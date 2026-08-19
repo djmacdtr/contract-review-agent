@@ -1,0 +1,11 @@
+:root { font-family: Inter, "Microsoft YaHei", sans-serif; color: #1f2937; background: #f3f6fa; }
+body { margin: 0; }
+.shell { min-height: 100vh; }
+.el-header { height: auto; background: white; border-bottom: 1px solid #e5e7eb; }
+.brand { padding: 18px 20px 4px; font-size: 20px; font-weight: 700; }
+.page { max-width: 1180px; margin: 0 auto; }
+.panel { background: white; padding: 24px; border-radius: 10px; box-shadow: 0 2px 12px #0000000d; }
+.form-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
+.muted { color: #6b7280; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #e5e7eb; padding: 16px; border-radius: 8px; max-height: 520px; overflow: auto; }
+

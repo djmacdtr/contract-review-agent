@@ -1,0 +1,84 @@
+name: contract-review
+
+x-app: &app
+  image: contract-review-agent:dev
+  build:
+    context: .
+    target: runtime
+  env_file:
+    - .env
+  environment:
+    ALLOW_HTTP_DOWNLOADS: ${ALLOW_HTTP_DOWNLOADS:-false}
+    DOWNLOAD_HOST_ALLOWLIST: ${DOWNLOAD_HOST_ALLOWLIST:-}
+    PDF_MIN_TEXT_CHARS_PER_PAGE: ${PDF_MIN_TEXT_CHARS_PER_PAGE:-20}
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-contract_review}
+      POSTGRES_USER: ${POSTGRES_USER:-contract}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contract}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-contract} -d ${POSTGRES_DB:-contract_review}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+
+  fixture-server:
+    profiles: ["fixtures"]
+    image: contract-review-agent:dev
+    build:
+      context: .
+      target: runtime
+    command: ["python", "-m", "http.server", "8080", "--bind", "0.0.0.0", "--directory", "/fixtures"]
+    volumes:
+      - type: bind
+        source: ${LOCAL_FIXTURE_DIR:-./local-fixtures}
+        target: /fixtures
+        read_only: true
+    restart: unless-stopped
+
+  test:
+    profiles: ["tools"]
+    image: contract-review-agent:test
+    build:
+      context: .
+      target: test
+    env_file:
+      - .env
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-contract}:${POSTGRES_PASSWORD:-contract}@postgres:5432/contract_review_test
+      TEST_ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-contract}:${POSTGRES_PASSWORD:-contract}@postgres:5432/${POSTGRES_DB:-contract_review}
+      MOCK_STAGE_DELAY_SECONDS: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "scripts/run_tests.py"]
+
+volumes:
+  postgres_data:
+    name: contract-review-postgres-data
