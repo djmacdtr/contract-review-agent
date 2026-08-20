@@ -126,6 +126,10 @@ def main() -> None:
     assert statistics["low"] <= MAX_FINAL_DIFFS
     assert not any(item["diff_type"] == "NUMERIC_CHANGED" for item in diff_items)
     assert len(diff_items) <= MAX_FINAL_DIFFS
+    assert all(
+        item["severity"] == "LOW" and item.get("review_reason")
+        for item in diff_items
+    )
     assert diagnostics["reliable"] is True
     assert diagnostics["alignment_coverage_baseline"] >= MIN_ALIGNMENT_COVERAGE
     assert diagnostics["alignment_coverage_target"] >= MIN_ALIGNMENT_COVERAGE

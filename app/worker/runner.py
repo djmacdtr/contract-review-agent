@@ -106,7 +106,9 @@ class WorkerRunner:
                     result=result,
                     schema_version=self.settings.RESULT_SCHEMA_VERSION,
                     rules_version=metadata.get("rules_version", self.settings.RULES_VERSION),
-                    workflow_version=metadata.get("workflow_version", self.settings.WORKFLOW_VERSION),
+                    workflow_version=metadata.get(
+                        "workflow_version", self.settings.WORKFLOW_VERSION
+                    ),
                     model_name=metadata.get("primary_model"),
                     file_metadata=file_metadata,
                 )
@@ -116,11 +118,16 @@ class WorkerRunner:
             logger.info("task_succeeded", task_id=task.id, task_type=task.task_type.value)
             return True
         except WorkflowError as exc:
+            details = exc.details or {}
             logger.error(
                 "task_failed",
                 task_id=task.id,
                 task_type=task.task_type.value,
                 error_code=exc.code,
+                component=details.get("component"),
+                failure_kind=details.get("failure_kind"),
+                attempts=details.get("attempts"),
+                elapsed_ms=details.get("elapsed_ms"),
             )
             async with SessionFactory() as session, session.begin():
                 await self.repository.fail(
@@ -129,6 +136,7 @@ class WorkerRunner:
                     worker_id=self.worker_id,
                     code=exc.code,
                     message=exc.safe_message,
+                    details=exc.details,
                 )
             return False
         except Exception as exc:
@@ -145,6 +153,7 @@ class WorkerRunner:
                     worker_id=self.worker_id,
                     code="INTERNAL_WORKFLOW_ERROR",
                     message="任务处理发生未分类错误",
+                    details=None,
                 )
             return False
         finally:

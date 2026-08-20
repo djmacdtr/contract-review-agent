@@ -11,7 +11,9 @@ from app.db.models import CheckTask, TaskEvent, TaskFile, TaskResult
 
 
 class TaskRepository:
-    async def get(self, session: AsyncSession, task_id: str, *, with_files: bool = False) -> CheckTask | None:
+    async def get(
+        self, session: AsyncSession, task_id: str, *, with_files: bool = False
+    ) -> CheckTask | None:
         statement: Select[tuple[CheckTask]] = select(CheckTask).where(CheckTask.id == task_id)
         if with_files:
             statement = statement.options(selectinload(CheckTask.files))
@@ -41,7 +43,9 @@ class TaskRepository:
         if created_to:
             filters.append(CheckTask.created_at <= created_to)
 
-        total = (await session.execute(select(func.count()).select_from(CheckTask).where(*filters))).scalar_one()
+        total = (
+            await session.execute(select(func.count()).select_from(CheckTask).where(*filters))
+        ).scalar_one()
         rows = (
             await session.execute(
                 select(CheckTask)
@@ -243,6 +247,7 @@ class TaskRepository:
         worker_id: str,
         code: str,
         message: str,
+        details: dict[str, Any] | None = None,
     ) -> bool:
         now = datetime.now(UTC)
         changed = (
@@ -259,7 +264,7 @@ class TaskRepository:
                     stage_message="任务处理失败",
                     error_code=code,
                     error_message=message,
-                    error_details=None,
+                    error_details=details,
                     updated_at=now,
                     finished_at=now,
                 )
@@ -278,7 +283,9 @@ class TaskRepository:
             )
         return bool(changed)
 
-    async def recover_stale(self, session: AsyncSession, stale_after_seconds: float) -> tuple[list[str], list[str]]:
+    async def recover_stale(
+        self, session: AsyncSession, stale_after_seconds: float
+    ) -> tuple[list[str], list[str]]:
         cutoff = datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
         stale = (
             await session.execute(

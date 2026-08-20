@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.enums import TaskStage, TaskStatus
+from app.core.errors import WorkflowError
 from app.db.models import CheckTask, TaskFile, TaskResult
 from app.db.repositories.task_repository import TaskRepository
 from app.db.session import SessionFactory
@@ -87,6 +88,44 @@ async def test_worker_failure_then_retry_creates_new_task() -> None:
         assert retried["task_id"] != task_id
         assert retried["source_task_id"] == task_id
         assert retried["status"] == "PENDING"
+
+
+async def test_worker_persists_and_returns_safe_workflow_error_details(capsys) -> None:
+    class SafeFailureWorkflow:
+        async def run(self, **kwargs):
+            raise WorkflowError(
+                "OCR_SERVICE_UNAVAILABLE",
+                "OCR 服务暂时不可用",
+                details={
+                    "component": "EXTERNAL_DOCUMENT_PARSER",
+                    "failure_kind": "UPSTREAM_502",
+                    "attempts": 1,
+                    "elapsed_ms": 25,
+                },
+            )
+
+    task_id = await create("/api/v1/final-comparisons", FINAL_PAYLOAD)
+    runner = WorkerRunner(get_settings(), workflow=SafeFailureWorkflow())
+    assert await runner.run_once() is True
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        detail = (await client.get(f"/api/v1/tasks/{task_id}")).json()["data"]
+
+    assert detail["error"] == {
+        "code": "OCR_SERVICE_UNAVAILABLE",
+        "message": "OCR 服务暂时不可用",
+        "details": {
+            "component": "EXTERNAL_DOCUMENT_PARSER",
+            "failure_kind": "UPSTREAM_502",
+            "attempts": 1,
+            "elapsed_ms": 25,
+        },
+    }
+    output = capsys.readouterr().out
+    assert "UPSTREAM_502" in output
+    assert "OCR_BASE_URL" not in output
 
 
 async def test_stale_task_requeues_then_fails_at_max_attempts() -> None:

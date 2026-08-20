@@ -112,6 +112,40 @@ async def test_client_retries_only_transient_gateway_errors(tmp_path: Path, stat
     assert calls == 2
 
 
+@pytest.mark.parametrize(
+    ("status", "failure_kind"),
+    [(502, "UPSTREAM_502"), (503, "UPSTREAM_503"), (504, "UPSTREAM_504")],
+)
+async def test_client_exposes_safe_gateway_failure_details_after_retries(
+    tmp_path: Path, status: int, failure_kind: str
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, content=b"vendor detail must not escape")
+
+    client = TextInDocumentParserClient(
+        settings(OCR_HTTP_RETRY_ATTEMPTS=1, OCR_RETRY_BACKOFF_SECONDS=0),
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(WorkflowError) as caught:
+        await client.parse(make_file(tmp_path), mode="auto")
+
+    assert caught.value.code == "OCR_SERVICE_UNAVAILABLE"
+    assert caught.value.details == {
+        "component": "EXTERNAL_DOCUMENT_PARSER",
+        "failure_kind": failure_kind,
+        "attempts": 2,
+        "elapsed_ms": caught.value.details["elapsed_ms"],
+    }
+    assert isinstance(caught.value.details["elapsed_ms"], int)
+    assert caught.value.details["elapsed_ms"] >= 0
+    assert calls == 2
+    assert "vendor detail" not in str(caught.value.details)
+
+
 async def test_client_applies_response_limit_before_transient_retry(tmp_path: Path) -> None:
     calls = 0
 
@@ -164,6 +198,36 @@ async def test_client_maps_timeout_without_leaking_configuration(tmp_path: Path)
     assert caught.value.code == "OCR_SERVICE_UNAVAILABLE"
     assert "ocr.invalid" not in str(caught.value)
     assert "unit-test-secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "failure_kind"),
+    [
+        (httpx.ConnectTimeout, "CONNECT_TIMEOUT"),
+        (httpx.ReadTimeout, "READ_TIMEOUT"),
+        (httpx.WriteTimeout, "WRITE_TIMEOUT"),
+        (httpx.ConnectError, "NETWORK_ERROR"),
+    ],
+)
+async def test_client_exposes_safe_network_failure_details(
+    tmp_path: Path,
+    error_type: type[httpx.HTTPError],
+    failure_kind: str,
+) -> None:
+    async def fail(request: httpx.Request) -> httpx.Response:
+        raise error_type("sensitive transport detail", request=request)
+
+    client = TextInDocumentParserClient(
+        settings(OCR_HTTP_RETRY_ATTEMPTS=0), transport=httpx.MockTransport(fail)
+    )
+    with pytest.raises(WorkflowError) as caught:
+        await client.parse(make_file(tmp_path), mode="auto")
+
+    assert caught.value.code == "OCR_SERVICE_UNAVAILABLE"
+    assert caught.value.details["component"] == "EXTERNAL_DOCUMENT_PARSER"
+    assert caught.value.details["failure_kind"] == failure_kind
+    assert caught.value.details["attempts"] == 1
+    assert "sensitive transport detail" not in str(caught.value.details)
 
 
 async def test_enabled_client_requires_complete_runtime_configuration(tmp_path: Path) -> None:
