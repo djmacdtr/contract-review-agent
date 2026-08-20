@@ -194,7 +194,9 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
     assert "token=secret" not in str(stored.result)
 
 
-async def test_empty_text_pdf_fails_with_ocr_required_and_cleans_workspace(tmp_path) -> None:
+async def test_formal_pdf_without_external_parser_fails_safely_and_cleans_workspace(
+    tmp_path,
+) -> None:
     empty_pdf = tmp_path / "empty.pdf"
     canvas = Canvas(str(empty_pdf))
     canvas.showPage()
@@ -235,5 +237,5 @@ async def test_empty_text_pdf_fails_with_ocr_required_and_cleans_workspace(tmp_p
             await session.execute(select(CheckTask).where(CheckTask.id == task_id))
         ).scalar_one()
     assert task.status == TaskStatus.FAILED
-    assert task.error_code == "OCR_REQUIRED"
+    assert task.error_code == "OCR_NOT_CONFIGURED"
     assert work_root.exists() and not any(work_root.iterdir())

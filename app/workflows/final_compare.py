@@ -8,7 +8,7 @@ from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.comparison.engine import (
     CompareOptions,
     compare_documents,
-    is_low_confidence_ocr_text_diff,
+    is_ocr_review_only_diff,
 )
 from app.comparison.models import ComparisonResult
 from app.core.config import Settings
@@ -22,8 +22,8 @@ from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.3.0"
-FINAL_COMPARE_RULES_VERSION = "0.3.0"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.4.0"
+FINAL_COMPARE_RULES_VERSION = "0.4.0"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -142,10 +142,7 @@ class FinalCompareWorkflowExecutor:
         statistics = {"total": len(diffs), "high": 0, "medium": 0, "low": 0, "info": 0}
         for item in comparison.diff_items:
             statistics[item.severity.lower()] += 1
-        if diffs and all(
-            is_low_confidence_ocr_text_diff(item, self.settings.OCR_LOW_CONFIDENCE_THRESHOLD)
-            for item in comparison.diff_items
-        ):
+        if diffs and all(is_ocr_review_only_diff(item) for item in comparison.diff_items):
             conclusion = "REVIEW_REQUIRED"
         elif diffs:
             conclusion = "RISK_FOUND"
@@ -192,6 +189,7 @@ class FinalCompareWorkflowExecutor:
                 "rules_version": FINAL_COMPARE_RULES_VERSION,
                 "primary_model": None,
                 "model_runs": [],
+                "comparison_diagnostics": comparison.diagnostics.model_dump(mode="json"),
             },
             "mock": False,
         }
