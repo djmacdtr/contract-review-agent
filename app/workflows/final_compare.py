@@ -64,9 +64,7 @@ class FinalCompareWorkflowExecutor:
 
         async def parse_documents(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.PARSING, 35, "正在解析 DOCX、文本型 PDF 或扫描 PDF")
-            parsed = []
-            for file in state["local_files"]:
-                parsed.append(await self.parsers.parse(file))
+            parsed = await self.parsers.parse_final_compare(state["local_files"])
             return {"parsed_documents": parsed}
 
         async def compare_versions(state: FinalCompareState) -> dict[str, Any]:

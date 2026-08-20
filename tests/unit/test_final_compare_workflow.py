@@ -92,7 +92,7 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
 
 
 class SyntheticOcrParser:
-    async def parse(self, file) -> ParsedDocument:
+    async def parse(self, file, *, mode: str) -> ParsedDocument:
         amount = "100" if file.role == "BASELINE" else "120"
         return ParsedDocument(
             file_id=file.file_id,
@@ -111,7 +111,7 @@ class SyntheticOcrParser:
                 )
             ],
             parser_name="textin-document-parser",
-            parser_metadata={"ocr": True, "engine_version": "test-engine"},
+            parser_metadata={"ocr": True, "engine_version": "test-engine", "parse_mode": mode},
             warnings=[
                 ProcessingWarning(
                     code="OCR_USED",

@@ -9,6 +9,7 @@ import httpx
 import orjson
 from pydantic import ValidationError
 
+from app.adapters.document_parser.base import ParseMode
 from app.adapters.document_parser.textin_models import TextInParseResponse
 from app.core.config import Settings
 from app.core.errors import WorkflowError
@@ -19,7 +20,6 @@ HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 FORBIDDEN_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 TRANSIENT_STATUSES = {502, 503, 504}
 FIXED_PARAMETERS = {
-    "parse_mode": "scan",
     "page_details": 1,
     "markdown_details": 1,
     "table_flavor": "html",
@@ -111,7 +111,7 @@ class TextInDocumentParserClient:
         code_and_message = mapping.get(code, ("OCR_PARSE_FAILED", "OCR 服务解析文档失败"))
         raise WorkflowError(*code_and_message, retryable=code == 500)
 
-    async def parse(self, file: LocalFile) -> TextInParseResponse:
+    async def parse(self, file: LocalFile, *, mode: ParseMode) -> TextInParseResponse:
         base_url, header, key = self._configuration()
         timeout = httpx.Timeout(
             self.settings.OCR_TIMEOUT_SECONDS,
@@ -129,7 +129,7 @@ class TextInDocumentParserClient:
                     async with client.stream(
                         "POST",
                         f"{base_url}{TEXTIN_ENGINE_PATH}",
-                        params=FIXED_PARAMETERS,
+                        params={**FIXED_PARAMETERS, "parse_mode": mode},
                         headers={header: key, "Content-Type": "application/octet-stream"},
                         content=self._body(file),
                     ) as response:

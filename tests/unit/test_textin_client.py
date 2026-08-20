@@ -54,7 +54,7 @@ async def test_client_sends_binary_auth_and_fixed_parameters(tmp_path: Path) -> 
         return httpx.Response(200, json=success_payload())
 
     client = TextInDocumentParserClient(settings(), transport=httpx.MockTransport(handler))
-    response = await client.parse(make_file(tmp_path))
+    response = await client.parse(make_file(tmp_path), mode="auto")
 
     assert response.code == 200
     assert response._response_size_bytes is not None
@@ -63,7 +63,7 @@ async def test_client_sends_binary_auth_and_fixed_parameters(tmp_path: Path) -> 
     assert observed["content_type"] == "application/octet-stream"
     assert observed["body"] == b"%PDF-1.7\nsynthetic"
     query = observed["query"]
-    assert query["parse_mode"] == "scan"
+    assert query["parse_mode"] == "auto"
     assert query["get_image"] == "none"
     assert query["raw_ocr"] == "1"
     assert query["char_details"] == "0"
@@ -88,7 +88,7 @@ async def test_client_maps_safe_errors(
 
     client = TextInDocumentParserClient(settings(), transport=httpx.MockTransport(handler))
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == expected
     assert "unit-test-secret" not in str(caught.value)
 
@@ -108,7 +108,7 @@ async def test_client_retries_only_transient_gateway_errors(tmp_path: Path, stat
         settings(OCR_HTTP_RETRY_ATTEMPTS=1, OCR_RETRY_BACKOFF_SECONDS=0),
         transport=httpx.MockTransport(handler),
     )
-    assert (await client.parse(make_file(tmp_path))).code == 200
+    assert (await client.parse(make_file(tmp_path), mode="scan")).code == 200
     assert calls == 2
 
 
@@ -129,7 +129,7 @@ async def test_client_applies_response_limit_before_transient_retry(tmp_path: Pa
         transport=httpx.MockTransport(handler),
     )
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == "OCR_RESPONSE_INVALID"
     assert calls == 1
 
@@ -142,7 +142,7 @@ async def test_client_rejects_oversized_or_invalid_response(tmp_path: Path) -> N
         settings(OCR_MAX_RESPONSE_MB=0.001), transport=httpx.MockTransport(oversized)
     )
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == "OCR_RESPONSE_INVALID"
 
     async def invalid_json(request: httpx.Request) -> httpx.Response:
@@ -150,7 +150,7 @@ async def test_client_rejects_oversized_or_invalid_response(tmp_path: Path) -> N
 
     client = TextInDocumentParserClient(settings(), transport=httpx.MockTransport(invalid_json))
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == "OCR_RESPONSE_INVALID"
 
 
@@ -160,7 +160,7 @@ async def test_client_maps_timeout_without_leaking_configuration(tmp_path: Path)
 
     client = TextInDocumentParserClient(settings(), transport=httpx.MockTransport(timeout))
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == "OCR_SERVICE_UNAVAILABLE"
     assert "ocr.invalid" not in str(caught.value)
     assert "unit-test-secret" not in str(caught.value)
@@ -169,5 +169,5 @@ async def test_client_maps_timeout_without_leaking_configuration(tmp_path: Path)
 async def test_enabled_client_requires_complete_runtime_configuration(tmp_path: Path) -> None:
     client = TextInDocumentParserClient(settings(OCR_BASE_URL=""))
     with pytest.raises(WorkflowError) as caught:
-        await client.parse(make_file(tmp_path))
+        await client.parse(make_file(tmp_path), mode="scan")
     assert caught.value.code == "OCR_NOT_CONFIGURED"

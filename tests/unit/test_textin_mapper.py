@@ -5,6 +5,8 @@ import pytest
 
 from app.adapters.document_parser.textin_mapper import map_textin_document
 from app.adapters.document_parser.textin_models import TextInParseResponse
+from app.adapters.document_parser.textin_parser import TextInDocumentParser
+from app.core.config import Settings
 from app.core.errors import WorkflowError
 from app.services.downloader import PDF_MIME, LocalFile
 
@@ -27,6 +29,20 @@ def local_file(tmp_path: Path) -> LocalFile:
         sha256="b" * 64,
         detected_mime_type=PDF_MIME,
     )
+
+
+class StubClient:
+    async def parse(self, file: LocalFile, *, mode: str) -> TextInParseResponse:
+        return load_response()
+
+
+async def test_parser_records_external_mode_and_stable_warning(tmp_path: Path) -> None:
+    parser = TextInDocumentParser(Settings(_env_file=None), client=StubClient())
+    document = await parser.parse(local_file(tmp_path), mode="auto")
+    assert document.parser_metadata["parse_mode"] == "auto"
+    warning = next(item for item in document.warnings if item.code == "PDF_EXTERNAL_PARSE_USED")
+    assert warning.details == {"parse_mode": "auto"}
+    assert warning.requires_manual_review is False
 
 
 def test_mapper_preserves_paragraph_table_location_and_confidence(tmp_path: Path) -> None:
