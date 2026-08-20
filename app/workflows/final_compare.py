@@ -159,7 +159,10 @@ class FinalCompareWorkflowExecutor:
         warnings.append(
             ProcessingWarning(
                 code="RULE_BASED_LIMITATION",
-                message="本结果来自确定性文字、数值和基础表格比对，可能包含 OCR 解析，不包含 LLM 或法律判断",
+                message=(
+                    "本结果来自确定性文字、数值和基础表格比对，可能包含 OCR 解析，"
+                    "不包含 LLM 或法律判断"
+                ),
                 requires_manual_review=False,
             ).model_dump(mode="json")
         )
