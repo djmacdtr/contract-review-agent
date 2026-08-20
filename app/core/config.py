@@ -33,7 +33,12 @@ class Settings(BaseSettings):
     OCR_ENABLED: bool = False
     OCR_BASE_URL: str = ""
     OCR_API_KEY: str = ""
+    OCR_AUTH_HEADER: str = ""
     OCR_TIMEOUT_SECONDS: float = 600.0
+    OCR_MAX_RESPONSE_MB: float = Field(default=50, gt=0)
+    OCR_HTTP_RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=5)
+    OCR_RETRY_BACKOFF_SECONDS: float = Field(default=0.5, ge=0, le=30)
+    OCR_LOW_CONFIDENCE_THRESHOLD: float = Field(default=0.8, ge=0, le=1)
 
     LLM_ENABLED: bool = False
     LLM_PROTOCOL: str = "openai"
@@ -54,6 +59,12 @@ class Settings(BaseSettings):
     RESULT_SCHEMA_VERSION: str = "1.0"
     WORKFLOW_VERSION: str = "0.1.0"
     RULES_VERSION: str = "0.1.0"
+
+    @property
+    def ocr_configured(self) -> bool:
+        return self.OCR_ENABLED and all(
+            value.strip() for value in (self.OCR_BASE_URL, self.OCR_API_KEY, self.OCR_AUTH_HEADER)
+        )
 
 
 @lru_cache

@@ -15,7 +15,10 @@ router = APIRouter(tags=["health"])
 @router.get("/health", response_model=ApiResponse[HealthData], summary="进程健康检查")
 async def health(request: Request) -> ApiResponse[HealthData]:
     return ApiResponse(
-        code="0", message="success", request_id=request.state.request_id, data=HealthData(status="ok")
+        code="0",
+        message="success",
+        request_id=request.state.request_id,
+        data=HealthData(status="ok"),
     )
 
 
@@ -36,8 +39,7 @@ async def ready(
         data=ReadyData(
             status="ready",
             database="ok",
-            ocr_configured=settings.OCR_ENABLED,
+            ocr_configured=settings.ocr_configured,
             llm_configured=settings.LLM_ENABLED,
         ),
     )
-

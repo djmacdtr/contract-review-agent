@@ -15,8 +15,23 @@ NUMBER_PATTERN = re.compile(
 )
 CLAUSE_KEY = re.compile(r"^(第[一二三四五六七八九十百千万0-9]+条|\d+(?:\.\d+)*[、.])")
 CRITICAL_KEYWORDS = (
-    "金额", "租金", "保证金", "期限", "利率", "合同编号", "甲方", "乙方", "保证人",
-    "账户", "担保", "违约", "争议", "租赁物", "总额", "付款", "主体",
+    "金额",
+    "租金",
+    "保证金",
+    "期限",
+    "利率",
+    "合同编号",
+    "甲方",
+    "乙方",
+    "保证人",
+    "账户",
+    "担保",
+    "违约",
+    "争议",
+    "租赁物",
+    "总额",
+    "付款",
+    "主体",
 )
 
 
@@ -25,6 +40,7 @@ class CompareOptions:
     ignore_formatting: bool = True
     ignore_headers_footers: bool = True
     numeric_sensitive: bool = True
+    ocr_low_confidence_threshold: float = 0.8
 
 
 def _side(document: ParsedDocument, block: DocumentBlock) -> DiffSide:
@@ -41,7 +57,11 @@ def _segments(before: str, after: str) -> list[DiffSegment]:
     segments: list[DiffSegment] = []
     for operation, i1, i2, j1, j2 in SequenceMatcher(None, before, after).get_opcodes():
         if operation in {"equal", "delete", "replace"} and i1 != i2:
-            segments.append(DiffSegment(operation="EQUAL" if operation == "equal" else "DELETE", text=before[i1:i2]))
+            segments.append(
+                DiffSegment(
+                    operation="EQUAL" if operation == "equal" else "DELETE", text=before[i1:i2]
+                )
+            )
         if operation in {"insert", "replace"} and j1 != j2:
             segments.append(DiffSegment(operation="INSERT", text=after[j1:j2]))
     return segments
@@ -56,6 +76,7 @@ def _make_diff(
     target: DocumentBlock | None,
     confidence: float,
     severity_context: str = "",
+    ocr_low_confidence_threshold: float = 0.8,
 ) -> DiffItem:
     before = baseline.raw_text if baseline else ""
     after = target.raw_text if target else ""
@@ -68,13 +89,27 @@ def _make_diff(
         "TABLE_ROW_DELETED": "目标表格缺少行",
         "TABLE_CELL_CHANGED": "表格单元格发生变化",
     }
+    locations = [block.location for block in (baseline, target) if block is not None]
+    ocr_locations = [location for location in locations if location.source == "OCR"]
+    ocr_confidences = [
+        location.confidence for location in ocr_locations if location.confidence is not None
+    ]
+    low_confidence_ocr = any(
+        location.confidence is None or location.confidence < ocr_low_confidence_threshold
+        for location in ocr_locations
+    )
+    if ocr_confidences:
+        confidence = min(confidence, *ocr_confidences)
+    severity = _severity(
+        f"{severity_context} {before} {after}",
+        numeric=diff_type == "NUMERIC_CHANGED",
+    )
+    if low_confidence_ocr and diff_type in {"ADDED", "DELETED", "MODIFIED"}:
+        severity = "LOW"
     return DiffItem(
         diff_id=f"diff_{index:06d}",
         diff_type=diff_type,
-        severity=_severity(
-            f"{severity_context} {before} {after}",
-            numeric=diff_type == "NUMERIC_CHANGED",
-        ),
+        severity=severity,
         title=labels[diff_type],
         baseline=_side(baseline_document, baseline) if baseline else None,
         target=_side(target_document, target) if target else None,
@@ -84,7 +119,11 @@ def _make_diff(
 
 
 def _paragraphs(document: ParsedDocument, options: CompareOptions) -> list[DocumentBlock]:
-    allowed = {"PARAGRAPH"} if options.ignore_headers_footers else {"PARAGRAPH", "HEADER", "FOOTER"}
+    allowed = (
+        {"PARAGRAPH"}
+        if options.ignore_headers_footers
+        else {"PARAGRAPH", "HEADER", "FOOTER", "SIDEBAR"}
+    )
     return [block for block in document.blocks if block.type in allowed and block.normalized_text]
 
 
@@ -102,7 +141,12 @@ def _compare_paragraphs(
 ) -> list[DiffItem]:
     baseline = _paragraphs(baseline_document, options)
     target = _paragraphs(target_document, options)
-    matcher = SequenceMatcher(None, [block.normalized_text for block in baseline], [block.normalized_text for block in target], autojunk=False)
+    matcher = SequenceMatcher(
+        None,
+        [block.normalized_text for block in baseline],
+        [block.normalized_text for block in target],
+        autojunk=False,
+    )
     differences: list[DiffItem] = []
     index = start_index
     for operation, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -117,20 +161,65 @@ def _compare_paragraphs(
             before = before_group[offset]
             after = after_group[offset]
             similarity = ratio(before.normalized_text, after.normalized_text) / 100
-            same_clause = bool(CLAUSE_KEY.match(before.normalized_text) and CLAUSE_KEY.match(before.normalized_text).group() == (CLAUSE_KEY.match(after.normalized_text).group() if CLAUSE_KEY.match(after.normalized_text) else None))
+            same_clause = bool(
+                CLAUSE_KEY.match(before.normalized_text)
+                and CLAUSE_KEY.match(before.normalized_text).group()
+                == (
+                    CLAUSE_KEY.match(after.normalized_text).group()
+                    if CLAUSE_KEY.match(after.normalized_text)
+                    else None
+                )
+            )
             minimum_similarity = 0.45 if same_clause else 0.5
             if similarity < minimum_similarity:
                 break
-            kind = "NUMERIC_CHANGED" if options.numeric_sensitive and _numeric_changed(before.raw_text, after.raw_text) else "MODIFIED"
-            differences.append(_make_diff(index, kind, baseline_document, target_document, before, after, similarity))
+            kind = (
+                "NUMERIC_CHANGED"
+                if options.numeric_sensitive and _numeric_changed(before.raw_text, after.raw_text)
+                else "MODIFIED"
+            )
+            differences.append(
+                _make_diff(
+                    index,
+                    kind,
+                    baseline_document,
+                    target_document,
+                    before,
+                    after,
+                    similarity,
+                    ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
+                )
+            )
             index += 1
             consumed_before += 1
             consumed_after += 1
         for before in before_group[consumed_before:]:
-            differences.append(_make_diff(index, "DELETED", baseline_document, target_document, before, None, 1.0))
+            differences.append(
+                _make_diff(
+                    index,
+                    "DELETED",
+                    baseline_document,
+                    target_document,
+                    before,
+                    None,
+                    1.0,
+                    ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
+                )
+            )
             index += 1
         for after in after_group[consumed_after:]:
-            differences.append(_make_diff(index, "ADDED", baseline_document, target_document, None, after, 1.0))
+            differences.append(
+                _make_diff(
+                    index,
+                    "ADDED",
+                    baseline_document,
+                    target_document,
+                    None,
+                    after,
+                    1.0,
+                    ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
+                )
+            )
             index += 1
     return differences
 
@@ -145,15 +234,40 @@ def _table_header(block: DocumentBlock) -> str:
     return " | ".join(cell.normalized_text for cell in block.table.rows[0].cells)
 
 
-def _table_block(document: ParsedDocument, table_index: int, row: TableRow | None = None, column: int | None = None) -> DocumentBlock:
+def _table_block(
+    document: ParsedDocument,
+    table_index: int,
+    row: TableRow | None = None,
+    column: int | None = None,
+) -> DocumentBlock:
     text = _row_text(row) if row else ""
-    location = row.cells[column].location if row and column is not None and column < len(row.cells) else (row.cells[0].location if row and row.cells else document.blocks[0].location)
-    return DocumentBlock(block_id=f"{document.file_id}_table_{table_index}_{row.row if row else 0}_{column or 0}", type="TABLE", order=table_index, raw_text=(row.cells[column].raw_text if row and column is not None else text), normalized_text=normalize_text(text), location=location)
+    location = (
+        row.cells[column].location
+        if row and column is not None and column < len(row.cells)
+        else (row.cells[0].location if row and row.cells else document.blocks[0].location)
+    )
+    return DocumentBlock(
+        block_id=f"{document.file_id}_table_{table_index}_{row.row if row else 0}_{column or 0}",
+        type="TABLE",
+        order=table_index,
+        raw_text=(row.cells[column].raw_text if row and column is not None else text),
+        normalized_text=normalize_text(text),
+        location=location,
+    )
 
 
-def _compare_tables(baseline_document: ParsedDocument, target_document: ParsedDocument, start_index: int) -> list[DiffItem]:
-    base_tables = [block for block in baseline_document.blocks if block.type == "TABLE" and block.table]
-    target_tables = [block for block in target_document.blocks if block.type == "TABLE" and block.table]
+def _compare_tables(
+    baseline_document: ParsedDocument,
+    target_document: ParsedDocument,
+    start_index: int,
+    options: CompareOptions,
+) -> list[DiffItem]:
+    base_tables = [
+        block for block in baseline_document.blocks if block.type == "TABLE" and block.table
+    ]
+    target_tables = [
+        block for block in target_document.blocks if block.type == "TABLE" and block.table
+    ]
     differences: list[DiffItem] = []
     index = start_index
     unused_targets = set(range(len(target_tables)))
@@ -169,22 +283,66 @@ def _compare_tables(baseline_document: ParsedDocument, target_document: ParsedDo
         def emit_row_pair(base_row: TableRow | None, target_row: TableRow | None) -> None:
             nonlocal index
             if base_row is None:
-                differences.append(_make_diff(index, "TABLE_ROW_ADDED", baseline_document, target_document, None, _table_block(target_document, table_index, target_row), 0.9))
+                differences.append(
+                    _make_diff(
+                        index,
+                        "TABLE_ROW_ADDED",
+                        baseline_document,
+                        target_document,
+                        None,
+                        _table_block(target_document, table_index, target_row),
+                        0.9,
+                        ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
+                    )
+                )
                 index += 1
                 return
             if target_row is None:
-                differences.append(_make_diff(index, "TABLE_ROW_DELETED", baseline_document, target_document, _table_block(baseline_document, table_index, base_row), None, 0.9))
+                differences.append(
+                    _make_diff(
+                        index,
+                        "TABLE_ROW_DELETED",
+                        baseline_document,
+                        target_document,
+                        _table_block(baseline_document, table_index, base_row),
+                        None,
+                        0.9,
+                        ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
+                    )
+                )
                 index += 1
                 return
             for column in range(max(len(base_row.cells), len(target_row.cells))):
-                before = base_row.cells[column].normalized_text if column < len(base_row.cells) else ""
-                after = target_row.cells[column].normalized_text if column < len(target_row.cells) else ""
+                before = (
+                    base_row.cells[column].normalized_text if column < len(base_row.cells) else ""
+                )
+                after = (
+                    target_row.cells[column].normalized_text
+                    if column < len(target_row.cells)
+                    else ""
+                )
                 if before == after:
                     continue
-                base_cell_block = _table_block(baseline_document, table_index, base_row, column) if column < len(base_row.cells) else None
-                target_cell_block = _table_block(target_document, table_index, target_row, column) if column < len(target_row.cells) else None
-                base_header = base_rows[0].cells[column].raw_text if base_rows and column < len(base_rows[0].cells) else ""
-                target_header = target_rows[0].cells[column].raw_text if target_rows and column < len(target_rows[0].cells) else ""
+                base_cell_block = (
+                    _table_block(baseline_document, table_index, base_row, column)
+                    if column < len(base_row.cells)
+                    else None
+                )
+                target_cell_block = (
+                    _table_block(target_document, table_index, target_row, column)
+                    if column < len(target_row.cells)
+                    else None
+                )
+                base_header = (
+                    base_rows[0].cells[column].raw_text
+                    if base_rows and column < len(base_rows[0].cells)
+                    else ""
+                )
+                target_header = (
+                    target_rows[0].cells[column].raw_text
+                    if target_rows and column < len(target_rows[0].cells)
+                    else ""
+                )
                 differences.append(
                     _make_diff(
                         index,
@@ -195,6 +353,7 @@ def _compare_tables(baseline_document: ParsedDocument, target_document: ParsedDo
                         target_cell_block,
                         0.95,
                         severity_context=f"{base_header} {target_header}",
+                        ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
                     )
                 )
                 index += 1
@@ -240,7 +399,9 @@ def _compare_tables(baseline_document: ParsedDocument, target_document: ParsedDo
             if score > best_score:
                 best_score = score
                 best_target = target_position
-        if best_target is not None and (best_score >= 70 or (not _table_header(base_block) and best_target == base_position)):
+        if best_target is not None and (
+            best_score >= 70 or (not _table_header(base_block) and best_target == base_position)
+        ):
             unused_targets.remove(best_target)
             emit_rows(base_block, target_tables[best_target])
         else:
@@ -250,9 +411,11 @@ def _compare_tables(baseline_document: ParsedDocument, target_document: ParsedDo
     return differences
 
 
-def compare_documents(baseline: ParsedDocument, target: ParsedDocument, options: CompareOptions) -> ComparisonResult:
+def compare_documents(
+    baseline: ParsedDocument, target: ParsedDocument, options: CompareOptions
+) -> ComparisonResult:
     differences = _compare_paragraphs(baseline, target, options, 1)
-    differences.extend(_compare_tables(baseline, target, len(differences) + 1))
+    differences.extend(_compare_tables(baseline, target, len(differences) + 1, options))
     warnings = [*baseline.warnings, *target.warnings]
     if not options.ignore_formatting:
         warnings.append(
@@ -262,3 +425,16 @@ def compare_documents(baseline: ParsedDocument, target: ParsedDocument, options:
             )
         )
     return ComparisonResult(diff_items=differences, warnings=warnings)
+
+
+def is_low_confidence_ocr_text_diff(item: DiffItem, threshold: float) -> bool:
+    if item.diff_type not in {"ADDED", "DELETED", "MODIFIED"}:
+        return False
+    locations = [
+        side.location
+        for side in (item.baseline, item.target)
+        if side is not None and side.location.source == "OCR"
+    ]
+    return bool(locations) and any(
+        location.confidence is None or location.confidence < threshold for location in locations
+    )
