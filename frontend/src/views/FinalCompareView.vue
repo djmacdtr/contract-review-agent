@@ -1,7 +1,7 @@
 <template>
   <div class="page panel">
     <h2>创建放款阶段比对任务</h2>
-    <el-alert type="info" :closable="false" title="执行确定性文字、数值和基础表格比对；不检查印章，不调用 OCR 或 LLM。" />
+    <el-alert type="info" :closable="false" title="文本 PDF 和 DOCX 本地解析；扫描 PDF 在服务已配置时回退 OCR。结果不调用 LLM，也不构成法律判断。" />
     <el-form label-position="top" style="margin-top: 16px">
       <el-form-item label="业务关联 ID"><el-input v-model="form.client_reference_id" /></el-form-item>
       <el-form-item label="原文件/申请版"><RemoteFileFields v-model="form.baseline_file" /></el-form-item>
