@@ -1,6 +1,6 @@
 # 合同智能检查 Agent
 
-这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE` 已支持受控 URL 下载、DOCX/文本型 PDF 本地解析、扫描 PDF 外部 OCR 回退，以及确定性文字、数值和基础表格比对；`DRAFT_REVIEW` 仍为 Mock。
+这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.4.0` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、可靠性保护，以及确定性文字、数值和基础表格比对；`DRAFT_REVIEW` 仍为 Mock。
 
 > 所有结果都不构成合同审查、法律审核或放款意见。真实版本比对标记为 `RULE_BASED`；OCR 只负责文档结构解析，本版本不调用 LLM，也不检查印章。
 
@@ -130,7 +130,7 @@ docker volume inspect contract-review-postgres-data
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
 - `ALLOW_HTTP_DOWNLOADS` 默认关闭；开发 fixture 需要显式开启，并将 `DOWNLOAD_HOST_ALLOWLIST` 精确设为 `fixture-server`。
 - `MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`DOWNLOAD_MAX_REDIRECTS` 控制下载边界。
-- `PDF_MIN_TEXT_CHARS_PER_PAGE` 控制文本 PDF 最低文本密度；低于阈值时，仅在 OCR 完整启用后回退外部解析，否则返回 `OCR_REQUIRED`。
+- `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
 - `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
 
@@ -147,7 +147,9 @@ conda run -n contract-review-agent-py312 python scripts/e2e_ocr_acceptance.py
 
 真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本只打印页数、结构块数、表格数、引擎版本和置信度摘要，不打印全文、服务地址或密钥。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
 
-2026-08-20 已完成一组 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。该数据支持当前继续使用同步模式，但仍需在甲方部署环境验证容器网络，并在决定约 200 页测试前评估 Worker 队列等待影响。
+2026-08-20 已完成一组 0.3.0 的 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。0.4.0 已将 PDF/PDF 改为双方统一 external `auto`，并在结果 `metadata.comparison_diagnostics` 返回双侧覆盖率、全局相似度、候选/最终差异数、fallback 和可靠性原因。若可靠性门槛未通过，候选差异不会升级为 HIGH/MEDIUM 业务风险，结论固定为 `REVIEW_REQUIRED`。
+
+0.4.0 首次 46 页双方 external `auto` 诊断任务已确认 46/46 页、双侧覆盖率 100%、全局相似度 99.05%，差异由旧流程的 2,099 项降至 16 项。该任务随后暴露并推动修复了外部解析器 HTML/Markdown/LaTeX 表达噪声和 OCR 微小字符差异分级；由于验收约束限定本轮只调用一次真实任务，修正后的最终真实复验仍需在下一次获准调用时完成，当前 PR 不应仅凭离线回放标记 Ready。
 
 ## 常见问题
 
@@ -178,6 +180,6 @@ docker compose logs worker
 
 ## 当前能力边界
 
-已实现 FINAL_COMPARE 的受控下载、DOCX/文本型 PDF 本地解析、扫描 PDF 同步 OCR 回退，以及文字/数值/基础表格差异。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。OCR 响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
+已实现 FINAL_COMPARE 的受控下载、任务级一致解析计划、同步外部 PDF 解析，以及文字/数值/基础表格差异。对齐引擎会处理中文空格、软换行、零宽字符和已确认的解析器标记噪声，支持 1–4 对 1–4 条款合并/拆分、表格兼容门控及页面文本 fallback；不可靠对齐不会直接生成业务风险。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。外部解析响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
 
-尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。OCR 未配置时，扫描或低文本密度 PDF 会明确以 `OCR_REQUIRED` 失败，不会假装完成。
+尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。正式 PDF 比对未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
