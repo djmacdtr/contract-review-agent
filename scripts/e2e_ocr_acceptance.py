@@ -14,10 +14,10 @@ FIXTURE_BASE = os.getenv("OCR_FIXTURE_BASE_URL", "http://127.0.0.1:18080")
 BASELINE_NAME = os.getenv("OCR_BASELINE_FILE_NAME", "融资租赁合同_电子印章示例_原版46页.pdf")
 TARGET_NAME = os.getenv("OCR_TARGET_FILE_NAME", "融资租赁合同_电子印章示例_原版46页_扫描版.pdf")
 EXPECTED_PAGES = int(os.getenv("OCR_EXPECTED_PAGES", "46"))
-EXPECTED_VERSION = os.getenv("OCR_EXPECTED_WORKFLOW_VERSION", "0.4.0")
+EXPECTED_VERSION = os.getenv("OCR_EXPECTED_WORKFLOW_VERSION", "0.4.1")
 DEADLINE_SECONDS = float(os.getenv("OCR_E2E_TIMEOUT_SECONDS", "660"))
 MAX_RESPONSE_BYTES = int(float(os.getenv("OCR_MAX_RESPONSE_MB", "50")) * 1024 * 1024)
-MAX_FINAL_DIFFS = int(os.getenv("OCR_MAX_FINAL_DIFFS", "50"))
+MAX_FINAL_DIFFS = int(os.getenv("OCR_MAX_FINAL_DIFFS", "3"))
 MIN_ALIGNMENT_COVERAGE = float(os.getenv("OCR_MIN_ALIGNMENT_COVERAGE", "0.90"))
 PREVIOUS_DIFF_COUNT = int(os.getenv("OCR_PREVIOUS_DIFF_COUNT", "2099"))
 
@@ -120,11 +120,13 @@ def main() -> None:
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["metadata"]["workflow_version"] == EXPECTED_VERSION
     assert result["metadata"]["rules_version"] == EXPECTED_VERSION
-    assert result["conclusion"] in {"PASS", "REVIEW_REQUIRED"}
+    assert result["conclusion"] == "REVIEW_REQUIRED"
     assert statistics["high"] == 0
     assert statistics["medium"] == 0
+    assert statistics["low"] <= MAX_FINAL_DIFFS
     assert not any(item["diff_type"] == "NUMERIC_CHANGED" for item in diff_items)
     assert len(diff_items) <= MAX_FINAL_DIFFS
+    assert diagnostics["reliable"] is True
     assert diagnostics["alignment_coverage_baseline"] >= MIN_ALIGNMENT_COVERAGE
     assert diagnostics["alignment_coverage_target"] >= MIN_ALIGNMENT_COVERAGE
     assert diagnostics["emitted_diff_count"] == len(diff_items)
