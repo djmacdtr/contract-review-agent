@@ -1,0 +1,57 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "duration": 321,
+    "version": "test-engine-1.0",
+    "result": {
+      "total_page_number": 1,
+      "valid_page_number": 1,
+      "success_count": 1,
+      "total_count": 1,
+      "pages": [
+        {
+          "page_id": 1,
+          "status": "success",
+          "angle": 0,
+          "content": [
+            {
+              "type": "text",
+              "content": [
+                {"type": "line", "text": "测试金额壹佰元", "score": 0.99}
+              ]
+            }
+          ]
+        }
+      ],
+      "detail": [
+        {
+          "page_id": 1,
+          "paragraph_id": 0,
+          "outline_level": 0,
+          "text": "第一条 测试金额壹佰元",
+          "type": "paragraph",
+          "content": 0,
+          "sub_type": "text_title",
+          "position": [10, 20, 300, 20, 300, 60, 10, 60]
+        },
+        {
+          "page_id": 1,
+          "paragraph_id": 1,
+          "outline_level": -1,
+          "text": "名称 数量",
+          "type": "table",
+          "content": 0,
+          "sub_type": "bordered",
+          "position": [10, 80, 300, 80, 300, 180, 10, 180],
+          "cells": [
+            {"row": 0, "col": 0, "row_span": 1, "col_span": 1, "text": "名称", "position": [10, 80, 150, 80, 150, 120, 10, 120]},
+            {"row": 0, "col": 1, "row_span": 1, "col_span": 1, "text": "数量", "position": [150, 80, 300, 80, 300, 120, 150, 120]},
+            {"row": 1, "col": 0, "row_span": 1, "col_span": 1, "text": "测试项", "position": [10, 120, 150, 120, 150, 180, 10, 180]},
+            {"row": 1, "col": 1, "row_span": 1, "col_span": 1, "text": "1", "position": [150, 120, 300, 120, 300, 180, 150, 180]}
+          ]
+        }
+      ]
+    }
+  }
+}

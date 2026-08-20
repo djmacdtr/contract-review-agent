@@ -6,6 +6,11 @@ import structlog
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level.upper(), force=True)
+    # httpx logs the complete request URL at INFO, including signed download
+    # URLs and the configured OCR endpoint. Those values are intentionally
+    # excluded from application logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -21,4 +26,3 @@ def configure_logging(level: str) -> None:
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
-

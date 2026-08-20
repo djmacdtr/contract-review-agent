@@ -1,8 +1,8 @@
 # 合同智能检查 Agent
 
-这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE` 已支持受控 URL 下载、DOCX/文本型 PDF 解析及确定性文字、数值和基础表格比对；`DRAFT_REVIEW` 仍为 Mock。
+这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE` 已支持受控 URL 下载、DOCX/文本型 PDF 本地解析、扫描 PDF 外部 OCR 回退，以及确定性文字、数值和基础表格比对；`DRAFT_REVIEW` 仍为 Mock。
 
-> 所有结果都不构成合同审查、法律审核或放款意见。真实版本比对标记为 `RULE_BASED`；本版本不调用 OCR 或 LLM，也不检查印章。
+> 所有结果都不构成合同审查、法律审核或放款意见。真实版本比对标记为 `RULE_BASED`；OCR 只负责文档结构解析，本版本不调用 LLM，也不检查印章。
 
 ## 入口
 
@@ -43,6 +43,14 @@ docker compose --profile tools run --rm test
 ```
 
 测试容器会自动创建并迁移独立的 `contract_review_test` 数据库，避免正在运行的 Worker 领取测试任务；不会删除或重建开发数据库。
+
+本机 Python 开发建议使用独立 Miniconda 环境，避免修改其他项目共用的环境：
+
+```powershell
+conda create -n contract-review-agent-py312 python=3.12 -y
+conda run -n contract-review-agent-py312 python -m pip install -e ".[test]"
+conda run -n contract-review-agent-py312 python -m pytest -q
+```
 
 运行 DRAFT_REVIEW Mock 的 API → Worker → 结果闭环：
 
@@ -122,7 +130,24 @@ docker volume inspect contract-review-postgres-data
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
 - `ALLOW_HTTP_DOWNLOADS` 默认关闭；开发 fixture 需要显式开启，并将 `DOWNLOAD_HOST_ALLOWLIST` 精确设为 `fixture-server`。
 - `MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`DOWNLOAD_MAX_REDIRECTS` 控制下载边界。
-- `PDF_MIN_TEXT_CHARS_PER_PAGE` 控制文本 PDF 最低文本密度；低于阈值返回 `OCR_REQUIRED`。
+- `PDF_MIN_TEXT_CHARS_PER_PAGE` 控制文本 PDF 最低文本密度；低于阈值时，仅在 OCR 完整启用后回退外部解析，否则返回 `OCR_REQUIRED`。
+- `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
+- `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
+
+### 本机真实 OCR 验证
+
+当开发机 Docker 网络无法访问甲方 OCR，但宿主机可以访问时，可让 PostgreSQL 继续运行在 Docker 中，让 API 与 Worker 使用上述 Miniconda 环境在宿主机运行。仅对这些临时进程设置 `OCR_ENABLED=true`，并将 `DATABASE_URL` 指向映射到 `127.0.0.1` 的 PostgreSQL 端口。可用以下脚本验证，但输入只能使用脱敏或完全合成的扫描 PDF：
+
+```powershell
+conda run -n contract-review-agent-py312 python scripts/ocr_live_probe.py <synthetic-scan.pdf>
+conda run -n contract-review-agent-py312 python scripts/e2e_ocr_local.py
+# 46 页验收（文件名、API/fixture 地址和期望页数均可用环境变量覆盖）
+conda run -n contract-review-agent-py312 python scripts/e2e_ocr_acceptance.py
+```
+
+真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本只打印页数、结构块数、表格数、引擎版本和置信度摘要，不打印全文、服务地址或密钥。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
+
+2026-08-20 已完成一组 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。该数据支持当前继续使用同步模式，但仍需在甲方部署环境验证容器网络，并在决定约 200 页测试前评估 Worker 队列等待影响。
 
 ## 常见问题
 
@@ -153,6 +178,6 @@ docker compose logs worker
 
 ## 当前能力边界
 
-已实现 FINAL_COMPARE 的受控下载、DOCX/文本型 PDF 解析、文字/数值/基础 DOCX 表格差异。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。
+已实现 FINAL_COMPARE 的受控下载、DOCX/文本型 PDF 本地解析、扫描 PDF 同步 OCR 回退，以及文字/数值/基础表格差异。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。OCR 响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
 
-尚未实现扫描 PDF OCR、旧版 DOC、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。扫描或低文本密度 PDF 会明确以 `OCR_REQUIRED` 失败，不会假装完成。
+尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。OCR 未配置时，扫描或低文本密度 PDF 会明确以 `OCR_REQUIRED` 失败，不会假装完成。

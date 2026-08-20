@@ -4,20 +4,26 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from app.comparison.engine import CompareOptions, compare_documents
+from app.adapters.document_parser.textin_parser import TextInDocumentParser
+from app.comparison.engine import (
+    CompareOptions,
+    compare_documents,
+    is_low_confidence_ocr_text_diff,
+)
 from app.comparison.models import ComparisonResult
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
+from app.documents.router import DocumentParsingRouter
 from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.2.0"
-FINAL_COMPARE_RULES_VERSION = "0.2.0"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.3.0"
+FINAL_COMPARE_RULES_VERSION = "0.3.0"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -37,11 +43,16 @@ class FinalCompareWorkflowExecutor:
         *,
         downloader: SafeFileDownloadService | None = None,
         parsers: ParserRegistry | None = None,
+        document_router: DocumentParsingRouter | None = None,
     ) -> None:
         self.settings = settings
         self.downloader = downloader or SafeFileDownloadService(settings)
-        self.parsers = parsers or ParserRegistry(
+        local_parsers = parsers or ParserRegistry(
             pdf_min_text_chars_per_page=settings.PDF_MIN_TEXT_CHARS_PER_PAGE
+        )
+        self.parsers = document_router or DocumentParsingRouter(
+            local=local_parsers,
+            external=TextInDocumentParser(settings) if settings.OCR_ENABLED else None,
         )
 
     def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
@@ -52,7 +63,7 @@ class FinalCompareWorkflowExecutor:
             return {"local_files": await self.downloader.prepare(state["files"], workspace)}
 
         async def parse_documents(state: FinalCompareState) -> dict[str, Any]:
-            await callback(TaskStage.PARSING, 35, "正在解析 DOCX 或文本型 PDF")
+            await callback(TaskStage.PARSING, 35, "正在解析 DOCX、文本型 PDF 或扫描 PDF")
             parsed = []
             for file in state["local_files"]:
                 parsed.append(await self.parsers.parse(file))
@@ -71,6 +82,7 @@ class FinalCompareWorkflowExecutor:
                     ignore_formatting=raw_options.get("ignore_formatting", True),
                     ignore_headers_footers=raw_options.get("ignore_headers_footers", True),
                     numeric_sensitive=raw_options.get("numeric_sensitive", True),
+                    ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
                 ),
             )
             return {"comparison": compared}
@@ -116,8 +128,15 @@ class FinalCompareWorkflowExecutor:
                 "sha256": document.sha256,
                 "page_count": document.page_count,
                 "parser_name": document.parser_name,
-                "parse_status": "WARNING" if document.warnings else "SUCCEEDED",
-                "parse_warnings": [warning.model_dump(mode="json") for warning in document.warnings],
+                "parse_status": (
+                    "WARNING"
+                    if any(warning.requires_manual_review for warning in document.warnings)
+                    else "SUCCEEDED"
+                ),
+                "parse_warnings": [
+                    warning.model_dump(mode="json") for warning in document.warnings
+                ],
+                "parser_metadata": document.parser_metadata,
             }
             for document in documents
         ]
@@ -125,9 +144,14 @@ class FinalCompareWorkflowExecutor:
         statistics = {"total": len(diffs), "high": 0, "medium": 0, "low": 0, "info": 0}
         for item in comparison.diff_items:
             statistics[item.severity.lower()] += 1
-        if diffs:
+        if diffs and all(
+            is_low_confidence_ocr_text_diff(item, self.settings.OCR_LOW_CONFIDENCE_THRESHOLD)
+            for item in comparison.diff_items
+        ):
+            conclusion = "REVIEW_REQUIRED"
+        elif diffs:
             conclusion = "RISK_FOUND"
-        elif comparison.warnings:
+        elif any(warning.requires_manual_review for warning in comparison.warnings):
             conclusion = "REVIEW_REQUIRED"
         else:
             conclusion = "PASS"
@@ -135,7 +159,11 @@ class FinalCompareWorkflowExecutor:
         warnings.append(
             ProcessingWarning(
                 code="RULE_BASED_LIMITATION",
-                message="本结果来自确定性文字、数值和基础表格比对，不包含 OCR、LLM 或法律判断",
+                message=(
+                    "本结果来自确定性文字、数值和基础表格比对，可能包含 OCR 解析，"
+                    "不包含 LLM 或法律判断"
+                ),
+                requires_manual_review=False,
             ).model_dump(mode="json")
         )
         return {
@@ -158,7 +186,7 @@ class FinalCompareWorkflowExecutor:
                 "overall_advice": f"请按来源位置人工复核 {len(diffs)} 项确定性差异。",
                 "priority_actions": ["优先复核 HIGH 级金额、期限、主体及关键条款变化"],
                 "manual_review_focus": ["差异前后文本及段落、页码或表格位置"],
-                "limitations": ["未执行 OCR、LLM、复杂合同规则或法律判断"],
+                "limitations": ["可能使用 OCR；未执行 LLM、复杂合同规则或法律判断"],
             },
             "metadata": {
                 "execution_mode": "RULE_BASED",
@@ -196,8 +224,14 @@ class FinalCompareWorkflowExecutor:
                     "sha256": document.sha256,
                     "page_count": document.page_count,
                     "parser_name": document.parser_name,
-                    "parse_status": "WARNING" if document.warnings else "SUCCEEDED",
-                    "parse_warnings": [warning.model_dump(mode="json") for warning in document.warnings],
+                    "parse_status": (
+                        "WARNING"
+                        if any(warning.requires_manual_review for warning in document.warnings)
+                        else "SUCCEEDED"
+                    ),
+                    "parse_warnings": [
+                        warning.model_dump(mode="json") for warning in document.warnings
+                    ],
                 }
                 for document in documents
             ]

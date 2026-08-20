@@ -32,6 +32,7 @@ class ResultFile(BaseModel):
     parser_name: str
     parse_status: str
     parse_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    parser_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResultMetadata(BaseModel):

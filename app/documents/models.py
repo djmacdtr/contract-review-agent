@@ -12,7 +12,9 @@ class DocumentLocation(BaseModel):
     row: int | None = None
     column: int | None = None
     section: str | None = None
-    bbox: list[str] | None = None
+    bbox: list[float] | None = None
+    source: Literal["LOCAL", "OCR"] | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class TableCell(BaseModel):
@@ -33,7 +35,7 @@ class ParsedTable(BaseModel):
 
 class DocumentBlock(BaseModel):
     block_id: str
-    type: Literal["PARAGRAPH", "TABLE", "HEADER", "FOOTER"]
+    type: Literal["PARAGRAPH", "TABLE", "HEADER", "FOOTER", "SIDEBAR"]
     order: int
     raw_text: str
     normalized_text: str
@@ -45,6 +47,10 @@ class ProcessingWarning(BaseModel):
     code: str
     message: str
     requires_manual_review: bool = True
+    file_id: str | None = None
+    page: int | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParsedDocument(BaseModel):

@@ -21,7 +21,9 @@ from tests.integration.helpers import DRAFT_PAYLOAD, FINAL_PAYLOAD
 
 
 async def create(path: str, payload: dict) -> str:
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
         response = await client.post(path, json=payload)
         assert response.status_code == 202, response.text
         return response.json()["data"]["task_id"]
@@ -47,9 +49,17 @@ async def test_full_worker_success_and_atomic_result() -> None:
     assert await runner.run_once() is True
 
     async with SessionFactory() as session:
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
-        result = (await session.execute(select(TaskResult).where(TaskResult.task_id == task_id))).scalar_one()
-        files = (await session.execute(select(TaskFile).where(TaskFile.task_id == task_id))).scalars().all()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
+        result = (
+            await session.execute(select(TaskResult).where(TaskResult.task_id == task_id))
+        ).scalar_one()
+        files = (
+            (await session.execute(select(TaskFile).where(TaskFile.task_id == task_id)))
+            .scalars()
+            .all()
+        )
     assert task.status == TaskStatus.SUCCEEDED
     assert task.progress == 100 and task.finished_at is not None
     assert result.result["mock"] is True
@@ -66,7 +76,9 @@ async def test_worker_failure_then_retry_creates_new_task() -> None:
         workflow=MockWorkflowExecutor(settings, fail_stage=TaskStage.PARSING),
     )
     await runner.run_once()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
         failed = await client.get(f"/api/v1/tasks/{task_id}")
         assert failed.json()["data"]["status"] == "FAILED"
         response = await client.post(f"/api/v1/tasks/{task_id}/retry")
@@ -81,7 +93,9 @@ async def test_stale_task_requeues_then_fails_at_max_attempts() -> None:
     task_id = await create("/api/v1/final-comparisons", FINAL_PAYLOAD)
     old = datetime.now(UTC) - timedelta(hours=1)
     async with SessionFactory() as session, session.begin():
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
         task.status = TaskStatus.RUNNING
         task.stage = TaskStage.PARSING
         task.worker_id = "dead-worker"
@@ -93,7 +107,9 @@ async def test_stale_task_requeues_then_fails_at_max_attempts() -> None:
     assert requeued == [task_id] and failed == []
 
     async with SessionFactory() as session, session.begin():
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
         task.status = TaskStatus.RUNNING
         task.stage = TaskStage.PARSING
         task.worker_id = "dead-worker-2"
@@ -102,7 +118,9 @@ async def test_stale_task_requeues_then_fails_at_max_attempts() -> None:
     requeued, failed = await runner.recover_stale()
     assert requeued == [] and failed == [task_id]
     async with SessionFactory() as session:
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
     assert task.status == TaskStatus.FAILED and task.error_code == "WORKER_LOST"
 
 
@@ -113,7 +131,10 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
         document = Document()
         document.add_paragraph(f"合同金额为{amount}万元，期限为24个月。")
         document.save(path)
-    bodies = {"/baseline.docx": baseline_path.read_bytes(), "/target.docx": target_path.read_bytes()}
+    bodies = {
+        "/baseline.docx": baseline_path.read_bytes(),
+        "/target.docx": target_path.read_bytes(),
+    }
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=bodies[request.url.path], request=request)
@@ -123,8 +144,14 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
 
     payload = {
         "client_reference_id": "integration-real-final",
-        "baseline_file": {"url": "http://fixture-server/baseline.docx?token=secret", "file_name": "baseline.docx"},
-        "target_file": {"url": "http://fixture-server/target.docx?token=secret", "file_name": "target.docx"},
+        "baseline_file": {
+            "url": "http://fixture-server/baseline.docx?token=secret",
+            "file_name": "baseline.docx",
+        },
+        "target_file": {
+            "url": "http://fixture-server/target.docx?token=secret",
+            "file_name": "target.docx",
+        },
     }
     task_id = await create("/api/v1/final-comparisons", payload)
     base_settings = get_settings()
@@ -133,6 +160,7 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
             "TEMP_ROOT": str(tmp_path / "work"),
             "ALLOW_HTTP_DOWNLOADS": True,
             "DOWNLOAD_HOST_ALLOWLIST": "fixture-server",
+            "OCR_ENABLED": False,
         }
     )
     downloader = SafeFileDownloadService(
@@ -147,9 +175,17 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
     assert await runner.run_once() is True
 
     async with SessionFactory() as session:
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
-        stored = (await session.execute(select(TaskResult).where(TaskResult.task_id == task_id))).scalar_one()
-        files = (await session.execute(select(TaskFile).where(TaskFile.task_id == task_id))).scalars().all()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
+        stored = (
+            await session.execute(select(TaskResult).where(TaskResult.task_id == task_id))
+        ).scalar_one()
+        files = (
+            (await session.execute(select(TaskFile).where(TaskFile.task_id == task_id)))
+            .scalars()
+            .all()
+        )
     assert task.status == TaskStatus.SUCCEEDED
     assert stored.result["mock"] is False
     assert stored.result["metadata"]["execution_mode"] == "RULE_BASED"
@@ -195,7 +231,9 @@ async def test_empty_text_pdf_fails_with_ocr_required_and_cleans_workspace(tmp_p
     )
     assert await runner.run_once() is True
     async with SessionFactory() as session:
-        task = (await session.execute(select(CheckTask).where(CheckTask.id == task_id))).scalar_one()
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
     assert task.status == TaskStatus.FAILED
     assert task.error_code == "OCR_REQUIRED"
     assert work_root.exists() and not any(work_root.iterdir())

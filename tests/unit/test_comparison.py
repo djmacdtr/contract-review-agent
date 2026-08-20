@@ -9,7 +9,13 @@ from app.documents.models import (
 )
 
 
-def paragraph_document(file_id: str, texts: list[str]) -> ParsedDocument:
+def paragraph_document(
+    file_id: str,
+    texts: list[str],
+    *,
+    source: str | None = None,
+    confidence: float | None = None,
+) -> ParsedDocument:
     return ParsedDocument(
         file_id=file_id,
         role="BASELINE" if file_id == "base" else "TARGET",
@@ -23,7 +29,11 @@ def paragraph_document(file_id: str, texts: list[str]) -> ParsedDocument:
                 order=index,
                 raw_text=text,
                 normalized_text=text,
-                location=DocumentLocation(paragraph_index=index),
+                location=DocumentLocation(
+                    paragraph_index=index,
+                    source=source,
+                    confidence=confidence,
+                ),
             )
             for index, text in enumerate(texts)
         ],
@@ -76,8 +86,12 @@ def test_same_document_has_no_differences() -> None:
 
 
 def test_paragraph_numeric_added_and_deleted_are_classified() -> None:
-    baseline = paragraph_document("base", ["第一条 合同金额为100万元。", "第二条 保留条款", "将删除"])
-    target = paragraph_document("target", ["第一条 合同金额为120万元。", "第二条 保留条款", "新增内容"])
+    baseline = paragraph_document(
+        "base", ["第一条 合同金额为100万元。", "第二条 保留条款", "将删除"]
+    )
+    target = paragraph_document(
+        "target", ["第一条 合同金额为120万元。", "第二条 保留条款", "新增内容"]
+    )
     compared = compare_documents(baseline, target, CompareOptions())
     types = [item.diff_type for item in compared.diff_items]
     assert "NUMERIC_CHANGED" in types
@@ -89,7 +103,9 @@ def test_paragraph_numeric_added_and_deleted_are_classified() -> None:
 
 
 def test_table_cell_change_has_traceable_row_and_column() -> None:
-    compared = compare_documents(table_document("base", "100万元"), table_document("target", "120万元"), CompareOptions())
+    compared = compare_documents(
+        table_document("base", "100万元"), table_document("target", "120万元"), CompareOptions()
+    )
     item = next(item for item in compared.diff_items if item.diff_type == "TABLE_CELL_CHANGED")
     assert item.baseline.location.table_index == 0
     assert item.baseline.location.row == 1
@@ -119,3 +135,23 @@ def test_table_rows_match_by_unique_first_column_when_order_changes() -> None:
     base_table.rows.append(extra_base)
     compared = compare_documents(baseline, target, CompareOptions())
     assert compared.diff_items == []
+
+
+def test_low_confidence_ocr_text_is_low_but_numeric_change_remains_high() -> None:
+    baseline = paragraph_document(
+        "base", ["第一条 普通说明。", "第二条 合同金额为100万元。"], source="OCR", confidence=0.55
+    )
+    target = paragraph_document(
+        "target", ["第一条 普通描述。", "第二条 合同金额为120万元。"], source="OCR", confidence=0.55
+    )
+    compared = compare_documents(
+        baseline,
+        target,
+        CompareOptions(ocr_low_confidence_threshold=0.8),
+    )
+    ordinary = next(item for item in compared.diff_items if item.diff_type == "MODIFIED")
+    numeric = next(item for item in compared.diff_items if item.diff_type == "NUMERIC_CHANGED")
+    assert ordinary.severity == "LOW"
+    assert ordinary.confidence == 0.55
+    assert numeric.severity == "HIGH"
+    assert numeric.confidence == 0.55
