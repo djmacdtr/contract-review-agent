@@ -139,19 +139,19 @@ docker volume inspect contract-review-postgres-data
 当开发机 Docker 网络无法访问甲方 OCR，但宿主机可以访问时，可让 PostgreSQL 继续运行在 Docker 中，让 API 与 Worker 使用上述 Miniconda 环境在宿主机运行。仅对这些临时进程设置 `OCR_ENABLED=true`，并将 `DATABASE_URL` 指向映射到 `127.0.0.1` 的 PostgreSQL 端口。可用以下脚本验证，但输入只能使用脱敏或完全合成的扫描 PDF：
 
 ```powershell
-conda run -n contract-review-agent-py312 python scripts/ocr_live_probe.py <synthetic-scan.pdf>
+conda run -n contract-review-agent-py312 python scripts/ocr_live_probe.py --mode auto <synthetic-scan.pdf>
 conda run -n contract-review-agent-py312 python scripts/e2e_ocr_local.py
 # 46 页验收（文件名、API/fixture 地址和期望页数均可用环境变量覆盖）
 conda run -n contract-review-agent-py312 python scripts/e2e_ocr_acceptance.py
 ```
 
-真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本只打印页数、结构块数、表格数、引擎版本和置信度摘要，不打印全文、服务地址或密钥。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
+`ocr_live_probe.py` 的 `--mode` 支持 `auto` 或 `scan`，默认 `auto`。真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本成功时只打印页数、结构块/表格/单元格数、解析模式、耗时、响应大小和置信度摘要；失败时只打印稳定错误码及安全诊断，不打印异常链、全文、服务地址或密钥。安全诊断仅包含组件、失败类型、尝试次数和耗时，并通过任务现有 `error_details` 字段持久化。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
 
 2026-08-20 已完成一组 0.3.0 的 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。0.4.0 已将 PDF/PDF 改为双方统一 external `auto`，并在结果 `metadata.comparison_diagnostics` 返回双侧覆盖率、全局相似度、候选/最终差异数、fallback 和可靠性原因。若可靠性门槛未通过，候选差异不会升级为 HIGH/MEDIUM 业务风险，结论固定为 `REVIEW_REQUIRED`。
 
 0.4.0 首次 46 页双方 external `auto` 诊断任务已确认 46/46 页、双侧覆盖率 100%、全局相似度 99.05%，差异由旧流程的 2,099 项降至 16 项。0.4.1 进一步定点合并 OCR 表格中“空主键、仅名称/描述类文本列非空”的相邻续行，并以 `OCR_SINGLE_CHAR_VARIANCE`、`OCR_PLACEHOLDER_VARIANCE`、`OCR_READING_ORDER_VARIANCE` 等原因码保留 LOW 人工复核；金额、日期、比例、主体、条款和表格真实变化由正样本保护，Docker 全量测试为 91 项通过。
 
-0.4.1 获准的唯一一次 46 页真实复验任务 `tsk_01M0F5C0FB1SRY05XQP6AGKPW0` 在 `PARSING / 35%` 以 `OCR_SERVICE_UNAVAILABLE` 安全失败，未生成结果，临时目录已清理且未自动重跑。因此 0 HIGH、0 MEDIUM、最多 3 LOW、`reliable=true` 等最终精度门槛尚未形成新的端到端证据，当前 PR 必须保持 Draft。
+0.4.1 首次获准的 46 页复验曾在 `PARSING / 35%` 以 `OCR_SERVICE_UNAVAILABLE` 安全失败，未自动重跑。增加安全诊断和单页预检后，2026-08-20 在宿主机链路完成了严格限额复验：单页预检上传 1 次、唯一 46 页任务双方各上传 1 次，HTTP 自动重试关闭。任务 `tsk_01M0F7EP40AEJNRG7CJNET0BS5` 在 84.782 秒内成功，双方 external `auto` 均为 46/46 页，双侧覆盖率 100%，最终只有 3 项带原因码的 LOW 人工复核项，HIGH、MEDIUM 和 `NUMERIC_CHANGED` 均为 0，结论为 `REVIEW_REQUIRED`。后端 Docker 全量测试为 103 项通过。自动浏览器在本次环境中不可用，控制台视觉检查仍需按进度记录中的人工清单完成，因此 PR 暂时保持 Draft。
 
 ## 常见问题
 
