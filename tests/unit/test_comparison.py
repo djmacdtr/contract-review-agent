@@ -1,9 +1,13 @@
+import pytest
+
 from app.comparison.engine import CompareOptions, compare_documents
+from app.comparison.reliable import comparison_normalize
 from app.documents.models import (
     DocumentBlock,
     DocumentLocation,
     ParsedDocument,
     ParsedTable,
+    ProcessingWarning,
     TableCell,
     TableRow,
 )
@@ -41,9 +45,15 @@ def paragraph_document(
     )
 
 
-def table_document(file_id: str, amount: str) -> ParsedDocument:
+def table_document_from_rows(
+    file_id: str,
+    values_by_row: list[tuple[str, ...]],
+    *,
+    source: str | None = None,
+    confidence: float | None = None,
+) -> ParsedDocument:
     rows = []
-    for row_index, values in enumerate((("项目", "金额"), ("设备A", amount))):
+    for row_index, values in enumerate(values_by_row):
         rows.append(
             TableRow(
                 row=row_index,
@@ -51,7 +61,14 @@ def table_document(file_id: str, amount: str) -> ParsedDocument:
                     TableCell(
                         raw_text=value,
                         normalized_text=value,
-                        location=DocumentLocation(table_index=0, row=row_index, column=column),
+                        location=DocumentLocation(
+                            page=1,
+                            table_index=0,
+                            row=row_index,
+                            column=column,
+                            source=source,
+                            confidence=confidence,
+                        ),
                     )
                     for column, value in enumerate(values)
                 ],
@@ -70,11 +87,35 @@ def table_document(file_id: str, amount: str) -> ParsedDocument:
                 order=0,
                 raw_text="",
                 normalized_text="",
-                location=DocumentLocation(table_index=0),
+                location=DocumentLocation(page=1, table_index=0, source=source),
                 table=ParsedTable(table_index=0, rows=rows),
             )
         ],
         parser_name="test",
+    )
+
+
+def table_document(file_id: str, amount: str) -> ParsedDocument:
+    return table_document_from_rows(
+        file_id,
+        [("项目", "金额"), ("设备A", amount)],
+    )
+
+
+def asset_table_document(
+    file_id: str,
+    rows: list[tuple[str, ...]],
+    *,
+    source: str | None = "OCR",
+) -> ParsedDocument:
+    return table_document_from_rows(
+        file_id,
+        [
+            ("序号", "设备名称", "设备编号", "数量", "金额", "交付日期"),
+            *rows,
+        ],
+        source=source,
+        confidence=0.99 if source == "OCR" else None,
     )
 
 
@@ -155,3 +196,396 @@ def test_low_confidence_ocr_text_is_low_but_numeric_change_remains_high() -> Non
     assert ordinary.confidence == 0.55
     assert numeric.severity == "HIGH"
     assert numeric.confidence == 0.55
+
+
+def test_one_to_many_and_many_to_one_segmentation_are_equivalent() -> None:
+    whole = "第一条合同金额为100万元，租赁期限为24个月。"
+    split = ["第一条合同金额为100万元，", "租赁期限为24个月。"]
+    one_to_many = compare_documents(
+        paragraph_document("base", [whole]), paragraph_document("target", split), CompareOptions()
+    )
+    many_to_one = compare_documents(
+        paragraph_document("base", split), paragraph_document("target", [whole]), CompareOptions()
+    )
+    assert one_to_many.diff_items == []
+    assert many_to_one.diff_items == []
+    assert one_to_many.diagnostics.reliable is True
+    assert many_to_one.diagnostics.reliable is True
+
+
+def test_many_to_many_segmentation_preserves_traceable_locations() -> None:
+    baseline = paragraph_document("base", ["第一条付款金额为100万元，", "期限24个月。"])
+    target = paragraph_document("target", ["第一条付款金额为120万元，期限24个月。"])
+    compared = compare_documents(baseline, target, CompareOptions())
+    numeric = next(item for item in compared.diff_items if item.diff_type == "NUMERIC_CHANGED")
+    assert len(numeric.baseline.locations) == 2
+    assert len(numeric.target.locations) == 1
+    assert numeric.baseline.location == numeric.baseline.locations[0]
+    assert compared.diagnostics.alignment_coverage_baseline == 1.0
+
+
+def test_comparison_normalization_suppresses_spacing_linebreak_and_punctuation_noise() -> None:
+    baseline = paragraph_document("base", ["第 一 条\u200b 合同金额：100万元。"])
+    target = paragraph_document("target", ["第一条\n合同金额:100万元"])
+    compared = compare_documents(baseline, target, CompareOptions())
+    assert compared.diff_items == []
+
+
+def test_adjacent_text_only_table_continuation_row_is_merged() -> None:
+    baseline = asset_table_document(
+        "base",
+        [("1", "大型钢制储罐设备", "EQ-001", "2", "100万元", "2026年8月20日")],
+    )
+    target = asset_table_document(
+        "target",
+        [
+            ("1", "大型钢制储罐", "EQ-001", "2", "100万元", "2026年8月20日"),
+            ("", "设备", "", "", "", ""),
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert compared.diff_items == []
+
+
+def test_sparse_multirow_table_continuations_are_merged_before_compatibility_gate() -> None:
+    baseline = asset_table_document(
+        "base",
+        [("1", "大型钢制储罐设备名称", "EQ-001", "2", "100万元", "2026年8月20日")],
+    )
+    target = asset_table_document(
+        "target",
+        [
+            ("1", "大型", "EQ-001", "2", "100万元", "2026年8月20日"),
+            ("", "钢制", "", "", "", ""),
+            ("", "储罐", "", "", "", ""),
+            ("", "设备", "", "", "", ""),
+            ("", "名称", "", "", "", ""),
+        ],
+    )
+    target_table = target.blocks[0].table
+    assert target_table is not None
+    for row in target_table.rows[2:]:
+        row.cells = [row.cells[1]]
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert compared.diff_items == []
+    assert compared.diagnostics.compatible_table_count == 1
+
+
+@pytest.mark.parametrize(
+    ("baseline", "target"),
+    [
+        ("融资租赁合同", "融资<br>租赁**合同**"),
+        ("设备规格A~B", "$\\mathrm {设备规格A}\\mathrm {\\sim B}$"),
+        ("设备A 设备B", "| 设备A | 设备B |"),
+    ],
+)
+def test_comparison_normalization_suppresses_external_parser_markup(
+    baseline: str, target: str
+) -> None:
+    assert comparison_normalize(baseline)[1] == comparison_normalize(target)[1]
+
+
+def test_legal_clause_single_character_ocr_variance_is_retained_as_review_only() -> None:
+    prefix = "第十条争议解决条款约定双方应当依约履行义务" * 5
+    compared = compare_documents(
+        paragraph_document("base", [prefix + "双方同意继续履行。"], source="OCR", confidence=0.99),
+        paragraph_document("target", [prefix + "双方同继续履行。"], source="OCR", confidence=0.99),
+        CompareOptions(),
+    )
+    assert len(compared.diff_items) == 1
+    assert compared.diff_items[0].diff_type == "MODIFIED"
+    assert compared.diff_items[0].severity == "LOW"
+    assert compared.diff_items[0].review_reason == "OCR_SINGLE_CHAR_VARIANCE"
+
+
+def test_external_parser_reading_order_variance_is_review_only() -> None:
+    common = "合同附件列明设备名称规格数量及存放地点并由双方确认"
+    compared = compare_documents(
+        paragraph_document(
+            "base", [common + "钢制储罐其他约定"], source="OCR", confidence=0.99
+        ),
+        paragraph_document(
+            "target", [common + "其他约定钢制储罐"], source="OCR", confidence=0.99
+        ),
+        CompareOptions(),
+    )
+    assert len(compared.diff_items) == 1
+    assert compared.diff_items[0].severity == "LOW"
+    assert compared.diff_items[0].review_reason == "OCR_READING_ORDER_VARIANCE"
+
+
+def test_amount_placeholder_single_character_variance_is_retained_for_review() -> None:
+    common = "支付金额(大写):__________元;支付金额(小写):人民币__________元"
+    compared = compare_documents(
+        paragraph_document("base", [common + "D"], source="OCR", confidence=0.99),
+        paragraph_document("target", [common], source="OCR", confidence=0.99),
+        CompareOptions(),
+    )
+
+    assert len(compared.diff_items) == 1
+    assert compared.diff_items[0].diff_type == "MODIFIED"
+    assert compared.diff_items[0].severity == "LOW"
+    assert compared.diff_items[0].review_reason == "OCR_PLACEHOLDER_VARIANCE"
+
+
+def test_same_character_multiset_with_true_word_order_change_is_not_suppressed() -> None:
+    compared = compare_documents(
+        paragraph_document(
+            "base",
+            ["本合同约定先交付设备后支付全部价款"],
+            source="OCR",
+            confidence=0.99,
+        ),
+        paragraph_document(
+            "target",
+            ["本合同约定先支付全部价款后交付设备"],
+            source="OCR",
+            confidence=0.99,
+        ),
+        CompareOptions(),
+    )
+
+    assert compared.diff_items
+    assert {item.diff_type for item in compared.diff_items} <= {"ADDED", "DELETED", "MODIFIED"}
+    assert any(item.requires_manual_review for item in compared.diff_items)
+    assert any(item.baseline is not None for item in compared.diff_items)
+    assert any(item.target is not None for item in compared.diff_items)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("付款日期为2026年8月20日。", "付款日期为2026年9月20日。"),
+        ("年利率为3.5%。", "年利率为4.1%。"),
+        ("租赁期限为24个月。", "租赁期限为36个月。"),
+    ],
+)
+def test_critical_numeric_changes_are_never_absorbed_by_fuzzy_alignment(
+    before: str, after: str
+) -> None:
+    compared = compare_documents(
+        paragraph_document("base", [before]),
+        paragraph_document("target", [after]),
+        CompareOptions(),
+    )
+    assert [item.diff_type for item in compared.diff_items] == ["NUMERIC_CHANGED"]
+    assert compared.diff_items[0].severity == "HIGH"
+    assert compared.diff_items[0].baseline.location.paragraph_index == 0
+    assert compared.diff_items[0].target.location.paragraph_index == 0
+    assert compared.diff_items[0].baseline.text == before
+    assert compared.diff_items[0].target.text == after
+    assert any(segment.operation == "DELETE" for segment in compared.diff_items[0].segments)
+    assert any(segment.operation == "INSERT" for segment in compared.diff_items[0].segments)
+
+
+def test_subject_and_clause_changes_remain_recallable() -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["第一条甲方为北京示例公司。", "第二条保留条款。"]),
+        paragraph_document("target", ["第一条甲方为上海示例公司。", "新增完整条款。"]),
+        CompareOptions(),
+    )
+    assert any(item.severity == "HIGH" for item in compared.diff_items)
+
+
+def test_subject_single_character_change_is_high_and_traceable() -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["第一条甲方为北京示例科技有限公司。"]),
+        paragraph_document("target", ["第一条甲方为北京示例科枝有限公司。"]),
+        CompareOptions(),
+    )
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "MODIFIED"
+    assert item.severity == "HIGH"
+    assert item.baseline.location.paragraph_index == 0
+    assert item.target.location.paragraph_index == 0
+    assert any(segment.operation == "DELETE" and segment.text == "技" for segment in item.segments)
+    assert any(segment.operation == "INSERT" and segment.text == "枝" for segment in item.segments)
+
+
+def test_complete_clause_addition_and_deletion_preserve_type_and_locations() -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["共同条款。", "原完整条款仅在基准文件中存在。"]),
+        paragraph_document("target", ["共同条款。", "新完整约定仅在目标文件中出现。"]),
+        CompareOptions(),
+    )
+
+    assert {item.diff_type for item in compared.diff_items} == {"ADDED", "DELETED"}
+    deleted = next(item for item in compared.diff_items if item.diff_type == "DELETED")
+    added = next(item for item in compared.diff_items if item.diff_type == "ADDED")
+    assert deleted.baseline.location.paragraph_index == 1
+    assert deleted.target is None
+    assert added.target.location.paragraph_index == 1
+    assert added.baseline is None
+
+
+@pytest.mark.parametrize(
+    ("column", "before", "after", "expected_severity"),
+    [
+        (1, "大型钢制储罐", "大型不锈钢储罐", "MEDIUM"),
+        (2, "EQ-001", "EQ-009", "HIGH"),
+        (3, "2", "3", "HIGH"),
+        (4, "100万元", "120万元", "HIGH"),
+        (5, "2026年8月20日", "2026年9月20日", "HIGH"),
+    ],
+)
+def test_real_table_cell_changes_are_not_absorbed(
+    column: int,
+    before: str,
+    after: str,
+    expected_severity: str,
+) -> None:
+    base_values = ["1", "大型钢制储罐", "EQ-001", "2", "100万元", "2026年8月20日"]
+    target_values = base_values.copy()
+    base_values[column] = before
+    target_values[column] = after
+
+    compared = compare_documents(
+        asset_table_document("base", [tuple(base_values)]),
+        asset_table_document("target", [tuple(target_values)]),
+        CompareOptions(),
+    )
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "TABLE_CELL_CHANGED"
+    assert item.severity == expected_severity
+    assert item.baseline.location.row == 1
+    assert item.baseline.location.column == column
+    assert item.target.location.row == 1
+    assert item.target.location.column == column
+    assert item.baseline.text == before
+    assert item.target.text == after
+
+
+@pytest.mark.parametrize(
+    ("continuation", "expected_column"),
+    [
+        (("2", "设备B", "EQ-002", "1", "80万元", "2026年8月21日"), 0),
+        (("", "设备B", "EQ-002", "", "", ""), 2),
+        (("", "设备B", "", "1", "", ""), 3),
+        (("", "设备B", "", "", "80万元", ""), 4),
+        (("", "设备B", "", "", "", "2026年8月21日"), 5),
+    ],
+)
+def test_table_rows_with_keys_or_critical_values_are_never_merged(
+    continuation: tuple[str, ...], expected_column: int
+) -> None:
+    baseline = asset_table_document(
+        "base",
+        [("1", "设备A", "EQ-001", "2", "100万元", "2026年8月20日")],
+    )
+    target = asset_table_document(
+        "target",
+        [
+            ("1", "设备A", "EQ-001", "2", "100万元", "2026年8月20日"),
+            continuation,
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert compared.diff_items
+    assert any(
+        location.column == expected_column
+        for item in compared.diff_items
+        for side in (item.baseline, item.target)
+        if side is not None
+        for location in (side.locations or [side.location])
+    )
+
+
+def test_unrelated_documents_are_safely_suppressed_for_manual_review() -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["第一条融资租赁合同金额为100万元。"]),
+        paragraph_document("target", ["天气预报显示明日有雨，出行请携带雨具。"]),
+        CompareOptions(),
+    )
+    assert compared.diff_items == []
+    assert compared.diagnostics.reliable is False
+    assert "DOCUMENT_PAIR_UNRELATED" in compared.diagnostics.reasons
+    assert any(warning.code == "DOCUMENT_PAIR_UNRELATED" for warning in compared.warnings)
+
+
+def test_repeated_headers_and_footers_are_ignored_by_default() -> None:
+    baseline = paragraph_document("base", ["第一条共同正文。"])
+    target = paragraph_document("target", ["第一条共同正文。"])
+    for document, marker in ((baseline, "基准页眉"), (target, "目标页眉")):
+        document.blocks.extend(
+            [
+                DocumentBlock(
+                    block_id=f"{document.file_id}_header_{page}",
+                    type="HEADER" if page % 2 else "FOOTER",
+                    order=page,
+                    raw_text=f"{marker}-{page}",
+                    normalized_text=f"{marker}-{page}",
+                    location=DocumentLocation(page=page, source="OCR", confidence=0.99),
+                )
+                for page in range(1, 5)
+            ]
+        )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert compared.diff_items == []
+
+
+def test_structure_explosion_is_suppressed_and_reported() -> None:
+    baseline = paragraph_document("base", [f"物理短行{i}" for i in range(20)])
+    target = paragraph_document("target", ["完全不同的长段落A", "完全不同的长段落B"])
+    compared = compare_documents(baseline, target, CompareOptions())
+    assert compared.diff_items == []
+    assert compared.diagnostics.candidate_diff_count > 0
+    assert compared.diagnostics.emitted_diff_count == 0
+    assert compared.diagnostics.reliable is False
+    assert "ALIGNMENT_UNRELIABLE" in compared.diagnostics.reasons
+
+
+def test_duplicate_warnings_are_aggregated_with_count() -> None:
+    baseline = paragraph_document("base", ["相同内容"])
+    target = paragraph_document("target", ["相同内容"])
+    baseline.warnings = [
+        ProcessingWarning(code="OCR_NOTE", message="相同警告", requires_manual_review=False),
+        ProcessingWarning(code="OCR_NOTE", message="相同警告", requires_manual_review=False),
+    ]
+    compared = compare_documents(baseline, target, CompareOptions())
+    notes = [warning for warning in compared.warnings if warning.code == "OCR_NOTE"]
+    assert len(notes) == 1
+    assert notes[0].details["count"] == 2
+
+
+def test_page_flat_fallback_recovers_equivalent_split_pdf_text() -> None:
+    parts = ["第一条", "合同", "金额", "为", "100", "万元", "期限", "24个月"]
+    baseline = paragraph_document("base", parts)
+    target = paragraph_document("target", ["".join(parts)])
+    for document in (baseline, target):
+        document.page_count = 1
+        for block in document.blocks:
+            block.location.page = 1
+    compared = compare_documents(baseline, target, CompareOptions())
+    assert compared.diff_items == []
+    assert compared.diagnostics.fallback_mode == "PAGE_FLAT"
+    assert compared.diagnostics.alignment_coverage_baseline == 1.0
+
+
+def test_incompatible_tables_fall_back_without_row_explosion() -> None:
+    baseline = table_document("base", "100万元")
+    target = table_document("target", "100万元")
+    assert target.blocks[0].table is not None
+    for row in target.blocks[0].table.rows:
+        row.cells.append(
+            TableCell(
+                raw_text="附加列",
+                normalized_text="附加列",
+                location=DocumentLocation(table_index=0, row=row.row, column=2),
+            )
+        )
+    compared = compare_documents(baseline, target, CompareOptions())
+    assert any(warning.code == "TABLE_STRUCTURE_INCOMPATIBLE" for warning in compared.warnings)
+    assert not any(item.diff_type.startswith("TABLE_") for item in compared.diff_items)
+    assert compared.diagnostics.compatible_table_count == 0

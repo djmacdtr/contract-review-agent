@@ -1,6 +1,6 @@
 # 合同智能检查 Agent
 
-这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE` 已支持受控 URL 下载、DOCX/文本型 PDF 本地解析、扫描 PDF 外部 OCR 回退，以及确定性文字、数值和基础表格比对；`DRAFT_REVIEW` 仍为 Mock。
+这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.4.1` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、可靠性保护、严格的 OCR 表格续行合并，以及带原因码的 LOW 人工复核项；`DRAFT_REVIEW` 仍为 Mock。
 
 > 所有结果都不构成合同审查、法律审核或放款意见。真实版本比对标记为 `RULE_BASED`；OCR 只负责文档结构解析，本版本不调用 LLM，也不检查印章。
 
@@ -130,7 +130,7 @@ docker volume inspect contract-review-postgres-data
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
 - `ALLOW_HTTP_DOWNLOADS` 默认关闭；开发 fixture 需要显式开启，并将 `DOWNLOAD_HOST_ALLOWLIST` 精确设为 `fixture-server`。
 - `MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`DOWNLOAD_MAX_REDIRECTS` 控制下载边界。
-- `PDF_MIN_TEXT_CHARS_PER_PAGE` 控制文本 PDF 最低文本密度；低于阈值时，仅在 OCR 完整启用后回退外部解析，否则返回 `OCR_REQUIRED`。
+- `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
 - `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
 
@@ -139,15 +139,19 @@ docker volume inspect contract-review-postgres-data
 当开发机 Docker 网络无法访问甲方 OCR，但宿主机可以访问时，可让 PostgreSQL 继续运行在 Docker 中，让 API 与 Worker 使用上述 Miniconda 环境在宿主机运行。仅对这些临时进程设置 `OCR_ENABLED=true`，并将 `DATABASE_URL` 指向映射到 `127.0.0.1` 的 PostgreSQL 端口。可用以下脚本验证，但输入只能使用脱敏或完全合成的扫描 PDF：
 
 ```powershell
-conda run -n contract-review-agent-py312 python scripts/ocr_live_probe.py <synthetic-scan.pdf>
+conda run -n contract-review-agent-py312 python scripts/ocr_live_probe.py --mode auto <synthetic-scan.pdf>
 conda run -n contract-review-agent-py312 python scripts/e2e_ocr_local.py
 # 46 页验收（文件名、API/fixture 地址和期望页数均可用环境变量覆盖）
 conda run -n contract-review-agent-py312 python scripts/e2e_ocr_acceptance.py
 ```
 
-真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本只打印页数、结构块数、表格数、引擎版本和置信度摘要，不打印全文、服务地址或密钥。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
+`ocr_live_probe.py` 的 `--mode` 支持 `auto` 或 `scan`，默认 `auto`。真实 OCR 地址、鉴权头和值只从被 Git 忽略的 `.env` 或进程环境读取。探测脚本成功时只打印页数、结构块/表格/单元格数、解析模式、耗时、响应大小和置信度摘要；失败时只打印稳定错误码及安全诊断，不打印异常链、全文、服务地址或密钥。安全诊断仅包含组件、失败类型、尝试次数和耗时，并通过任务现有 `error_details` 字段持久化。宿主机成功不能替代最终甲方内网中 Worker 容器的单页扫描 PDF 验收。
 
-2026-08-20 已完成一组 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。该数据支持当前继续使用同步模式，但仍需在甲方部署环境验证容器网络，并在决定约 200 页测试前评估 Worker 队列等待影响。
+2026-08-20 已完成一组 0.3.0 的 46 页宿主机真实闭环：基准文件由 `pdfplumber` 解析，扫描目标文件回退 OCR，46 页全部成功；任务总耗时约 52.4 秒，OCR 服务耗时约 43.0 秒，响应约 5.1 MiB。0.4.0 已将 PDF/PDF 改为双方统一 external `auto`，并在结果 `metadata.comparison_diagnostics` 返回双侧覆盖率、全局相似度、候选/最终差异数、fallback 和可靠性原因。若可靠性门槛未通过，候选差异不会升级为 HIGH/MEDIUM 业务风险，结论固定为 `REVIEW_REQUIRED`。
+
+0.4.0 首次 46 页双方 external `auto` 诊断任务已确认 46/46 页、双侧覆盖率 100%、全局相似度 99.05%，差异由旧流程的 2,099 项降至 16 项。0.4.1 进一步定点合并 OCR 表格中“空主键、仅名称/描述类文本列非空”的相邻续行，并以 `OCR_SINGLE_CHAR_VARIANCE`、`OCR_PLACEHOLDER_VARIANCE`、`OCR_READING_ORDER_VARIANCE` 等原因码保留 LOW 人工复核；金额、日期、比例、主体、条款和表格真实变化由正样本保护，Docker 全量测试为 91 项通过。
+
+0.4.1 首次获准的 46 页复验曾在 `PARSING / 35%` 以 `OCR_SERVICE_UNAVAILABLE` 安全失败，未自动重跑。增加安全诊断和单页预检后，2026-08-20 在宿主机链路完成了严格限额复验：单页预检上传 1 次、唯一 46 页任务双方各上传 1 次，HTTP 自动重试关闭。任务 `tsk_01M0F7EP40AEJNRG7CJNET0BS5` 在 84.782 秒内成功，双方 external `auto` 均为 46/46 页，双侧覆盖率 100%，最终只有 3 项带原因码的 LOW 人工复核项，HIGH、MEDIUM 和 `NUMERIC_CHANGED` 均为 0，结论为 `REVIEW_REQUIRED`。后端 Docker 全量测试为 103 项通过。自动浏览器在本次环境中不可用，控制台视觉检查仍需按进度记录中的人工清单完成，因此 PR 暂时保持 Draft。
 
 ## 常见问题
 
@@ -178,6 +182,6 @@ docker compose logs worker
 
 ## 当前能力边界
 
-已实现 FINAL_COMPARE 的受控下载、DOCX/文本型 PDF 本地解析、扫描 PDF 同步 OCR 回退，以及文字/数值/基础表格差异。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。OCR 响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
+已实现 FINAL_COMPARE 的受控下载、任务级一致解析计划、同步外部 PDF 解析，以及文字/数值/基础表格差异。对齐引擎会处理中文空格、软换行、零宽字符和已确认的解析器标记噪声，支持 1–4 对 1–4 条款合并/拆分、严格的 OCR 表格续行合并、表格兼容门控及页面文本 fallback；不可靠对齐不会直接生成业务风险。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。外部解析响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
 
-尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。OCR 未配置时，扫描或低文本密度 PDF 会明确以 `OCR_REQUIRED` 失败，不会假装完成。
+尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 真实模板/跨资料检查、复杂表格、合同数学规则、印章、上传、报告、鉴权和模板库。正式 PDF 比对未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。

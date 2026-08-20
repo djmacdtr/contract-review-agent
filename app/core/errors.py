@@ -19,14 +19,27 @@ class AppError(Exception):
 
 class TaskNotFoundError(AppError):
     def __init__(self, task_id: str) -> None:
-        super().__init__("TASK_NOT_FOUND", "任务不存在", status_code=404, details={"task_id": task_id})
+        super().__init__(
+            "TASK_NOT_FOUND",
+            "任务不存在",
+            status_code=404,
+            details={"task_id": task_id},
+        )
 
 
 class WorkflowError(Exception):
     """A safe, stable task failure that may be persisted and returned to clients."""
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.safe_message = message
         self.retryable = retryable
+        self.details = details

@@ -1,4 +1,4 @@
-"""Validate one real text-PDF to scanned-PDF FINAL_COMPARE task using safe metrics."""
+"""Validate one paired 46-page external-parser FINAL_COMPARE task using safe metrics."""
 
 from __future__ import annotations
 
@@ -14,9 +14,12 @@ FIXTURE_BASE = os.getenv("OCR_FIXTURE_BASE_URL", "http://127.0.0.1:18080")
 BASELINE_NAME = os.getenv("OCR_BASELINE_FILE_NAME", "融资租赁合同_电子印章示例_原版46页.pdf")
 TARGET_NAME = os.getenv("OCR_TARGET_FILE_NAME", "融资租赁合同_电子印章示例_原版46页_扫描版.pdf")
 EXPECTED_PAGES = int(os.getenv("OCR_EXPECTED_PAGES", "46"))
-EXPECTED_VERSION = os.getenv("OCR_EXPECTED_WORKFLOW_VERSION", "0.3.0")
+EXPECTED_VERSION = os.getenv("OCR_EXPECTED_WORKFLOW_VERSION", "0.4.1")
 DEADLINE_SECONDS = float(os.getenv("OCR_E2E_TIMEOUT_SECONDS", "660"))
 MAX_RESPONSE_BYTES = int(float(os.getenv("OCR_MAX_RESPONSE_MB", "50")) * 1024 * 1024)
+MAX_FINAL_DIFFS = int(os.getenv("OCR_MAX_FINAL_DIFFS", "3"))
+MIN_ALIGNMENT_COVERAGE = float(os.getenv("OCR_MIN_ALIGNMENT_COVERAGE", "0.90"))
+PREVIOUS_DIFF_COUNT = int(os.getenv("OCR_PREVIOUS_DIFF_COUNT", "2099"))
 
 
 def fixture_url(file_name: str) -> str:
@@ -42,6 +45,36 @@ def required_metric(metadata: dict, name: str) -> int | float | str:
     if value is None:
         raise AssertionError(f"OCR parser metadata is missing {name}")
     return value
+
+
+def validate_external_file(file_result: dict) -> dict:
+    metadata = file_result.get("parser_metadata") or {}
+    assert file_result["parser_name"] == "textin-document-parser"
+    assert file_result["page_count"] == EXPECTED_PAGES
+    assert metadata.get("ocr") is True
+    assert metadata.get("parse_mode") == "auto"
+    assert required_metric(metadata, "engine_version")
+    assert required_metric(metadata, "duration_ms") >= 0
+    assert required_metric(metadata, "response_size_bytes") <= MAX_RESPONSE_BYTES
+    assert required_metric(metadata, "block_count") > 0
+    assert required_metric(metadata, "table_count") > 0
+    assert required_metric(metadata, "cell_count") > 0
+    assert required_metric(metadata, "detail_page_count") == EXPECTED_PAGES
+    assert required_metric(metadata, "bbox_block_count") > 0
+    assert required_metric(metadata, "bbox_cell_count") > 0
+    assert required_metric(metadata, "confidence_mean") > 0
+    assert required_metric(metadata, "confidence_min") > 0
+    return metadata
+
+
+def has_traceable_location(diff: dict) -> bool:
+    for side_name in ("baseline", "target"):
+        side = diff.get(side_name)
+        if not side:
+            continue
+        if side.get("locations") or side.get("location"):
+            return True
+    return False
 
 
 def main() -> None:
@@ -76,29 +109,34 @@ def main() -> None:
     files = {item["role"]: item for item in result["files"]}
     baseline = files["BASELINE"]
     target = files["TARGET"]
-    metadata = target.get("parser_metadata") or {}
+    baseline_metadata = validate_external_file(baseline)
+    target_metadata = validate_external_file(target)
+    diagnostics = result["metadata"]["comparison_diagnostics"]
+    statistics = result["summary"]["statistics"]
+    diff_items = result["diff_items"]
     result_size = len(json.dumps(result, ensure_ascii=False).encode())
 
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["metadata"]["workflow_version"] == EXPECTED_VERSION
     assert result["metadata"]["rules_version"] == EXPECTED_VERSION
-    assert baseline["parser_name"] == "pdfplumber"
-    assert baseline["page_count"] == EXPECTED_PAGES
-    assert target["parser_name"] == "textin-document-parser"
-    assert target["page_count"] == EXPECTED_PAGES
-    assert metadata.get("ocr") is True
-    assert required_metric(metadata, "engine_version")
-    assert required_metric(metadata, "duration_ms") >= 0
-    assert required_metric(metadata, "response_size_bytes") <= MAX_RESPONSE_BYTES
-    assert required_metric(metadata, "block_count") > 0
-    assert required_metric(metadata, "table_count") > 0
-    assert required_metric(metadata, "cell_count") > 0
-    assert required_metric(metadata, "detail_page_count") == EXPECTED_PAGES
-    assert required_metric(metadata, "bbox_block_count") > 0
-    assert required_metric(metadata, "bbox_cell_count") > 0
-    assert required_metric(metadata, "confidence_mean") > 0
-    assert required_metric(metadata, "confidence_min") > 0
+    assert result["conclusion"] == "REVIEW_REQUIRED"
+    assert statistics["high"] == 0
+    assert statistics["medium"] == 0
+    assert statistics["low"] <= MAX_FINAL_DIFFS
+    assert not any(item["diff_type"] == "NUMERIC_CHANGED" for item in diff_items)
+    assert len(diff_items) <= MAX_FINAL_DIFFS
+    assert all(
+        item["severity"] == "LOW" and item.get("review_reason")
+        for item in diff_items
+    )
+    assert diagnostics["reliable"] is True
+    assert diagnostics["alignment_coverage_baseline"] >= MIN_ALIGNMENT_COVERAGE
+    assert diagnostics["alignment_coverage_target"] >= MIN_ALIGNMENT_COVERAGE
+    assert diagnostics["emitted_diff_count"] == len(diff_items)
+    assert all(has_traceable_location(item) for item in diff_items)
+    reduction = 1 - (len(diff_items) / PREVIOUS_DIFF_COUNT)
+    assert reduction >= 0.97
     assert elapsed <= 600
 
     safe = {
@@ -106,23 +144,16 @@ def main() -> None:
         "history": history,
         "elapsed_seconds": elapsed,
         "conclusion": result["conclusion"],
-        "diff_count": len(result["diff_items"]),
+        "diff_count": len(diff_items),
+        "diff_reduction_ratio": round(reduction, 6),
         "result_size_bytes": result_size,
         "baseline_parser": baseline["parser_name"],
         "target_parser": target["parser_name"],
-        "page_count": target["page_count"],
-        "engine_version": metadata["engine_version"],
-        "service_duration_ms": metadata["duration_ms"],
-        "response_size_bytes": metadata["response_size_bytes"],
-        "block_count": metadata["block_count"],
-        "table_count": metadata["table_count"],
-        "cell_count": metadata["cell_count"],
-        "detail_page_count": metadata["detail_page_count"],
-        "bbox_block_count": metadata["bbox_block_count"],
-        "bbox_cell_count": metadata["bbox_cell_count"],
-        "confidence_mean": metadata["confidence_mean"],
-        "confidence_min": metadata["confidence_min"],
-        "warning_codes": [item["code"] for item in target.get("parse_warnings", [])],
+        "baseline_metrics": baseline_metadata,
+        "target_metrics": target_metadata,
+        "comparison_diagnostics": diagnostics,
+        "statistics": statistics,
+        "warning_codes": [item["code"] for item in result.get("warnings", [])],
     }
     print(json.dumps(safe, ensure_ascii=False))
 

@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from rapidfuzz.fuzz import ratio
 
 from app.comparison.models import ComparisonResult, DiffItem, DiffSegment, DiffSide
-from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning, TableRow
+from app.documents.models import DocumentBlock, ParsedDocument, TableRow
 from app.documents.normalization import normalize_text
 
 NUMBER_PATTERN = re.compile(
@@ -414,27 +414,14 @@ def _compare_tables(
 def compare_documents(
     baseline: ParsedDocument, target: ParsedDocument, options: CompareOptions
 ) -> ComparisonResult:
-    differences = _compare_paragraphs(baseline, target, options, 1)
-    differences.extend(_compare_tables(baseline, target, len(differences) + 1, options))
-    warnings = [*baseline.warnings, *target.warnings]
-    if not options.ignore_formatting:
-        warnings.append(
-            ProcessingWarning(
-                code="FORMATTING_COMPARISON_NOT_SUPPORTED",
-                message="本阶段仅比较文字和基础表格内容，不比较字体、样式或版式",
-            )
-        )
-    return ComparisonResult(diff_items=differences, warnings=warnings)
+    from app.comparison.reliable import compare_documents_reliably
+
+    return compare_documents_reliably(baseline, target, options)
 
 
-def is_low_confidence_ocr_text_diff(item: DiffItem, threshold: float) -> bool:
-    if item.diff_type not in {"ADDED", "DELETED", "MODIFIED"}:
-        return False
-    locations = [
-        side.location
-        for side in (item.baseline, item.target)
-        if side is not None and side.location.source == "OCR"
-    ]
-    return bool(locations) and any(
-        location.confidence is None or location.confidence < threshold for location in locations
+def is_ocr_review_only_diff(item: DiffItem) -> bool:
+    return (
+        item.severity == "LOW"
+        and item.diff_type != "NUMERIC_CHANGED"
+        and item.review_reason is not None
     )
