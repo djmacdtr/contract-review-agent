@@ -22,7 +22,6 @@ from app.documents.models import (
     DocumentLocation,
     ParsedDocument,
     ProcessingWarning,
-    TableRow,
 )
 
 NUMBER_PATTERN = re.compile(
@@ -59,6 +58,35 @@ CRITICAL_KEYWORDS = (
     "付款",
     "主体",
 )
+TABLE_CONTINUATION_HEADERS = (
+    "名称",
+    "描述",
+    "说明",
+    "备注",
+    "约定",
+    "用途",
+    "地点",
+    "地址",
+    "规格",
+)
+TABLE_PROTECTED_HEADERS = (
+    "序号",
+    "编号",
+    "编码",
+    "型号",
+    "数量",
+    "单价",
+    "金额",
+    "日期",
+    "期限",
+    "比例",
+    "利率",
+    "税率",
+    "期数",
+    "账号",
+    "合计",
+)
+PLACEHOLDER_CONTEXT = ("金额", "价款", "大写", "小写", "人民币", "____")
 
 
 class CompareOptionsLike(Protocol):
@@ -110,6 +138,19 @@ class TableMatch:
     target: DocumentBlock
 
 
+@dataclass(frozen=True)
+class ComparableTableCell:
+    raw_text: str
+    locations: tuple[DocumentLocation, ...]
+
+
+@dataclass(frozen=True)
+class ComparableTableRow:
+    row: int
+    cells: tuple[ComparableTableCell, ...]
+    source_rows: tuple[int, ...]
+
+
 def comparison_normalize(text: str) -> tuple[str, str]:
     normalized = unicodedata.normalize("NFKC", text)
     normalized = normalized.replace("\u200b", "").replace("\u00ad", "")
@@ -156,24 +197,6 @@ def _paragraph_units(block: DocumentBlock) -> list[ComparableUnit]:
     ]
 
 
-def _row_unit(block: DocumentBlock, row: TableRow) -> ComparableUnit:
-    raw = " | ".join(cell.raw_text for cell in row.cells)
-    normalized, match_text = comparison_normalize(raw)
-    locations = tuple(cell.location for cell in row.cells) or (block.location,)
-    return ComparableUnit(
-        unit_id=f"{block.block_id}_row_{row.row}",
-        kind="TABLE_TEXT",
-        order=block.order + (row.row + 1) / 1000,
-        raw_text=raw,
-        normalized_text=normalized,
-        match_text=match_text,
-        clause_key=None,
-        locations=locations,
-        confidence=_confidence(locations),
-        page=next((location.page for location in locations if location.page is not None), None),
-    )
-
-
 def build_comparable_document(
     document: ParsedDocument,
     options: CompareOptionsLike,
@@ -194,24 +217,141 @@ def build_comparable_document(
             and block.table is not None
             and block.table.table_index not in structured_table_indexes
         ):
-            units.extend(_row_unit(block, row) for row in block.table.rows)
+            units.extend(
+                _comparable_table_row_unit(block, row)
+                for row in _comparable_table_rows(block)
+            )
     return ComparableDocument(
         source=document, units=tuple(sorted(units, key=lambda item: item.order))
     )
 
 
 def _table_header(block: DocumentBlock) -> str:
-    if not block.table or not block.table.rows:
+    rows = _comparable_table_rows(block)
+    if not rows:
         return ""
-    return "|".join(comparison_normalize(cell.raw_text)[1] for cell in block.table.rows[0].cells)
+    return "|".join(comparison_normalize(cell.raw_text)[1] for cell in rows[0].cells)
+
+
+def _table_column_count(block: DocumentBlock) -> int:
+    if not block.table:
+        return 0
+    maximum = 0
+    for row in block.table.rows:
+        for position, cell in enumerate(row.cells):
+            column = cell.location.column if cell.location.column is not None else position
+            maximum = max(maximum, column + 1)
+    return maximum
+
+
+def _dense_table_rows(block: DocumentBlock) -> list[ComparableTableRow]:
+    if not block.table:
+        return []
+    column_count = _table_column_count(block)
+    dense_rows: list[ComparableTableRow] = []
+    for row in sorted(block.table.rows, key=lambda item: item.row):
+        cells = [ComparableTableCell(raw_text="", locations=()) for _ in range(column_count)]
+        for position, cell in enumerate(row.cells):
+            column = cell.location.column if cell.location.column is not None else position
+            if column >= column_count:
+                continue
+            existing = cells[column]
+            cells[column] = ComparableTableCell(
+                raw_text=f"{existing.raw_text}{cell.raw_text}",
+                locations=(*existing.locations, cell.location),
+            )
+        dense_rows.append(
+            ComparableTableRow(row=row.row, cells=tuple(cells), source_rows=(row.row,))
+        )
+    return dense_rows
+
+
+def _is_ocr_location(location: DocumentLocation) -> bool:
+    return location.source == "OCR"
+
+
+def _is_adjacent_table_continuation(
+    header: ComparableTableRow,
+    previous: ComparableTableRow,
+    current: ComparableTableRow,
+) -> int | None:
+    if not previous.cells or len(previous.cells) != len(current.cells):
+        return None
+    if current.row != previous.source_rows[-1] + 1:
+        return None
+    nonempty = [
+        column
+        for column, cell in enumerate(current.cells)
+        if comparison_normalize(cell.raw_text)[1]
+    ]
+    if len(nonempty) != 1 or nonempty[0] == 0:
+        return None
+    column = nonempty[0]
+    header_text = comparison_normalize(header.cells[column].raw_text)[1]
+    if not any(keyword in header_text for keyword in TABLE_CONTINUATION_HEADERS):
+        return None
+    if any(keyword in header_text for keyword in TABLE_PROTECTED_HEADERS):
+        return None
+    if not comparison_normalize(previous.cells[0].raw_text)[1]:
+        return None
+    if not comparison_normalize(previous.cells[column].raw_text)[1]:
+        return None
+    previous_locations = previous.cells[column].locations
+    current_locations = current.cells[column].locations
+    if not previous_locations or not current_locations:
+        return None
+    continuation_locations = (*previous_locations, *current_locations)
+    if not all(_is_ocr_location(location) for location in continuation_locations):
+        return None
+    previous_location = previous_locations[-1]
+    current_location = current_locations[0]
+    if (
+        previous_location.table_index != current_location.table_index
+        or previous_location.column != current_location.column
+        or previous_location.row not in previous.source_rows
+        or current_location.row != current.row
+    ):
+        return None
+    if (
+        previous_location.page is not None
+        and current_location.page is not None
+        and previous_location.page != current_location.page
+    ):
+        return None
+    return column
+
+
+def _comparable_table_rows(block: DocumentBlock) -> list[ComparableTableRow]:
+    rows = _dense_table_rows(block)
+    if len(rows) < 3:
+        return rows
+    header, *data = rows
+    merged: list[ComparableTableRow] = []
+    for row in data:
+        if not merged:
+            merged.append(row)
+            continue
+        column = _is_adjacent_table_continuation(header, merged[-1], row)
+        if column is None:
+            merged.append(row)
+            continue
+        previous = merged[-1]
+        cells = list(previous.cells)
+        cells[column] = ComparableTableCell(
+            raw_text=f"{cells[column].raw_text}{row.cells[column].raw_text}",
+            locations=(*cells[column].locations, *row.cells[column].locations),
+        )
+        merged[-1] = ComparableTableRow(
+            row=previous.row,
+            cells=tuple(cells),
+            source_rows=(*previous.source_rows, *row.source_rows),
+        )
+    return [header, *merged]
 
 
 def _table_shape(block: DocumentBlock) -> tuple[int, int]:
-    if not block.table:
-        return 0, 0
-    rows = len(block.table.rows)
-    columns = max((len(row.cells) for row in block.table.rows), default=0)
-    return rows, columns
+    rows = _comparable_table_rows(block)
+    return len(rows), len(rows[0].cells) if rows else 0
 
 
 def match_compatible_tables(
@@ -450,9 +590,9 @@ def _segments(before: str, after: str) -> list[DiffSegment]:
 
 
 def _severity(text: str, *, numeric: bool) -> str:
-    if any(keyword in text for keyword in CRITICAL_KEYWORDS):
+    if numeric or any(keyword in text for keyword in CRITICAL_KEYWORDS):
         return "HIGH"
-    return "MEDIUM" if numeric or text else "LOW"
+    return "MEDIUM" if text else "LOW"
 
 
 def _side(document: ParsedDocument, units: tuple[ComparableUnit, ...]) -> DiffSide:
@@ -495,13 +635,14 @@ def _make_diff(
     low_ocr = any(value < options.ocr_low_confidence_threshold for value in ocr_confidences)
     confidence = min([similarity, *ocr_confidences]) if ocr_confidences else similarity
     severity = _severity(
-        f"{severity_context} {before} {after}", numeric=diff_type == "NUMERIC_CHANGED"
+        f"{severity_context} {before} {after}",
+        numeric=diff_type == "NUMERIC_CHANGED"
+        or (diff_type == "TABLE_CELL_CHANGED" and _numeric_changed(before, after)),
     )
-    if low_ocr and diff_type in {"ADDED", "DELETED", "MODIFIED"}:
-        severity = "LOW"
     both_sides_ocr = bool(left and right) and all(
         any(location.source == "OCR" for location in unit.locations) for unit in all_units
     )
+    review_reason = None
     if (
         both_sides_ocr
         and diff_type in {"MODIFIED", "TABLE_CELL_CHANGED"}
@@ -520,7 +661,19 @@ def _make_diff(
             and len(before_match) == len(after_match)
             and Counter(before_match) == Counter(after_match)
         )
-        if (matcher.ratio() >= 0.98 and changed_characters <= 2) or parser_order_variance:
+        tiny_variance = matcher.ratio() >= 0.98 and changed_characters <= 2
+        placeholder_variance = tiny_variance and sum(
+            keyword in f"{before} {after}" for keyword in PLACEHOLDER_CONTEXT
+        ) >= 2
+        if placeholder_variance:
+            review_reason = "OCR_PLACEHOLDER_VARIANCE"
+        elif parser_order_variance:
+            review_reason = "OCR_READING_ORDER_VARIANCE"
+        elif tiny_variance:
+            review_reason = "OCR_SINGLE_CHAR_VARIANCE"
+        elif low_ocr:
+            review_reason = "OCR_LOW_CONFIDENCE_VARIANCE"
+        if review_reason is not None:
             # OCR line confidence is not a character-level guarantee. Retain
             # tiny non-numeric discrepancies for review without promoting
             # them to a substantive contract risk.
@@ -534,6 +687,7 @@ def _make_diff(
         target=_side(target, right) if right else None,
         segments=_segments(before, after) if left and right else [],
         confidence=round(max(0.0, min(confidence, 1.0)), 4),
+        review_reason=review_reason,
     )
 
 
@@ -579,26 +733,53 @@ def _candidate_diffs(
     return differences
 
 
-def _row_key(row: TableRow) -> str:
+def _row_key(row: ComparableTableRow) -> str:
     return comparison_normalize(row.cells[0].raw_text)[1] if row.cells else ""
 
 
-def _table_unit(block: DocumentBlock, row: TableRow, column: int | None = None) -> ComparableUnit:
+def _comparable_table_row_unit(
+    block: DocumentBlock, row: ComparableTableRow
+) -> ComparableUnit:
+    raw = " | ".join(cell.raw_text for cell in row.cells)
+    normalized, match_text = comparison_normalize(raw)
+    locations = tuple(location for cell in row.cells for location in cell.locations)
+    locations = locations or (block.location,)
+    return ComparableUnit(
+        unit_id=f"{block.block_id}_rows_{'_'.join(map(str, row.source_rows))}",
+        kind="TABLE_TEXT",
+        order=block.order + (row.row + 1) / 1000,
+        raw_text=raw,
+        normalized_text=normalized,
+        match_text=match_text,
+        clause_key=None,
+        locations=locations,
+        confidence=_confidence(locations),
+        page=next((location.page for location in locations if location.page is not None), None),
+    )
+
+
+def _table_unit(
+    block: DocumentBlock, row: ComparableTableRow, column: int | None = None
+) -> ComparableUnit:
     if column is None:
-        return _row_unit(block, row)
+        return _comparable_table_row_unit(block, row)
     cell = row.cells[column]
     normalized, match_text = comparison_normalize(cell.raw_text)
+    locations = cell.locations or tuple(
+        location for candidate in row.cells for location in candidate.locations
+    )
+    locations = locations or (block.location,)
     return ComparableUnit(
-        unit_id=f"{block.block_id}_r{row.row}_c{column}",
+        unit_id=f"{block.block_id}_r{'_'.join(map(str, row.source_rows))}_c{column}",
         kind="TABLE_CELL",
         order=block.order + (row.row + 1) / 1000 + column / 100000,
         raw_text=cell.raw_text,
         normalized_text=normalized,
         match_text=match_text,
         clause_key=None,
-        locations=(cell.location,),
-        confidence=_confidence((cell.location,)),
-        page=cell.location.page,
+        locations=locations,
+        confidence=_confidence(locations),
+        page=next((location.page for location in locations if location.page is not None), None),
     )
 
 
@@ -612,8 +793,8 @@ def _compare_table_matches(
     differences = []
     for match in matches:
         assert match.baseline.table and match.target.table
-        base_rows = match.baseline.table.rows
-        target_rows = match.target.table.rows
+        base_rows = _comparable_table_rows(match.baseline)
+        target_rows = _comparable_table_rows(match.target)
         base_data, target_data = base_rows[1:], target_rows[1:]
         base_keys, target_keys = [_row_key(row) for row in base_data], [
             _row_key(row) for row in target_data
@@ -624,7 +805,7 @@ def _compare_table_matches(
             and len(set(base_keys)) == len(base_keys)
             and len(set(target_keys)) == len(target_keys)
         )
-        pairs: list[tuple[TableRow | None, TableRow | None]] = []
+        pairs: list[tuple[ComparableTableRow | None, ComparableTableRow | None]] = []
         if keyed:
             target_by_key = dict(zip(target_keys, target_data, strict=True))
             base_key_set = set(base_keys)

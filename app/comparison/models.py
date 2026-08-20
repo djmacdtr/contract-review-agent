@@ -37,6 +37,12 @@ class DiffItem(BaseModel):
     segments: list[DiffSegment] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
     requires_manual_review: bool = True
+    review_reason: Literal[
+        "OCR_SINGLE_CHAR_VARIANCE",
+        "OCR_PLACEHOLDER_VARIANCE",
+        "OCR_READING_ORDER_VARIANCE",
+        "OCR_LOW_CONFIDENCE_VARIANCE",
+    ] | None = None
 
 
 class ComparisonDiagnostics(BaseModel):

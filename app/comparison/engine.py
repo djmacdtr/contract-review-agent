@@ -420,12 +420,8 @@ def compare_documents(
 
 
 def is_ocr_review_only_diff(item: DiffItem) -> bool:
-    if item.severity != "LOW" or item.diff_type == "NUMERIC_CHANGED":
-        return False
-    locations = []
-    for side in (item.baseline, item.target):
-        if side is None:
-            continue
-        candidates = side.locations or [side.location]
-        locations.extend(location for location in candidates if location.source == "OCR")
-    return bool(locations)
+    return (
+        item.severity == "LOW"
+        and item.diff_type != "NUMERIC_CHANGED"
+        and item.review_reason is not None
+    )

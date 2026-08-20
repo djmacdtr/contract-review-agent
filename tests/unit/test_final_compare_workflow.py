@@ -79,8 +79,8 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
     result = output.result
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
-    assert result["metadata"]["workflow_version"] == "0.4.0"
-    assert result["metadata"]["rules_version"] == "0.4.0"
+    assert result["metadata"]["workflow_version"] == "0.4.1"
+    assert result["metadata"]["rules_version"] == "0.4.1"
     assert result["metadata"]["comparison_diagnostics"]["reliable"] is True
     assert result["metadata"]["primary_model"] is None
     assert result["metadata"]["model_runs"] == []
@@ -240,3 +240,4 @@ def test_only_low_confidence_ocr_text_diffs_require_review_instead_of_risk() -> 
     )
     assert result["conclusion"] == "REVIEW_REQUIRED"
     assert result["diff_items"][0]["severity"] == "LOW"
+    assert result["diff_items"][0]["review_reason"] == "OCR_LOW_CONFIDENCE_VARIANCE"

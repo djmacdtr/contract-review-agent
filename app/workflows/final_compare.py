@@ -22,8 +22,8 @@ from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.4.0"
-FINAL_COMPARE_RULES_VERSION = "0.4.0"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.4.1"
+FINAL_COMPARE_RULES_VERSION = "0.4.1"
 
 
 class FinalCompareState(TypedDict, total=False):
