@@ -48,7 +48,8 @@
       <el-tab-pane label="风险项"><el-empty v-if="!result.risk_items.length" /><el-card v-for="(item, i) in result.risk_items" :key="i" class="item"><pre>{{ JSON.stringify(item, null, 2) }}</pre></el-card></el-tab-pane>
       <el-tab-pane label="差异项">
         <el-empty v-if="!result.diff_items.length" description="未发现确定性内容差异" />
-        <el-card v-for="item in pagedDiffs" :key="item.diff_id" class="item diff-card">
+        <h4 v-if="businessDiffs.length">业务差异（{{ businessDiffs.length }}）</h4>
+        <el-card v-for="item in pagedBusinessDiffs" :key="item.diff_id" class="item diff-card">
           <template #header>
             <div class="diff-header"><span>{{ item.title }}</span><span><el-tag>{{ displayLabel(item.diff_type) }}</el-tag> <el-tag :type="severityType(item.severity)">{{ displayLabel(item.severity) }}</el-tag></span></div>
           </template>
@@ -59,13 +60,28 @@
           <p class="muted">置信度：{{ item.confidence }} · 需要人工复核：{{ item.requires_manual_review ? '是' : '否' }}</p>
         </el-card>
         <el-pagination
-          v-if="result.diff_items.length > pageSize"
+          v-if="businessDiffs.length > pageSize"
           v-model:current-page="diffPage"
           :page-size="pageSize"
-          :total="result.diff_items.length"
+          :total="businessDiffs.length"
           layout="prev, pager, next, total"
           class="pagination"
         />
+        <el-collapse v-if="reviewDiffs.length" class="review-section">
+          <el-collapse-item :title="`OCR 人工复核项（${reviewDiffs.length}）`" name="ocr-review">
+            <el-alert title="以下差异疑似来自 OCR 单字符、占位符或阅读顺序波动，仍需人工查看原件。" type="warning" :closable="false" />
+            <el-card v-for="item in reviewDiffs" :key="item.diff_id" class="item diff-card">
+              <template #header>
+                <div class="diff-header"><span>{{ item.title }}</span><span><el-tag>{{ displayLabel(item.review_reason) }}</el-tag> <el-tag type="info">{{ displayLabel(item.severity) }}</el-tag></span></div>
+              </template>
+              <div class="diff-columns">
+                <div><strong>基准文件</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
+                <div><strong>目标文件</strong><p class="location">{{ formatLocations(item.target?.locations, item.target?.location) }}</p><p>{{ item.target?.text || '—' }}</p></div>
+              </div>
+              <p class="muted">复核原因：{{ displayLabel(item.review_reason) }} · 置信度：{{ item.confidence }}</p>
+            </el-card>
+          </el-collapse-item>
+        </el-collapse>
       </el-tab-pane>
       <el-tab-pane label="原始 JSON"><pre>{{ JSON.stringify(result, null, 2) }}</pre></el-tab-pane>
     </el-tabs>
@@ -84,7 +100,9 @@ const route = useRoute(); const router = useRouter(); const taskId = String(rout
 const detail = ref<TaskDetail>(); const result = ref<TaskResult>(); let timer: number | undefined
 const pageSize = 20; const diffPage = ref(1)
 const diagnostics = computed(() => result.value?.metadata.comparison_diagnostics)
-const pagedDiffs = computed(() => { const start = (diffPage.value - 1) * pageSize; return result.value?.diff_items.slice(start, start + pageSize) ?? [] })
+const businessDiffs = computed(() => result.value?.diff_items.filter(item => !item.review_reason) ?? [])
+const reviewDiffs = computed(() => result.value?.diff_items.filter(item => Boolean(item.review_reason)) ?? [])
+const pagedBusinessDiffs = computed(() => { const start = (diffPage.value - 1) * pageSize; return businessDiffs.value.slice(start, start + pageSize) })
 async function load() { try { detail.value = await api.detail(taskId); if (detail.value.status === 'SUCCEEDED') { result.value = await api.result(taskId); stop() } else if (['FAILED', 'CANCELLED'].includes(detail.value.status)) stop() } catch (e) { ElMessage.error(String(e)); stop() } }
 function stop() { if (timer) window.clearInterval(timer); timer = undefined }
 async function retry() { try { const next = await api.retry(taskId); await router.push(`/tasks/${next.task_id}`); window.location.reload() } catch (e) { ElMessage.error(String(e)) } }
@@ -95,4 +113,4 @@ function severityType(severity: string): 'danger' | 'warning' | 'info' | 'succes
 onMounted(async () => { await load(); if (!result.value && detail.value?.status !== 'FAILED') timer = window.setInterval(load, 2000) }); onBeforeUnmount(stop)
 </script>
 
-<style scoped>.item { margin: 12px 0; }.diff-header { display:flex; justify-content:space-between; gap:16px; }.diff-columns { display:grid; grid-template-columns:1fr 1fr; gap:20px; }.diff-columns > div { background:#f8fafc; padding:14px; border-radius:8px; }.location { color:#64748b; font-size:13px; }.pagination { justify-content:center; margin-top:20px; } @media (max-width: 800px) { .diff-columns { grid-template-columns:1fr; } }</style>
+<style scoped>.item { margin: 12px 0; }.diff-header { display:flex; justify-content:space-between; gap:16px; }.diff-columns { display:grid; grid-template-columns:1fr 1fr; gap:20px; }.diff-columns > div { background:#f8fafc; padding:14px; border-radius:8px; }.location { color:#64748b; font-size:13px; }.pagination { justify-content:center; margin-top:20px; }.review-section { margin-top:20px; } @media (max-width: 800px) { .diff-columns { grid-template-columns:1fr; } }</style>

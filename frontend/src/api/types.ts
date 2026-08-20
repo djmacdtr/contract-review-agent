@@ -25,6 +25,7 @@ export interface DiffItem {
   diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED'
   severity: 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO'
   title: string; baseline?: DiffSide; target?: DiffSide; segments: DiffSegment[]; confidence: number; requires_manual_review: boolean
+  review_reason?: 'OCR_SINGLE_CHAR_VARIANCE' | 'OCR_PLACEHOLDER_VARIANCE' | 'OCR_READING_ORDER_VARIANCE' | 'OCR_LOW_CONFIDENCE_VARIANCE'
 }
 export interface ResultFile {
   file_id: string; role: string; file_name: string; safe_url: string; sha256?: string; page_count?: number
