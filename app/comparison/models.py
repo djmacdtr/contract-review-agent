@@ -30,7 +30,6 @@ class DiffItem(BaseModel):
         "TABLE_ROW_DELETED",
         "TABLE_CELL_CHANGED",
     ]
-    severity: Literal["HIGH", "MEDIUM", "LOW", "INFO"]
     title: str
     baseline: DiffSide | None
     target: DiffSide | None

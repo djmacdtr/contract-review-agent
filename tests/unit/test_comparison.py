@@ -138,7 +138,7 @@ def test_paragraph_numeric_added_and_deleted_are_classified() -> None:
     assert "NUMERIC_CHANGED" in types
     assert set(types) & {"MODIFIED", "ADDED", "DELETED"}
     numeric = next(item for item in compared.diff_items if item.diff_type == "NUMERIC_CHANGED")
-    assert numeric.severity == "HIGH"
+    assert not hasattr(numeric, "severity")
     assert numeric.baseline.location.paragraph_index == 0
     assert any(segment.operation == "DELETE" for segment in numeric.segments)
 
@@ -151,7 +151,7 @@ def test_table_cell_change_has_traceable_row_and_column() -> None:
     assert item.baseline.location.table_index == 0
     assert item.baseline.location.row == 1
     assert item.baseline.location.column == 1
-    assert item.severity == "HIGH"
+    assert not hasattr(item, "severity")
 
 
 def test_low_similarity_same_clause_number_is_not_forced_into_modified() -> None:
@@ -192,9 +192,9 @@ def test_low_confidence_ocr_text_is_low_but_numeric_change_remains_high() -> Non
     )
     ordinary = next(item for item in compared.diff_items if item.diff_type == "MODIFIED")
     numeric = next(item for item in compared.diff_items if item.diff_type == "NUMERIC_CHANGED")
-    assert ordinary.severity == "LOW"
+    assert ordinary.review_reason == "OCR_LOW_CONFIDENCE_VARIANCE"
     assert ordinary.confidence == 0.55
-    assert numeric.severity == "HIGH"
+    assert not hasattr(numeric, "severity")
     assert numeric.confidence == 0.55
 
 
@@ -298,7 +298,6 @@ def test_legal_clause_single_character_ocr_variance_is_retained_as_review_only()
     )
     assert len(compared.diff_items) == 1
     assert compared.diff_items[0].diff_type == "MODIFIED"
-    assert compared.diff_items[0].severity == "LOW"
     assert compared.diff_items[0].review_reason == "OCR_SINGLE_CHAR_VARIANCE"
 
 
@@ -314,7 +313,6 @@ def test_external_parser_reading_order_variance_is_review_only() -> None:
         CompareOptions(),
     )
     assert len(compared.diff_items) == 1
-    assert compared.diff_items[0].severity == "LOW"
     assert compared.diff_items[0].review_reason == "OCR_READING_ORDER_VARIANCE"
 
 
@@ -328,7 +326,6 @@ def test_amount_placeholder_single_character_variance_is_retained_for_review() -
 
     assert len(compared.diff_items) == 1
     assert compared.diff_items[0].diff_type == "MODIFIED"
-    assert compared.diff_items[0].severity == "LOW"
     assert compared.diff_items[0].review_reason == "OCR_PLACEHOLDER_VARIANCE"
 
 
@@ -373,7 +370,7 @@ def test_critical_numeric_changes_are_never_absorbed_by_fuzzy_alignment(
         CompareOptions(),
     )
     assert [item.diff_type for item in compared.diff_items] == ["NUMERIC_CHANGED"]
-    assert compared.diff_items[0].severity == "HIGH"
+    assert compared.diff_items[0].review_reason is None
     assert compared.diff_items[0].baseline.location.paragraph_index == 0
     assert compared.diff_items[0].target.location.paragraph_index == 0
     assert compared.diff_items[0].baseline.text == before
@@ -388,7 +385,8 @@ def test_subject_and_clause_changes_remain_recallable() -> None:
         paragraph_document("target", ["第一条甲方为上海示例公司。", "新增完整条款。"]),
         CompareOptions(),
     )
-    assert any(item.severity == "HIGH" for item in compared.diff_items)
+    assert compared.diff_items
+    assert all(item.review_reason is None for item in compared.diff_items)
 
 
 def test_subject_single_character_change_is_high_and_traceable() -> None:
@@ -401,7 +399,7 @@ def test_subject_single_character_change_is_high_and_traceable() -> None:
     assert len(compared.diff_items) == 1
     item = compared.diff_items[0]
     assert item.diff_type == "MODIFIED"
-    assert item.severity == "HIGH"
+    assert item.review_reason is None
     assert item.baseline.location.paragraph_index == 0
     assert item.target.location.paragraph_index == 0
     assert any(segment.operation == "DELETE" and segment.text == "技" for segment in item.segments)
@@ -425,20 +423,19 @@ def test_complete_clause_addition_and_deletion_preserve_type_and_locations() -> 
 
 
 @pytest.mark.parametrize(
-    ("column", "before", "after", "expected_severity"),
+    ("column", "before", "after"),
     [
-        (1, "大型钢制储罐", "大型不锈钢储罐", "MEDIUM"),
-        (2, "EQ-001", "EQ-009", "HIGH"),
-        (3, "2", "3", "HIGH"),
-        (4, "100万元", "120万元", "HIGH"),
-        (5, "2026年8月20日", "2026年9月20日", "HIGH"),
+        (1, "大型钢制储罐", "大型不锈钢储罐"),
+        (2, "EQ-001", "EQ-009"),
+        (3, "2", "3"),
+        (4, "100万元", "120万元"),
+        (5, "2026年8月20日", "2026年9月20日"),
     ],
 )
 def test_real_table_cell_changes_are_not_absorbed(
     column: int,
     before: str,
     after: str,
-    expected_severity: str,
 ) -> None:
     base_values = ["1", "大型钢制储罐", "EQ-001", "2", "100万元", "2026年8月20日"]
     target_values = base_values.copy()
@@ -454,7 +451,7 @@ def test_real_table_cell_changes_are_not_absorbed(
     assert len(compared.diff_items) == 1
     item = compared.diff_items[0]
     assert item.diff_type == "TABLE_CELL_CHANGED"
-    assert item.severity == expected_severity
+    assert item.review_reason is None
     assert item.baseline.location.row == 1
     assert item.baseline.location.column == column
     assert item.target.location.row == 1

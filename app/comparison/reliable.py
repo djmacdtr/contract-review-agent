@@ -39,25 +39,6 @@ INTER_CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
 LATEX_ROMAN = re.compile(r"\\mathrm\s*\{([^{}]*)\}")
 IGNORABLE_PUNCTUATION = str.maketrans("", "", "，,。；;：:“”\"‘’'（）()【】[]、 *|~")
-CRITICAL_KEYWORDS = (
-    "金额",
-    "租金",
-    "保证金",
-    "期限",
-    "利率",
-    "合同编号",
-    "甲方",
-    "乙方",
-    "保证人",
-    "账户",
-    "担保",
-    "违约",
-    "争议",
-    "租赁物",
-    "总额",
-    "付款",
-    "主体",
-)
 TABLE_CONTINUATION_HEADERS = (
     "名称",
     "描述",
@@ -589,12 +570,6 @@ def _segments(before: str, after: str) -> list[DiffSegment]:
     return segments
 
 
-def _severity(text: str, *, numeric: bool) -> str:
-    if numeric or any(keyword in text for keyword in CRITICAL_KEYWORDS):
-        return "HIGH"
-    return "MEDIUM" if text else "LOW"
-
-
 def _side(document: ParsedDocument, units: tuple[ComparableUnit, ...]) -> DiffSide:
     locations = [location for unit in units for location in unit.locations]
     return DiffSide(
@@ -614,7 +589,6 @@ def _make_diff(
     right: tuple[ComparableUnit, ...],
     similarity: float,
     options: CompareOptionsLike,
-    severity_context: str = "",
 ) -> DiffItem:
     before, after = _join_raw(left), _join_raw(right)
     labels = {
@@ -634,11 +608,6 @@ def _make_diff(
     ]
     low_ocr = any(value < options.ocr_low_confidence_threshold for value in ocr_confidences)
     confidence = min([similarity, *ocr_confidences]) if ocr_confidences else similarity
-    severity = _severity(
-        f"{severity_context} {before} {after}",
-        numeric=diff_type == "NUMERIC_CHANGED"
-        or (diff_type == "TABLE_CELL_CHANGED" and _numeric_changed(before, after)),
-    )
     both_sides_ocr = bool(left and right) and all(
         any(location.source == "OCR" for location in unit.locations) for unit in all_units
     )
@@ -673,15 +642,9 @@ def _make_diff(
             review_reason = "OCR_SINGLE_CHAR_VARIANCE"
         elif low_ocr:
             review_reason = "OCR_LOW_CONFIDENCE_VARIANCE"
-        if review_reason is not None:
-            # OCR line confidence is not a character-level guarantee. Retain
-            # tiny non-numeric discrepancies for review without promoting
-            # them to a substantive contract risk.
-            severity = "LOW"
     return DiffItem(
         diff_id=f"diff_{index:06d}",
         diff_type=diff_type,
-        severity=severity,
         title=labels[diff_type],
         baseline=_side(baseline, left) if left else None,
         target=_side(target, right) if right else None,
@@ -863,11 +826,6 @@ def _compare_table_matches(
                     target_cell.raw_text
                 )[1]:
                     continue
-                header_context = " ".join(
-                    row.cells[column].raw_text
-                    for row in (base_rows[0], target_rows[0])
-                    if column < len(row.cells)
-                )
                 differences.append(
                     _make_diff(
                         start + len(differences),
@@ -878,7 +836,6 @@ def _compare_table_matches(
                         (_table_unit(match.target, target_row, column),),
                         0.95,
                         options,
-                        severity_context=header_context,
                     )
                 )
     return differences

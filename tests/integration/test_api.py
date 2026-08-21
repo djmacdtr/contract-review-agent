@@ -52,6 +52,9 @@ async def test_list_not_found_retry_guard_and_validation_are_stable(client) -> N
     assert listed.status_code == 200
     assert listed.json()["data"]["total"] == 1
     assert listed.json()["data"]["items"][0]["task_id"] == task_id
+    summary = listed.json()["data"]["items"][0]
+    assert {"risk_count", "review_count", "legacy_statistics"} <= summary.keys()
+    assert "high_risk_count" not in summary
 
     missing = await client.get("/api/v1/tasks/tsk_missing")
     assert missing.status_code == 404 and missing.json()["code"] == "TASK_NOT_FOUND"
@@ -128,3 +131,6 @@ async def test_draft_openapi_example_omits_reference_type(client) -> None:
     schema = (await client.get("/openapi.json")).json()
     example = schema["components"]["schemas"]["DraftReviewCreate"]["example"]
     assert "reference_type" not in example["reference_files"][0]
+    assert "severity" not in schema["components"]["schemas"]["DiffItem"]["properties"]
+    statistics = schema["components"]["schemas"]["ResultStatistics"]["properties"]
+    assert {"risk_count", "review_count", "passed_check_count"} <= statistics.keys()

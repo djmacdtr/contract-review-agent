@@ -204,10 +204,11 @@ class TaskService:
                     status=row.status,
                     progress=row.progress,
                     conclusion=row.conclusion,
-                    high_risk_count=row.high_risk_count,
-                    medium_risk_count=row.medium_risk_count,
-                    low_risk_count=row.low_risk_count,
-                    info_count=row.info_count,
+                    risk_count=row.risk_count,
+                    review_count=row.review_count,
+                    legacy_statistics=bool(
+                        row.result and row.result.schema_version != "2.0"
+                    ),
                     created_at=row.created_at,
                     finished_at=row.finished_at,
                 )

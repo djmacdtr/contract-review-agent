@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     LLM_ENABLE_EMBEDDING: bool = False
     LLM_ENABLE_RERANK: bool = False
 
-    RESULT_SCHEMA_VERSION: str = "1.0"
+    RESULT_SCHEMA_VERSION: str = "2.0"
     WORKFLOW_VERSION: str = "0.1.0"
     RULES_VERSION: str = "0.1.0"
 

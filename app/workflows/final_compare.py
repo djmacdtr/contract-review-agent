@@ -8,7 +8,6 @@ from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.comparison.engine import (
     CompareOptions,
     compare_documents,
-    is_ocr_review_only_diff,
 )
 from app.comparison.models import ComparisonResult
 from app.core.config import Settings
@@ -17,13 +16,15 @@ from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
+from app.results.risk_model import build_review_items, build_risk_items, build_statistics
+from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.4.1"
-FINAL_COMPARE_RULES_VERSION = "0.4.1"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.4.2"
+FINAL_COMPARE_RULES_VERSION = "0.4.2"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -139,14 +140,30 @@ class FinalCompareWorkflowExecutor:
             for document in documents
         ]
         diffs = [item.model_dump(mode="json") for item in comparison.diff_items]
-        statistics = {"total": len(diffs), "high": 0, "medium": 0, "low": 0, "info": 0}
-        for item in comparison.diff_items:
-            statistics[item.severity.lower()] += 1
-        if diffs and all(is_ocr_review_only_diff(item) for item in comparison.diff_items):
-            conclusion = "REVIEW_REQUIRED"
-        elif diffs:
+        risk_items = build_risk_items(
+            comparison.diff_items, module_code="VERSION_CHANGE"
+        )
+        review_items = build_review_items(
+            comparison.diff_items,
+            comparison.warnings,
+            module_code="DOCUMENT_RELIABILITY",
+        )
+        passed_checks = (
+            [
+                {
+                    "check_id": "check_document_alignment",
+                    "module_code": "DOCUMENT_ALIGNMENT",
+                    "title": "文档对齐可靠",
+                    "description": "双方文档达到确定性比对可靠性阈值。",
+                }
+            ]
+            if comparison.diagnostics.reliable
+            else []
+        )
+        statistics = build_statistics(risk_items, review_items, passed_checks)
+        if risk_items:
             conclusion = "RISK_FOUND"
-        elif any(warning.requires_manual_review for warning in comparison.warnings):
+        elif review_items:
             conclusion = "REVIEW_REQUIRED"
         else:
             conclusion = "PASS"
@@ -162,24 +179,28 @@ class FinalCompareWorkflowExecutor:
             ).model_dump(mode="json")
         )
         return {
-            "schema_version": self.settings.RESULT_SCHEMA_VERSION,
+            "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": TaskType.FINAL_COMPARE.value,
             "conclusion": conclusion,
             "summary": {
                 "title": "确定性合同版本比对结果",
-                "description": f"共发现 {len(diffs)} 项可追溯差异；结果仅用于辅助人工复核。",
+                "description": (
+                    f"确认 {len(risk_items)} 项风险，另有 {len(review_items)} 项需要人工复核。"
+                ),
                 "statistics": statistics,
             },
             "files": files,
-            "risk_items": [],
+            "risk_items": risk_items,
+            "review_items": review_items,
+            "passed_checks": passed_checks,
             "diff_items": diffs,
             "fact_matrix": [],
             "rule_checks": [],
             "warnings": warnings,
             "advice": {
-                "overall_advice": f"请按来源位置人工复核 {len(diffs)} 项确定性差异。",
-                "priority_actions": ["优先复核 HIGH 级金额、期限、主体及关键条款变化"],
+                "overall_advice": "请按来源位置处理确认风险，并单独复核不确定事项。",
+                "priority_actions": ["处理金额、期限、主体及关键条款的确认变化"],
                 "manual_review_focus": ["差异前后文本及段落、页码或表格位置"],
                 "limitations": ["可能使用 OCR；未执行 LLM、复杂合同规则或法律判断"],
             },

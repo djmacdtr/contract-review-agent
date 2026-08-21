@@ -11,13 +11,16 @@ from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
+from app.draft_review.template_checks import TemplateReviewResult, analyze_template
+from app.results.risk_model import build_review_items, build_risk_items, build_statistics
+from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-DRAFT_REVIEW_WORKFLOW_VERSION = "0.2.0"
-DRAFT_REVIEW_RULES_VERSION = "0.2.0"
+DRAFT_REVIEW_WORKFLOW_VERSION = "0.3.1"
+DRAFT_REVIEW_RULES_VERSION = "0.3.1"
 
 
 class DraftReviewState(TypedDict, total=False):
@@ -26,6 +29,7 @@ class DraftReviewState(TypedDict, total=False):
     options: dict[str, Any]
     local_files: list[LocalFile]
     parsed_documents: list[ParsedDocument]
+    template_review: TemplateReviewResult
     result: dict[str, Any]
 
 
@@ -58,16 +62,36 @@ class DraftReviewWorkflowExecutor:
             return {"local_files": await self.downloader.prepare(state["files"], workspace)}
 
         async def parse_documents(state: DraftReviewState) -> dict[str, Any]:
-            await callback(TaskStage.PARSING, 45, "正在逐份解析目标、模板和辅助资料")
+            await callback(TaskStage.PARSING, 35, "正在逐份解析目标、模板和辅助资料")
             return {
                 "parsed_documents": await self.parsers.parse_draft_review(state["local_files"])
             }
 
+        async def compare_template(state: DraftReviewState) -> dict[str, Any]:
+            await callback(TaskStage.TEMPLATE_COMPARE, 65, "正在对齐模板固定条款和允许填写区域")
+            by_role = {document.role: document for document in state["parsed_documents"]}
+            if "TARGET" not in by_role or "TEMPLATE" not in by_role:
+                raise WorkflowError("COMPARISON_FAILED", "起草检查缺少目标合同或模板")
+            options = state.get("options", {})
+            return {
+                "template_review": analyze_template(
+                    by_role["TEMPLATE"],
+                    by_role["TARGET"],
+                    ignore_formatting=options.get("ignore_formatting", True),
+                    ignore_headers_footers=options.get("ignore_headers_footers", True),
+                    check_blank_fields=options.get("check_blank_fields", True),
+                    ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
+                )
+            }
+
         async def build_result(state: DraftReviewState) -> dict[str, Any]:
-            await callback(TaskStage.PARSING, 85, "全部文件解析完成，正在汇总解析状态")
+            await callback(TaskStage.RULE_CHECKING, 85, "正在汇总模板差异和必填检查")
             return {
                 "result": self._build_result(
-                    state["task_id"], state["files"], state["parsed_documents"]
+                    state["task_id"],
+                    state["files"],
+                    state["parsed_documents"],
+                    state["template_review"],
                 )
             }
 
@@ -77,11 +101,13 @@ class DraftReviewWorkflowExecutor:
 
         graph.add_node("download_files", download_files)
         graph.add_node("parse_documents", parse_documents)
+        graph.add_node("compare_template", compare_template)
         graph.add_node("build_result", build_result)
         graph.add_node("persist_result", persist_result)
         graph.add_edge(START, "download_files")
         graph.add_edge("download_files", "parse_documents")
-        graph.add_edge("parse_documents", "build_result")
+        graph.add_edge("parse_documents", "compare_template")
+        graph.add_edge("compare_template", "build_result")
         graph.add_edge("build_result", "persist_result")
         graph.add_edge("persist_result", END)
         return graph.compile()
@@ -110,6 +136,7 @@ class DraftReviewWorkflowExecutor:
         task_id: str,
         input_files: list[dict[str, Any]],
         documents: list[ParsedDocument],
+        template_review: TemplateReviewResult,
     ) -> dict[str, Any]:
         input_by_id = {item["file_id"]: item for item in input_files}
         files: list[dict[str, Any]] = []
@@ -141,41 +168,95 @@ class DraftReviewWorkflowExecutor:
                     "content_structure": self._content_structure(document),
                 }
             )
+        existing_warning_codes = {warning["code"] for warning in warnings}
+        warnings.extend(
+            warning.model_dump(mode="json")
+            for warning in template_review.warnings
+            if warning.code not in existing_warning_codes
+        )
         warnings.append(
             ProcessingWarning(
-                code="DRAFT_REVIEW_PARSE_ONLY",
-                message="本阶段仅完成真实下载和解析；尚未执行模板比对、事实抽取、规则或 LLM。",
-                requires_manual_review=True,
+                code="DRAFT_REVIEW_RULE_BASED_LIMITATION",
+                message="已执行模板确定性检查；尚未执行辅助资料事实抽取、跨文件核对或 LLM。",
+                requires_manual_review=False,
             ).model_dump(mode="json")
         )
+        failed_rules = template_review.failed_rule_checks
+        risk_items = build_risk_items(
+            template_review.diff_items,
+            module_code="TEMPLATE_INTEGRITY",
+            failed_rules=failed_rules,
+        )
+        review_items = build_review_items(
+            template_review.diff_items,
+            template_review.warnings,
+            module_code="TEMPLATE_RELIABILITY",
+        )
+        passed_checks = []
+        if template_review.diagnostics.comparison.reliable:
+            passed_checks.append(
+                {
+                    "check_id": "check_template_alignment",
+                    "module_code": "TEMPLATE_INTEGRITY",
+                    "title": "模板正文对齐可靠",
+                    "description": "目标合同和模板正文达到确定性对齐阈值。",
+                }
+            )
+        if not failed_rules:
+            passed_checks.append(
+                {
+                    "check_id": "check_required_fields",
+                    "module_code": "TEMPLATE_COMPLETENESS",
+                    "title": "未发现明确漏填标记",
+                    "description": "已执行占位符、空白线和基础表格必填检查。",
+                }
+            )
+        statistics = build_statistics(risk_items, review_items, passed_checks)
+        if risk_items:
+            conclusion = "RISK_FOUND"
+        elif review_items:
+            conclusion = "REVIEW_REQUIRED"
+        else:
+            conclusion = "PASS"
         return {
-            "schema_version": self.settings.RESULT_SCHEMA_VERSION,
+            "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": TaskType.DRAFT_REVIEW.value,
-            "conclusion": "REVIEW_REQUIRED",
+            "conclusion": conclusion,
             "summary": {
-                "title": "起草检查多文档解析结果",
-                "description": f"已真实解析 {len(files)} 份文件，后续检查阶段尚未执行。",
-                "statistics": {"total": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+                "title": "起草合同模板确定性检查结果",
+                "description": (
+                    f"已解析 {len(files)} 份文件，确认 {len(risk_items)} 项风险，"
+                    f"另有 {len(review_items)} 项需要人工复核。"
+                ),
+                "statistics": statistics,
             },
             "files": files,
-            "risk_items": [],
-            "diff_items": [],
+            "risk_items": risk_items,
+            "review_items": review_items,
+            "passed_checks": passed_checks,
+            "diff_items": [
+                item.model_dump(mode="json") for item in template_review.diff_items
+            ],
             "fact_matrix": [],
-            "rule_checks": [],
+            "rule_checks": template_review.rule_checks,
             "warnings": warnings,
             "advice": {
-                "overall_advice": "文件解析已完成，请等待后续模板和跨资料检查能力。",
-                "priority_actions": [],
-                "manual_review_focus": ["逐份确认解析状态和警告"],
-                "limitations": ["未执行模板比对、事实抽取、LLM、合同规则或法律判断"],
+                "overall_advice": "请按证据位置复核固定条款差异和未填写字段。",
+                "priority_actions": ["处理固定条款、数值和必填问题"],
+                "manual_review_focus": ["模板固定文字、金额期限、占位符和表格必填项"],
+                "limitations": ["未执行辅助资料事实抽取、跨文件核对、LLM 或法律判断"],
             },
             "metadata": {
-                "execution_mode": "PARSER_ONLY",
+                "execution_mode": "RULE_BASED",
                 "workflow_version": DRAFT_REVIEW_WORKFLOW_VERSION,
                 "rules_version": DRAFT_REVIEW_RULES_VERSION,
                 "primary_model": None,
                 "model_runs": [],
+                "comparison_diagnostics": template_review.diagnostics.comparison.model_dump(
+                    mode="json"
+                ),
+                "template_diagnostics": template_review.diagnostics.model_dump(mode="json"),
             },
             "mock": False,
         }

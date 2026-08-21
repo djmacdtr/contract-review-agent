@@ -24,9 +24,18 @@
           :closable="false"
           class="item"
         />
+        <el-alert
+          v-if="templateDiagnostics"
+          type="info"
+          :title="`模板原始差异 ${templateDiagnostics.raw_diff_count} 项，保留 ${templateDiagnostics.retained_diff_count} 项`"
+          :description="`允许填写区域已过滤 ${templateDiagnostics.filtered_diff_count} 项，过滤原始差异仍保留在结果 metadata 中。`"
+          :closable="false"
+          class="item"
+        />
         <el-descriptions :column="2" border>
           <el-descriptions-item label="结论">{{ displayLabel(result.conclusion) }}</el-descriptions-item>
-          <el-descriptions-item label="差异数量">{{ result.summary.statistics.total }}</el-descriptions-item>
+          <el-descriptions-item label="确认风险">{{ result.summary.statistics.risk_count }}</el-descriptions-item>
+          <el-descriptions-item label="人工复核">{{ result.summary.statistics.review_count }}</el-descriptions-item>
           <template v-if="diagnostics">
             <el-descriptions-item label="基准覆盖率">{{ percent(diagnostics.alignment_coverage_baseline) }}</el-descriptions-item>
             <el-descriptions-item label="目标覆盖率">{{ percent(diagnostics.alignment_coverage_target) }}</el-descriptions-item>
@@ -62,10 +71,10 @@
         <h4 v-if="businessDiffs.length">业务差异（{{ businessDiffs.length }}）</h4>
         <el-card v-for="item in pagedBusinessDiffs" :key="item.diff_id" class="item diff-card">
           <template #header>
-            <div class="diff-header"><span>{{ item.title }}</span><span><el-tag>{{ displayLabel(item.diff_type) }}</el-tag> <el-tag :type="severityType(item.severity)">{{ displayLabel(item.severity) }}</el-tag></span></div>
+            <div class="diff-header"><span>{{ item.title }}</span><el-tag>{{ displayLabel(item.diff_type) }}</el-tag></div>
           </template>
           <div class="diff-columns">
-            <div><strong>基准文件</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
+            <div><strong>{{ detail?.task_type === 'DRAFT_REVIEW' ? '合同模板' : '基准文件' }}</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
             <div><strong>目标文件</strong><p class="location">{{ formatLocations(item.target?.locations, item.target?.location) }}</p><p>{{ item.target?.text || '—' }}</p></div>
           </div>
           <p class="muted">置信度：{{ item.confidence }} · 需要人工复核：{{ item.requires_manual_review ? '是' : '否' }}</p>
@@ -83,16 +92,37 @@
             <el-alert title="以下差异疑似来自 OCR 单字符、占位符或阅读顺序波动，仍需人工查看原件。" type="warning" :closable="false" />
             <el-card v-for="item in reviewDiffs" :key="item.diff_id" class="item diff-card">
               <template #header>
-                <div class="diff-header"><span>{{ item.title }}</span><span><el-tag>{{ displayLabel(item.review_reason) }}</el-tag> <el-tag type="info">{{ displayLabel(item.severity) }}</el-tag></span></div>
+                <div class="diff-header"><span>{{ item.title }}</span><el-tag type="warning">{{ displayLabel(item.review_reason) }}</el-tag></div>
               </template>
               <div class="diff-columns">
-                <div><strong>基准文件</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
+                <div><strong>{{ detail?.task_type === 'DRAFT_REVIEW' ? '合同模板' : '基准文件' }}</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
                 <div><strong>目标文件</strong><p class="location">{{ formatLocations(item.target?.locations, item.target?.location) }}</p><p>{{ item.target?.text || '—' }}</p></div>
               </div>
               <p class="muted">复核原因：{{ displayLabel(item.review_reason) }} · 置信度：{{ item.confidence }}</p>
             </el-card>
           </el-collapse-item>
         </el-collapse>
+      </el-tab-pane>
+      <el-tab-pane label="规则检查">
+        <el-empty v-if="!result.rule_checks.length" description="未发现未替换占位符或明确必填空项" />
+        <el-card v-for="item in result.rule_checks" :key="item.rule_id" class="item">
+          <template #header>
+            <div class="diff-header">
+              <span>{{ item.rule_name }}</span>
+              <el-tag :type="item.status === 'FAILED' ? 'danger' : 'success'">{{ displayLabel(item.status) }}</el-tag>
+            </div>
+          </template>
+          <p>{{ item.message }}</p>
+          <p class="location">{{ formatLocation(item.location) }}</p>
+          <p class="muted">期望：{{ item.expected || '—' }} · 实际：{{ item.actual || '—' }}</p>
+        </el-card>
+      </el-tab-pane>
+      <el-tab-pane label="人工复核">
+        <el-empty v-if="!result.review_items.length" description="没有待人工确认事项" />
+        <el-card v-for="item in result.review_items" :key="item.review_id" class="item">
+          <template #header><div class="diff-header"><span>{{ item.title }}</span><el-tag type="warning">{{ displayLabel(item.reason_code) }}</el-tag></div></template>
+          <p>{{ item.description }}</p>
+        </el-card>
       </el-tab-pane>
       <el-tab-pane label="原始 JSON"><pre>{{ JSON.stringify(result, null, 2) }}</pre></el-tab-pane>
     </el-tabs>
@@ -111,6 +141,7 @@ const route = useRoute(); const router = useRouter(); const taskId = String(rout
 const detail = ref<TaskDetail>(); const result = ref<TaskResult>(); let timer: number | undefined
 const pageSize = 20; const diffPage = ref(1)
 const diagnostics = computed(() => result.value?.metadata.comparison_diagnostics)
+const templateDiagnostics = computed(() => result.value?.metadata.template_diagnostics)
 const businessDiffs = computed(() => result.value?.diff_items.filter(item => !item.review_reason) ?? [])
 const reviewDiffs = computed(() => result.value?.diff_items.filter(item => Boolean(item.review_reason)) ?? [])
 const pagedBusinessDiffs = computed(() => { const start = (diffPage.value - 1) * pageSize; return businessDiffs.value.slice(start, start + pageSize) })
@@ -120,7 +151,6 @@ async function retry() { try { const next = await api.retry(taskId); await route
 function formatLocation(location?: DocumentLocation) { if (!location) return '无对应位置'; const parts = []; if (location.page != null) parts.push(`第 ${location.page} 页`); if (location.paragraph_index != null) parts.push(`段落 ${location.paragraph_index}`); if (location.table_index != null) parts.push(`表格 ${location.table_index}`); if (location.row != null) parts.push(`行 ${location.row}`); if (location.column != null) parts.push(`列 ${location.column}`); if (location.section) parts.push(location.section); if (location.source === 'OCR') parts.push('OCR'); if (location.confidence != null) parts.push(`置信度 ${location.confidence}`); return parts.join(' · ') || '结构位置未知' }
 function formatLocations(locations?: DocumentLocation[], primary?: DocumentLocation) { const values = locations?.length ? locations : (primary ? [primary] : []); if (!values.length) return '无对应位置'; if (values.length === 1) return formatLocation(values[0]); return `${formatLocation(values[0])} → ${formatLocation(values[values.length - 1])}（共 ${values.length} 处）` }
 function percent(value: number) { return `${(value * 100).toFixed(1)}%` }
-function severityType(severity: string): 'danger' | 'warning' | 'info' | 'success' { return severity === 'HIGH' ? 'danger' : severity === 'MEDIUM' ? 'warning' : severity === 'LOW' ? 'info' : 'success' }
 onMounted(async () => { await load(); if (!result.value && detail.value?.status !== 'FAILED') timer = window.setInterval(load, 2000) }); onBeforeUnmount(stop)
 </script>
 

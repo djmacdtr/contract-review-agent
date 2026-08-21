@@ -45,10 +45,9 @@ class TaskSummary(BaseModel):
     status: TaskStatus
     progress: int
     conclusion: Conclusion | None
-    high_risk_count: int
-    medium_risk_count: int
-    low_risk_count: int
-    info_count: int
+    risk_count: int
+    review_count: int
+    legacy_statistics: bool = False
     created_at: datetime
     finished_at: datetime | None
 
@@ -58,4 +57,3 @@ class TaskListData(BaseModel):
     page: int
     page_size: int
     total: int
-

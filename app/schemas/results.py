@@ -1,17 +1,36 @@
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.comparison.models import DiffItem
 from app.core.enums import Conclusion, TaskType
 
+RESULT_SCHEMA_VERSION = "2.0"
+
 
 class ResultStatistics(BaseModel):
-    total: int
-    high: int
-    medium: int
-    low: int
-    info: int
+    risk_count: int = Field(ge=0)
+    deletion_or_missing_count: int = Field(ge=0)
+    addition_or_change_count: int = Field(ge=0)
+    review_count: int = Field(ge=0)
+    passed_check_count: int = Field(ge=0)
+    legacy_statistics: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_legacy_statistics(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "risk_count" in value:
+            return value
+        risk_count = int(value.get("high", 0)) + int(value.get("medium", 0))
+        review_count = int(value.get("low", 0)) + int(value.get("info", 0))
+        return {
+            "risk_count": risk_count,
+            "deletion_or_missing_count": 0,
+            "addition_or_change_count": risk_count,
+            "review_count": review_count,
+            "passed_check_count": 0,
+            "legacy_statistics": True,
+        }
 
 
 class ResultSummary(BaseModel):
@@ -45,20 +64,99 @@ class ResultMetadata(BaseModel):
     model_runs: list[dict[str, Any]]
 
 
+class RiskItem(BaseModel):
+    risk_id: str
+    module_code: str
+    risk_type: Literal["DELETION_OR_MISSING", "ADDITION_OR_CHANGE"]
+    change_type: str
+    title: str
+    description: str
+    source_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    related_diff_ids: list[str] = Field(default_factory=list)
+    related_rule_ids: list[str] = Field(default_factory=list)
+    requires_manual_action: bool = True
+
+
+class ReviewItem(BaseModel):
+    review_id: str
+    module_code: str
+    reason_code: str
+    title: str
+    description: str
+    source_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    related_diff_ids: list[str] = Field(default_factory=list)
+    requires_manual_action: bool = True
+
+
+class PassedCheck(BaseModel):
+    check_id: str
+    module_code: str
+    title: str
+    description: str
+
+
+class RuleCheck(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    rule_id: str
+    rule_name: str
+    status: Literal["PASSED", "FAILED"]
+    location: dict[str, Any] | None = None
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    expected: str | None = None
+    actual: str | None = None
+    message: str
+
+
 class TaskResultData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    schema_version: str = Field(examples=["1.0"])
+    schema_version: str = Field(examples=["2.0"])
     task_id: str
     task_type: TaskType
     conclusion: Conclusion
     summary: ResultSummary
     files: list[ResultFile]
-    risk_items: list[dict[str, Any]]
+    risk_items: list[RiskItem]
+    review_items: list[ReviewItem] = Field(default_factory=list)
+    passed_checks: list[PassedCheck] = Field(default_factory=list)
     diff_items: list[DiffItem]
     fact_matrix: list[dict[str, Any]]
-    rule_checks: list[dict[str, Any]]
+    rule_checks: list[RuleCheck]
     warnings: list[dict[str, Any]]
     advice: dict[str, Any]
     metadata: ResultMetadata
     mock: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_legacy_risk_items(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("schema_version") == "2.0":
+            return value
+        converted = dict(value)
+        legacy_items = []
+        for index, item in enumerate(value.get("risk_items") or [], start=1):
+            if "module_code" in item and "risk_type" in item:
+                legacy_items.append(item)
+                continue
+            change_type = str(item.get("category") or "LEGACY_RISK")
+            legacy_items.append(
+                {
+                    "risk_id": item.get("risk_id") or f"risk_legacy_{index:06d}",
+                    "module_code": "LEGACY_RESULT",
+                    "risk_type": (
+                        "DELETION_OR_MISSING"
+                        if change_type in {"DELETED", "MISSING", "BLANK_OR_UNFILLED"}
+                        else "ADDITION_OR_CHANGE"
+                    ),
+                    "change_type": change_type,
+                    "title": item.get("title") or "历史风险项",
+                    "description": item.get("description") or "该事项来自旧版结果。",
+                    "source_evidence": item.get("sources") or [],
+                    "related_diff_ids": item.get("related_diff_ids") or [],
+                    "related_rule_ids": item.get("related_rule_ids") or [],
+                    "requires_manual_action": True,
+                }
+            )
+        converted["risk_items"] = legacy_items
+        return converted

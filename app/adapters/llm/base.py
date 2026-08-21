@@ -22,7 +22,12 @@ class MockContractLlmClient:
         self.model = model
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
-        return LlmResult(value={"facts": []}, configured_model=self.model, actual_model=None, mock=True)
+        return LlmResult(
+            value={"facts": []},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
         return LlmResult(
@@ -36,4 +41,3 @@ class MockContractLlmClient:
             actual_model=None,
             mock=True,
         )
-

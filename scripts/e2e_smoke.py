@@ -45,8 +45,8 @@ def payload() -> dict:
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="contract-review-smoke-") as directory:
         root = Path(directory)
-        write_docx(root / "target.docx", "目标合同")
-        write_docx(root / "template.docx", "合同模板")
+        write_docx(root / "target.docx", "融资租赁合同")
+        write_docx(root / "template.docx", "融资租赁合同")
         write_docx(root / "reference.docx", "任意辅助资料")
         handler = partial(QuietHandler, directory=directory)
         server = ThreadingHTTPServer(("0.0.0.0", FIXTURE_PORT), handler)
@@ -74,15 +74,21 @@ def main() -> None:
                 result = client.get(f"/api/v1/tasks/{task_id}/result")
                 result.raise_for_status()
                 result_data = result.json()["data"]
+                assert result_data["schema_version"] == "2.0"
                 assert result_data["mock"] is False
-                assert result_data["metadata"]["execution_mode"] == "PARSER_ONLY"
-                assert result_data["conclusion"] == "REVIEW_REQUIRED"
+                assert result_data["metadata"]["execution_mode"] == "RULE_BASED"
+                assert result_data["metadata"]["workflow_version"] == "0.3.1"
+                assert result_data["conclusion"] == "PASS"
+                assert result_data["summary"]["statistics"]["risk_count"] == 0
                 assert len(result_data["files"]) == 3
                 assert all(
                     item["parser_name"] == "python-docx" for item in result_data["files"]
                 )
-                assert result_data["warnings"][-1]["code"] == "DRAFT_REVIEW_PARSE_ONLY"
-                print({"task_id": task_id, "history": history, "result": "valid-real-parse"})
+                assert (
+                    result_data["warnings"][-1]["code"]
+                    == "DRAFT_REVIEW_RULE_BASED_LIMITATION"
+                )
+                print({"task_id": task_id, "history": history, "result": "valid-template-check"})
         finally:
             server.shutdown()
             server.server_close()

@@ -9,10 +9,10 @@ from app.services.downloader import SafeFileDownloadService
 from app.workflows.draft_review import DraftReviewWorkflowExecutor
 
 
-def build_docx(path: Path, text: str) -> bytes:
+def build_docx(path: Path, title: str, body: str) -> bytes:
     document = Document()
-    document.add_heading(text, level=1)
-    document.add_paragraph("用于真实解析闭环的合成内容。")
+    document.add_heading(title, level=1)
+    document.add_paragraph(body)
     document.save(path)
     return path.read_bytes()
 
@@ -25,9 +25,15 @@ async def test_draft_review_downloads_and_parses_every_file_without_mocking(
     tmp_path: Path,
 ) -> None:
     bodies = {
-        "/target.docx": build_docx(tmp_path / "target.docx", "目标合同"),
-        "/template.docx": build_docx(tmp_path / "template.docx", "合同模板"),
-        "/reference.docx": build_docx(tmp_path / "reference.docx", "任意辅助资料"),
+        "/target.docx": build_docx(
+            tmp_path / "target.docx", "融资租赁合同", "第一条 融资金额为1000万元。"
+        ),
+        "/template.docx": build_docx(
+            tmp_path / "template.docx", "融资租赁合同", "第一条 融资金额为##{融资金额}万元。"
+        ),
+        "/reference.docx": build_docx(
+            tmp_path / "reference.docx", "任意辅助资料", "仅参与本阶段解析。"
+        ),
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -84,16 +90,23 @@ async def test_draft_review_downloads_and_parses_every_file_without_mocking(
 
     result = output.result
     assert result["mock"] is False
-    assert result["metadata"]["execution_mode"] == "PARSER_ONLY"
+    assert result["metadata"]["execution_mode"] == "RULE_BASED"
+    assert result["schema_version"] == "2.0"
+    assert result["metadata"]["workflow_version"] == "0.3.1"
     assert result["metadata"]["primary_model"] is None
-    assert result["conclusion"] == "REVIEW_REQUIRED"
+    assert result["conclusion"] == "PASS"
+    assert result["diff_items"] == []
+    assert result["rule_checks"] == []
+    assert result["metadata"]["template_diagnostics"]["filtered_diff_count"] == 1
+    assert len({item["code"] for item in result["warnings"]}) == len(result["warnings"])
     assert len(result["files"]) == 3
     assert all(item["parser_name"] == "python-docx" for item in result["files"])
     assert all(item["document_profile"]["document_kind"] == "UNKNOWN" for item in result["files"])
     assert all(item["content_structure"]["block_count"] == 2 for item in result["files"])
     assert result["files"][0]["content_structure"]["sample_locations"]
-    assert result["warnings"][-1]["code"] == "DRAFT_REVIEW_PARSE_ONLY"
+    assert result["warnings"][-1]["code"] == "DRAFT_REVIEW_RULE_BASED_LIMITATION"
     assert "token=secret" not in str(result)
     assert updates[-1][0] == TaskStage.PERSISTING_RESULT
+    assert any(stage == TaskStage.TEMPLATE_COMPARE for stage, _value in updates)
     assert not any((tmp_path / "workspaces").iterdir())
     assert len(output.file_metadata) == 3

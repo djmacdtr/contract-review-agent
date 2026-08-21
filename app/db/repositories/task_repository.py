@@ -50,6 +50,7 @@ class TaskRepository:
             await session.execute(
                 select(CheckTask)
                 .where(*filters)
+                .options(selectinload(CheckTask.result))
                 .order_by(CheckTask.created_at.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -190,10 +191,8 @@ class TaskRepository:
                     stage_message="任务处理已完成",
                     progress=100,
                     conclusion=Conclusion(result["conclusion"]),
-                    high_risk_count=stats["high"],
-                    medium_risk_count=stats["medium"],
-                    low_risk_count=stats["low"],
-                    info_count=stats["info"],
+                    risk_count=stats["risk_count"],
+                    review_count=stats["review_count"],
                     heartbeat_at=now,
                     updated_at=now,
                     finished_at=now,

@@ -104,7 +104,7 @@ class WorkerRunner:
                     task_id=task.id,
                     worker_id=self.worker_id,
                     result=result,
-                    schema_version=self.settings.RESULT_SCHEMA_VERSION,
+                    schema_version=result["schema_version"],
                     rules_version=metadata.get("rules_version", self.settings.RULES_VERSION),
                     workflow_version=metadata.get(
                         "workflow_version", self.settings.WORKFLOW_VERSION

@@ -44,7 +44,11 @@ class CheckTask(Base):
         Index("ix_check_task_status_created", "status", "created_at"),
         Index("ix_check_task_type_created", "task_type", text("created_at DESC")),
         Index("ix_check_task_client_ref", "client_reference_id"),
-        Index("ix_check_task_heartbeat", "heartbeat_at", postgresql_where=text("status = 'RUNNING'")),
+        Index(
+            "ix_check_task_heartbeat",
+            "heartbeat_at",
+            postgresql_where=text("status = 'RUNNING'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -67,6 +71,8 @@ class CheckTask(Base):
     medium_risk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     low_risk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     info_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    risk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    review_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     options: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     request_id: Mapped[str | None] = mapped_column(String(64))

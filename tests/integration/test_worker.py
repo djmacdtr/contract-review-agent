@@ -237,8 +237,8 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
 async def test_real_draft_review_worker_parses_all_files_and_persists_metadata(tmp_path) -> None:
     bodies: dict[str, bytes] = {}
     for name, title in (
-        ("target.docx", "目标合同"),
-        ("template.docx", "合同模板"),
+        ("target.docx", "融资租赁合同"),
+        ("template.docx", "融资租赁合同"),
         ("reference.docx", "任意辅助资料"),
     ):
         path = tmp_path / name
@@ -306,8 +306,12 @@ async def test_real_draft_review_worker_parses_all_files_and_persists_metadata(t
 
     assert task.status == TaskStatus.SUCCEEDED
     assert stored.result["mock"] is False
-    assert stored.result["metadata"]["execution_mode"] == "PARSER_ONLY"
-    assert stored.result["conclusion"] == "REVIEW_REQUIRED"
+    assert stored.result["metadata"]["execution_mode"] == "RULE_BASED"
+    assert stored.result["schema_version"] == "2.0"
+    assert stored.result["metadata"]["workflow_version"] == "0.3.1"
+    assert stored.result["conclusion"] == "PASS"
+    assert task.risk_count == 0
+    assert task.review_count == stored.result["summary"]["statistics"]["review_count"]
     assert len(stored.result["files"]) == 3
     assert stored.model_name is None
     assert all(file.sha256 and file.parser_name == "python-docx" for file in files)

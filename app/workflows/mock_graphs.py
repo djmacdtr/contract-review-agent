@@ -6,6 +6,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
+from app.schemas.results import RESULT_SCHEMA_VERSION
 
 ProgressCallback = Callable[[TaskStage, int, str], Awaitable[None]]
 
@@ -82,7 +83,12 @@ class MockWorkflowExecutor:
     ) -> dict[str, Any]:
         graph = self._build_graph(task_type, progress_callback)
         await graph.ainvoke(
-            WorkflowState(task_id=task_id, task_type=task_type.value, files=files, completed_nodes=[])
+            WorkflowState(
+                task_id=task_id,
+                task_type=task_type.value,
+                files=files,
+                completed_nodes=[],
+            )
         )
         return self.build_result(task_id, task_type, files)
 
@@ -109,18 +115,15 @@ class MockWorkflowExecutor:
             risk_items = [
                 {
                     "risk_id": f"risk_{task_id[-8:]}",
-                    "category": "SOURCE_CONFLICT",
-                    "severity": "HIGH",
+                    "module_code": "FACT_CONSISTENCY",
+                    "risk_type": "ADDITION_OR_CHANGE",
+                    "change_type": "SOURCE_CONFLICT",
                     "title": "模拟：融资金额需要人工核对",
                     "description": "此项仅用于验证前端渲染，不代表真实合同存在风险。",
-                    "field_key": "financing_amount",
-                    "expected": "50000000.00",
-                    "actual": "51000000.00",
-                    "sources": [],
-                    "suggestion": "请在接入真实解析后核对原始证据。",
-                    "confidence": 0.0,
-                    "requires_manual_review": True,
-                    "generated_by": "MOCK",
+                    "source_evidence": [],
+                    "related_diff_ids": [],
+                    "related_rule_ids": [],
+                    "requires_manual_action": True,
                 }
             ]
             diff_items: list[dict[str, Any]] = []
@@ -146,9 +149,12 @@ class MockWorkflowExecutor:
                     "rule_id": "mock.rent_schedule.row_equation",
                     "rule_name": "每期本金加利息等于当期租金（模拟）",
                     "status": "FAILED",
-                    "severity": "HIGH",
                     "location": {"file_id": files[0]["file_id"], "table_index": 1, "row": 1},
-                    "inputs": {"principal": "6003808.01", "interest": "572500.99", "rent": "6576308.00"},
+                    "inputs": {
+                        "principal": "6003808.01",
+                        "interest": "572500.99",
+                        "rent": "6576308.00",
+                    },
                     "expected": "6576309.00",
                     "actual": "6576308.00",
                     "tolerance": "0.01",
@@ -162,7 +168,6 @@ class MockWorkflowExecutor:
                 {
                     "diff_id": f"diff_{task_id[-8:]}",
                     "diff_type": "NUMERIC_CHANGED",
-                    "severity": "HIGH",
                     "title": "模拟：租赁期限发生变化",
                     "baseline": {
                         "file_id": files[0]["file_id"],
@@ -186,21 +191,55 @@ class MockWorkflowExecutor:
             ]
             fact_matrix = []
             rule_checks = []
+            risk_items = [
+                {
+                    "risk_id": f"risk_{task_id[-8:]}",
+                    "module_code": "VERSION_CHANGE",
+                    "risk_type": "ADDITION_OR_CHANGE",
+                    "change_type": "NUMERIC_CHANGED",
+                    "title": "模拟：租赁期限发生变化",
+                    "description": "此项仅用于验证前端渲染，不代表真实合同存在风险。",
+                    "source_evidence": [],
+                    "related_diff_ids": [f"diff_{task_id[-8:]}"],
+                    "related_rule_ids": [],
+                    "requires_manual_action": True,
+                }
+            ]
             title = "模拟放款比对结果"
 
-        total = len(risk_items) + len(diff_items)
+        review_items = [
+            {
+                "review_id": f"review_mock_{task_id[-8:]}",
+                "module_code": "CAPABILITY_LIMITATION",
+                "reason_code": "MOCK_RESULT",
+                "title": "模拟结果需要人工确认",
+                "description": "未执行真实下载、解析或合同检查。",
+                "source_evidence": [],
+                "related_diff_ids": [],
+                "requires_manual_action": True,
+            }
+        ]
         return {
-            "schema_version": self.settings.RESULT_SCHEMA_VERSION,
+            "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": task_type.value,
             "conclusion": "RISK_FOUND",
             "summary": {
                 "title": title,
                 "description": "模拟结果仅用于验证任务、API 和控制台闭环，不构成合同审查意见。",
-                "statistics": {"total": total, "high": total, "medium": 0, "low": 0, "info": 0},
+                "statistics": {
+                    "risk_count": len(risk_items),
+                    "deletion_or_missing_count": 0,
+                    "addition_or_change_count": len(risk_items),
+                    "review_count": len(review_items),
+                    "passed_check_count": 0,
+                    "legacy_statistics": False,
+                },
             },
             "files": file_views,
             "risk_items": risk_items,
+            "review_items": review_items,
+            "passed_checks": [],
             "diff_items": diff_items,
             "fact_matrix": fact_matrix,
             "rule_checks": rule_checks,
@@ -218,7 +257,11 @@ class MockWorkflowExecutor:
                 "primary_model": self.settings.LLM_EXTRACTION_MODEL,
                 "model_runs": [
                     {
-                        "node": "extract_facts" if task_type == TaskType.DRAFT_REVIEW else "generate_advice",
+                        "node": (
+                            "extract_facts"
+                            if task_type == TaskType.DRAFT_REVIEW
+                            else "generate_advice"
+                        ),
                         "configured_model": self.settings.LLM_EXTRACTION_MODEL,
                         "actual_model": None,
                         "prompt_version": "mock-v1",

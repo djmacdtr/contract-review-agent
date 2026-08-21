@@ -14,27 +14,6 @@ NUMBER_PATTERN = re.compile(
     r"(?:\d{4}[年./-]\d{1,2}(?:[月./-]\d{1,2}日?)?|\d[\d,]*(?:\.\d+)?%?|[一二三四五六七八九十百千万]+(?:年|个月|月|日))"
 )
 CLAUSE_KEY = re.compile(r"^(第[一二三四五六七八九十百千万0-9]+条|\d+(?:\.\d+)*[、.])")
-CRITICAL_KEYWORDS = (
-    "金额",
-    "租金",
-    "保证金",
-    "期限",
-    "利率",
-    "合同编号",
-    "甲方",
-    "乙方",
-    "保证人",
-    "账户",
-    "担保",
-    "违约",
-    "争议",
-    "租赁物",
-    "总额",
-    "付款",
-    "主体",
-)
-
-
 @dataclass(frozen=True)
 class CompareOptions:
     ignore_formatting: bool = True
@@ -45,12 +24,6 @@ class CompareOptions:
 
 def _side(document: ParsedDocument, block: DocumentBlock) -> DiffSide:
     return DiffSide(file_id=document.file_id, location=block.location, text=block.raw_text)
-
-
-def _severity(text: str, *, numeric: bool = False) -> str:
-    if any(keyword in text for keyword in CRITICAL_KEYWORDS):
-        return "HIGH"
-    return "MEDIUM" if numeric or text else "LOW"
 
 
 def _segments(before: str, after: str) -> list[DiffSegment]:
@@ -75,7 +48,6 @@ def _make_diff(
     baseline: DocumentBlock | None,
     target: DocumentBlock | None,
     confidence: float,
-    severity_context: str = "",
     ocr_low_confidence_threshold: float = 0.8,
 ) -> DiffItem:
     before = baseline.raw_text if baseline else ""
@@ -94,22 +66,11 @@ def _make_diff(
     ocr_confidences = [
         location.confidence for location in ocr_locations if location.confidence is not None
     ]
-    low_confidence_ocr = any(
-        location.confidence is None or location.confidence < ocr_low_confidence_threshold
-        for location in ocr_locations
-    )
     if ocr_confidences:
         confidence = min(confidence, *ocr_confidences)
-    severity = _severity(
-        f"{severity_context} {before} {after}",
-        numeric=diff_type == "NUMERIC_CHANGED",
-    )
-    if low_confidence_ocr and diff_type in {"ADDED", "DELETED", "MODIFIED"}:
-        severity = "LOW"
     return DiffItem(
         diff_id=f"diff_{index:06d}",
         diff_type=diff_type,
-        severity=severity,
         title=labels[diff_type],
         baseline=_side(baseline_document, baseline) if baseline else None,
         target=_side(target_document, target) if target else None,
@@ -333,16 +294,6 @@ def _compare_tables(
                     if column < len(target_row.cells)
                     else None
                 )
-                base_header = (
-                    base_rows[0].cells[column].raw_text
-                    if base_rows and column < len(base_rows[0].cells)
-                    else ""
-                )
-                target_header = (
-                    target_rows[0].cells[column].raw_text
-                    if target_rows and column < len(target_rows[0].cells)
-                    else ""
-                )
                 differences.append(
                     _make_diff(
                         index,
@@ -352,7 +303,6 @@ def _compare_tables(
                         base_cell_block,
                         target_cell_block,
                         0.95,
-                        severity_context=f"{base_header} {target_header}",
                         ocr_low_confidence_threshold=options.ocr_low_confidence_threshold,
                     )
                 )
@@ -421,7 +371,6 @@ def compare_documents(
 
 def is_ocr_review_only_diff(item: DiffItem) -> bool:
     return (
-        item.severity == "LOW"
-        and item.diff_type != "NUMERIC_CHANGED"
+        item.diff_type != "NUMERIC_CHANGED"
         and item.review_reason is not None
     )

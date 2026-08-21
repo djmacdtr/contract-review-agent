@@ -8,4 +8,6 @@ body { margin: 0; }
 .form-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
 .muted { color: #6b7280; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #e5e7eb; padding: 16px; border-radius: 8px; max-height: 520px; overflow: auto; }
-
+.embedded-report { max-width: 1180px; margin: 0 auto; padding: 28px; display: flex; flex-direction: column; gap: 18px; }
+.loading-panel { background: white; border-radius: 12px; padding: 28px; box-shadow: 0 2px 12px #0000000d; }
+@media (max-width: 700px) { .embedded-report { padding: 14px; } }

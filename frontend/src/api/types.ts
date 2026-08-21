@@ -6,8 +6,8 @@ export interface RemoteFile { url: string; file_name: string }
 export interface TaskAccepted { task_id: string; task_type: TaskType; status: TaskStatus; progress: number }
 export interface TaskSummary {
   task_id: string; task_type: TaskType; client_reference_id?: string; status: TaskStatus; progress: number
-  conclusion?: string; high_risk_count: number; medium_risk_count: number; low_risk_count: number
-  info_count: number; created_at: string; finished_at?: string
+  conclusion?: string; risk_count: number; review_count: number; legacy_statistics: boolean
+  created_at: string; finished_at?: string
 }
 export interface TaskDetail extends TaskSummary {
   stage: string; stage_message?: string; attempt_count: number; started_at?: string; updated_at: string
@@ -23,7 +23,6 @@ export interface DiffSegment { operation: 'EQUAL' | 'DELETE' | 'INSERT'; text: s
 export interface DiffItem {
   diff_id: string
   diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED'
-  severity: 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO'
   title: string; baseline?: DiffSide; target?: DiffSide; segments: DiffSegment[]; confidence: number; requires_manual_review: boolean
   review_reason?: 'OCR_SINGLE_CHAR_VARIANCE' | 'OCR_PLACEHOLDER_VARIANCE' | 'OCR_READING_ORDER_VARIANCE' | 'OCR_LOW_CONFIDENCE_VARIANCE'
 }
@@ -42,12 +41,37 @@ export interface ComparisonDiagnostics {
   global_text_similarity: number; candidate_diff_count: number; emitted_diff_count: number
   compatible_table_count: number; fallback_mode: string; reasons: string[]
 }
+export interface FilteredTemplateDiff { filter_reason: 'TEMPLATE_FILL_ALLOWED'; diff: DiffItem }
+export interface TemplateDiagnostics {
+  comparison: ComparisonDiagnostics; raw_diff_count: number; retained_diff_count: number
+  filtered_diff_count: number; filtered_diff_items: FilteredTemplateDiff[]
+  expanded_table_count?: number; coalesced_fill_count?: number
+}
+export interface RuleCheck {
+  rule_id: string; rule_name: string; status: 'PASSED' | 'FAILED'
+  location?: DocumentLocation & { file_id?: string }; inputs?: Record<string, unknown>
+  expected?: string; actual?: string; message: string
+}
+export interface ResultStatistics {
+  risk_count: number; deletion_or_missing_count: number; addition_or_change_count: number
+  review_count: number; passed_check_count: number; legacy_statistics?: boolean
+}
+export interface RiskItem {
+  risk_id: string; module_code: string; risk_type: 'DELETION_OR_MISSING' | 'ADDITION_OR_CHANGE'
+  change_type: string; title: string; description: string; source_evidence: Record<string, unknown>[]
+  related_diff_ids: string[]; related_rule_ids: string[]; requires_manual_action: boolean
+}
+export interface ReviewItem {
+  review_id: string; module_code: string; reason_code: string; title: string; description: string
+  source_evidence: Record<string, unknown>[]; related_diff_ids: string[]; requires_manual_action: boolean
+}
+export interface PassedCheck { check_id: string; module_code: string; title: string; description: string }
 export interface TaskResult {
   schema_version: string; task_id: string; task_type: TaskType; conclusion: string; mock: boolean
-  summary: { title: string; description: string; statistics: Record<string, number> }
-  files: ResultFile[]; risk_items: Record<string, unknown>[]; diff_items: DiffItem[]
-  fact_matrix: Record<string, unknown>[]; rule_checks: Record<string, unknown>[]
+  summary: { title: string; description: string; statistics: ResultStatistics }
+  files: ResultFile[]; risk_items: RiskItem[]; review_items: ReviewItem[]; passed_checks: PassedCheck[]; diff_items: DiffItem[]
+  fact_matrix: Record<string, unknown>[]; rule_checks: RuleCheck[]
   warnings: { code: string; message: string; requires_manual_review?: boolean; page?: number; confidence?: number; details?: Record<string, unknown> }[]
   advice: Record<string, unknown>
-  metadata: { execution_mode: 'MOCK' | 'PARSER_ONLY' | 'RULE_BASED'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics }
+  metadata: { execution_mode: 'MOCK' | 'PARSER_ONLY' | 'RULE_BASED'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics; template_diagnostics?: TemplateDiagnostics }
 }
