@@ -1,16 +1,20 @@
 <template>
-  <router-view v-if="embedded" />
-  <el-container v-else class="shell">
-    <el-header>
-      <div class="brand">合同智能检查 Agent <el-tag type="success">FINAL Rule-based</el-tag> <el-tag type="success">DRAFT Rule-based</el-tag></div>
-      <el-menu mode="horizontal" router :default-active="$route.path">
-        <el-menu-item index="/tasks">任务列表</el-menu-item>
-        <el-menu-item index="/tasks/new/draft">起草检查</el-menu-item>
-        <el-menu-item index="/tasks/new/final">放款比对</el-menu-item>
+  <el-container class="shell">
+    <el-header class="console-header">
+      <div class="header-inner">
+        <div class="brand-block">
+          <span class="brand-mark">AI</span>
+          <div><strong>合同智能检查 Agent</strong><small>规则驱动的合同检查与版本比对</small></div>
+        </div>
+        <el-menu mode="horizontal" :default-active="activeMenu" :ellipsis="false">
+        <el-menu-item index="/tasks" @click="$router.push('/tasks')">任务中心</el-menu-item>
+        <el-menu-item index="/tasks/new/draft" @click="$router.push('/tasks/new/draft')">起草检查</el-menu-item>
+        <el-menu-item index="/tasks/new/final" @click="$router.push('/tasks/new/final')">放款比对</el-menu-item>
         <el-menu-item index="/docs" @click="openDocs">API 文档</el-menu-item>
-      </el-menu>
+        </el-menu>
+      </div>
     </el-header>
-    <el-main><router-view /></el-main>
+    <el-main><router-view :key="$route.fullPath" /></el-main>
   </el-container>
 </template>
 
@@ -18,6 +22,9 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 const route = useRoute()
-const embedded = computed(() => route.meta.embedded === true)
+const activeMenu = computed(() => {
+  if (route.path.startsWith('/reports/') || /^\/tasks\/[^/]+$/.test(route.path)) return '/tasks'
+  return route.path
+})
 const openDocs = () => window.open('/docs', '_blank')
 </script>

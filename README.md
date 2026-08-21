@@ -10,10 +10,10 @@
 - 健康检查：http://localhost:8000/health
 - 就绪检查：http://localhost:8000/ready
 - 测试控制台：http://localhost:8000/console/
-- 起草检查嵌入页：`http://localhost:8000/console/#/reports/draft/{task_id}`
-- 放款比对嵌入页：`http://localhost:8000/console/#/reports/final/{task_id}`
+- 起草检查报告页：`http://localhost:8000/console/#/reports/draft/{task_id}`
+- 放款比对报告页：`http://localhost:8000/console/#/reports/final/{task_id}`
 
-两个嵌入页是独立只读报告，不显示控制台导航、任务创建、重试或原始 JSON；URL 只携带不可猜测的任务 ID，不携带文件地址。
+两个业务报告页已纳入控制台统一导航。创建任务后默认进入对应报告并轮询进度；任务中心以“查看报告”为主入口，以“调试详情”为次入口。业务报告不显示原始 JSON 或文件 URL，调试详情仍保留解析诊断、重试和原始结果。URL 只携带不可猜测的任务 ID，不携带文件地址。
 - Worker：`python -m app.worker`
 - FastAPI：`app.main:app`
 - 初始迁移：`alembic/versions/0001_initial.py`
@@ -196,4 +196,4 @@ docker compose logs worker
 
 已实现 FINAL_COMPARE 的受控下载、任务级一致解析计划、同步外部 PDF 解析，以及文字/数值/基础表格差异。DRAFT_REVIEW 已复用可靠正文对齐并增加模板填写区过滤、未填标记和保守的表格检查。对齐引擎会处理中文空格、软换行、零宽字符和已确认的解析器标记噪声，支持 1–4 对 1–4 条款合并/拆分、严格的 OCR 表格续行合并、表格兼容门控及页面文本 fallback；不可靠对齐不会直接生成业务风险。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。外部解析响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
 
-尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 事实抽取/跨资料矩阵、复杂模板表格语义、合同数学规则、印章、上传、报告、鉴权和模板库。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
+尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 事实抽取/跨资料矩阵、复杂模板表格语义、合同数学规则、印章、上传、报告文件导出、鉴权和模板库。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。

@@ -1,19 +1,30 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
 import type { TaskDetail, TaskResult, TaskType } from '../api/types'
+import { reportPath } from '../utils/routes'
 
 export function useTaskReport(expectedType: TaskType) {
   const route = useRoute()
+  const router = useRouter()
   const taskId = String(route.params.taskId)
   const detail = ref<TaskDetail>()
   const result = ref<TaskResult>()
   const error = ref('')
+  const retrying = ref(false)
   let timer: number | undefined
 
   function stop() {
-    if (timer) window.clearInterval(timer)
+    if (timer) window.clearTimeout(timer)
     timer = undefined
+  }
+
+  function schedule() {
+    stop()
+    timer = window.setTimeout(async () => {
+      await load()
+      if (!result.value && !error.value) schedule()
+    }, 2000)
   }
 
   async function load() {
@@ -24,6 +35,7 @@ export function useTaskReport(expectedType: TaskType) {
         stop()
         return
       }
+      error.value = ''
       if (detail.value.status === 'SUCCEEDED') {
         result.value = await api.result(taskId)
         stop()
@@ -39,9 +51,25 @@ export function useTaskReport(expectedType: TaskType) {
 
   onMounted(async () => {
     await load()
-    if (!result.value && !error.value) timer = window.setInterval(load, 2000)
+    if (!result.value && !error.value) schedule()
   })
   onBeforeUnmount(stop)
 
-  return { taskId, detail, result, error }
+  async function retryTask() {
+    retrying.value = true
+    try {
+      const next = await api.retry(taskId)
+      await router.replace(reportPath(next))
+    } finally {
+      retrying.value = false
+    }
+  }
+
+  async function reload() {
+    error.value = ''
+    await load()
+    if (!result.value && !error.value) schedule()
+  }
+
+  return { taskId, detail, result, error, retrying, retryTask, reload }
 }

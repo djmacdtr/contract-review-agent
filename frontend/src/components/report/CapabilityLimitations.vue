@@ -2,4 +2,4 @@
 <script setup lang="ts">
 defineProps<{ items: string[] }>()
 </script>
-<style scoped>.limitations{background:#edf2f7;color:#52667a;border-radius:12px;padding:18px 22px}.limitations ul{margin:8px 0}.limitations p{margin:8px 0 0;font-weight:600}</style>
+<style scoped>.limitations{background:var(--report-surface-2);border:1px solid var(--report-border);color:var(--report-text-2);border-radius:12px;padding:18px 22px}.limitations strong{color:var(--report-text)}.limitations ul{margin:8px 0}.limitations p{margin:8px 0 0;font-weight:600;color:var(--report-text)}</style>

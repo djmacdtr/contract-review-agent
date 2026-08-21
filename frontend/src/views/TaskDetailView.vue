@@ -6,6 +6,7 @@
       <p>{{ displayLabel(detail.stage) }} · {{ detail.stage_message }}</p>
       <el-progress :percentage="detail.progress" />
       <el-alert v-if="detail.error" type="error" :title="`${detail.error.code}: ${detail.error.message}`" />
+      <el-button type="primary" plain @click="$router.push(reportPath(detail))">查看业务报告</el-button>
       <el-button v-if="detail.status === 'FAILED'" type="warning" @click="retry">创建重试任务</el-button>
     </template>
     <el-tabs v-if="result" style="margin-top: 20px">
@@ -137,6 +138,7 @@ import { api } from '../api/client'
 import type { TaskDetail, TaskResult } from '../api/types'
 import type { DocumentLocation } from '../api/types'
 import { displayLabel } from '../utils/labels'
+import { reportPath } from '../utils/routes'
 const route = useRoute(); const router = useRouter(); const taskId = String(route.params.taskId)
 const detail = ref<TaskDetail>(); const result = ref<TaskResult>(); let timer: number | undefined
 const pageSize = 20; const diffPage = ref(1)
@@ -147,7 +149,7 @@ const reviewDiffs = computed(() => result.value?.diff_items.filter(item => Boole
 const pagedBusinessDiffs = computed(() => { const start = (diffPage.value - 1) * pageSize; return businessDiffs.value.slice(start, start + pageSize) })
 async function load() { try { detail.value = await api.detail(taskId); if (detail.value.status === 'SUCCEEDED') { result.value = await api.result(taskId); stop() } else if (['FAILED', 'CANCELLED'].includes(detail.value.status)) stop() } catch (e) { ElMessage.error(String(e)); stop() } }
 function stop() { if (timer) window.clearInterval(timer); timer = undefined }
-async function retry() { try { const next = await api.retry(taskId); await router.push(`/tasks/${next.task_id}`); window.location.reload() } catch (e) { ElMessage.error(String(e)) } }
+async function retry() { try { const next = await api.retry(taskId); await router.push(reportPath(next)) } catch (e) { ElMessage.error(String(e)) } }
 function formatLocation(location?: DocumentLocation) { if (!location) return '无对应位置'; const parts = []; if (location.page != null) parts.push(`第 ${location.page} 页`); if (location.paragraph_index != null) parts.push(`段落 ${location.paragraph_index}`); if (location.table_index != null) parts.push(`表格 ${location.table_index}`); if (location.row != null) parts.push(`行 ${location.row}`); if (location.column != null) parts.push(`列 ${location.column}`); if (location.section) parts.push(location.section); if (location.source === 'OCR') parts.push('OCR'); if (location.confidence != null) parts.push(`置信度 ${location.confidence}`); return parts.join(' · ') || '结构位置未知' }
 function formatLocations(locations?: DocumentLocation[], primary?: DocumentLocation) { const values = locations?.length ? locations : (primary ? [primary] : []); if (!values.length) return '无对应位置'; if (values.length === 1) return formatLocation(values[0]); return `${formatLocation(values[0])} → ${formatLocation(values[values.length - 1])}（共 ${values.length} 处）` }
 function percent(value: number) { return `${(value * 100).toFixed(1)}%` }

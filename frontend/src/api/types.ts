@@ -3,17 +3,25 @@ export type TaskStatus = 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCE
 
 export interface Envelope<T> { code: string; message: string; request_id: string; data: T; error?: unknown }
 export interface RemoteFile { url: string; file_name: string }
-export interface TaskAccepted { task_id: string; task_type: TaskType; status: TaskStatus; progress: number }
+export interface TaskAccepted {
+  task_id: string; task_type: TaskType; status: TaskStatus; progress: number
+  created_at?: string; status_url?: string; result_url?: string; source_task_id?: string
+}
 export interface TaskSummary {
   task_id: string; task_type: TaskType; client_reference_id?: string; status: TaskStatus; progress: number
   conclusion?: string; risk_count: number; review_count: number; legacy_statistics: boolean
   created_at: string; finished_at?: string
 }
-export interface TaskDetail extends TaskSummary {
-  stage: string; stage_message?: string; attempt_count: number; started_at?: string; updated_at: string
-  error?: { code: string; message: string }
+export interface TaskDetail {
+  task_id: string; task_type: TaskType; client_reference_id?: string; status: TaskStatus; progress: number
+  stage: string; stage_message?: string; attempt_count: number; created_at: string; started_at?: string
+  updated_at: string; finished_at?: string; error?: { code: string; message: string; details?: Record<string, unknown> }
 }
 export interface TaskList { items: TaskSummary[]; page: number; page_size: number; total: number }
+export interface TaskListQuery {
+  page?: number; page_size?: number; task_type?: TaskType; status?: TaskStatus
+  client_reference_id?: string; created_from?: string; created_to?: string
+}
 export interface DocumentLocation {
   page?: number; paragraph_index?: number; table_index?: number; row?: number; column?: number; section?: string
   bbox?: number[]; source?: 'LOCAL' | 'OCR'; confidence?: number

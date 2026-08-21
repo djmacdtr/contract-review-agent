@@ -14,7 +14,7 @@ export default createRouter({
     { path: '/tasks/new/draft', component: DraftReviewView },
     { path: '/tasks/new/final', component: FinalCompareView },
     { path: '/tasks/:taskId', component: TaskDetailView },
-    { path: '/reports/draft/:taskId', component: DraftReportView, meta: { embedded: true } },
-    { path: '/reports/final/:taskId', component: FinalReportView, meta: { embedded: true } },
+    { path: '/reports/draft/:taskId', component: DraftReportView },
+    { path: '/reports/final/:taskId', component: FinalReportView },
   ],
 })

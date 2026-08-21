@@ -1,13 +1,69 @@
-:root { font-family: Inter, "Microsoft YaHei", sans-serif; color: #1f2937; background: #f3f6fa; }
-body { margin: 0; }
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  color: #1a1d28;
+  background: #f5f7fb;
+  --report-bg: #f5f7fb;
+  --report-surface: #fff;
+  --report-surface-2: #f8fafc;
+  --report-border: #e6ebf2;
+  --report-text: #1a1d28;
+  --report-text-2: #5b6472;
+  --report-text-3: #8995a8;
+  --report-primary: #2b6cb0;
+  --report-primary-soft: #e9f1fb;
+  --report-danger: #d8392b;
+  --report-danger-soft: #fdecea;
+  --report-warning: #d9780b;
+  --report-warning-soft: #fdf3e6;
+  --report-info: #3b6fb0;
+  --report-info-soft: #eaf1fb;
+  --report-success: #1f9d55;
+  --report-success-soft: #e8f6ed;
+  --report-shadow: 0 1px 2px #14203c0d, 0 8px 22px #14203c0d;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--report-bg); color: var(--report-text); -webkit-font-smoothing: antialiased; }
 .shell { min-height: 100vh; }
-.el-header { height: auto; background: white; border-bottom: 1px solid #e5e7eb; }
-.brand { padding: 18px 20px 4px; font-size: 20px; font-weight: 700; }
+.console-header { height: 72px; padding: 0; background: #fff; border-bottom: 1px solid var(--report-border); box-shadow: 0 2px 12px #14203c08; }
+.header-inner { max-width: 1240px; height: 100%; margin: 0 auto; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; gap: 28px; }
+.brand-block { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+.brand-block > div { display: flex; flex-direction: column; }
+.brand-block strong { font-size: 17px; }
+.brand-block small { color: var(--report-text-3); margin-top: 2px; }
+.brand-mark { width: 38px; height: 38px; display: inline-flex; align-items: center; justify-content: center; border-radius: 11px; background: linear-gradient(135deg, #1f3a5f, #2b6cb0); color: #fff; font-weight: 800; letter-spacing: .04em; }
+.console-header .el-menu { border-bottom: 0; height: 71px; }
+.console-header .el-menu-item { font-weight: 600; }
+.el-main { padding: 26px 24px 48px; }
+
 .page { max-width: 1180px; margin: 0 auto; }
-.panel { background: white; padding: 24px; border-radius: 10px; box-shadow: 0 2px 12px #0000000d; }
+.workspace-page { display: flex; flex-direction: column; gap: 18px; }
+.page-heading { padding: 6px 2px 2px; }
+.page-heading h1 { margin: 5px 0 4px; font-size: 27px; }
+.page-heading p { margin: 0; color: var(--report-text-2); }
+.page-kicker { color: var(--report-primary); font-size: 12px; font-weight: 800; letter-spacing: .1em; }
+.panel { background: #fff; padding: 24px; border: 1px solid var(--report-border); border-radius: 12px; box-shadow: var(--report-shadow); }
+.form-panel { max-width: 900px; width: 100%; margin: 0 auto; }
+.task-form { margin-top: 20px; }
 .form-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
-.muted { color: #6b7280; }
+.muted { color: var(--report-text-3); }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #e5e7eb; padding: 16px; border-radius: 8px; max-height: 520px; overflow: auto; }
-.embedded-report { max-width: 1180px; margin: 0 auto; padding: 28px; display: flex; flex-direction: column; gap: 18px; }
-.loading-panel { background: white; border-radius: 12px; padding: 28px; box-shadow: 0 2px 12px #0000000d; }
-@media (max-width: 700px) { .embedded-report { padding: 14px; } }
+
+.report-page { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 15px; }
+.report-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 11px 16px; background: #fff; border: 1px solid var(--report-border); border-radius: 10px; box-shadow: var(--report-shadow); color: var(--report-text-2); font-size: 12px; }
+.report-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.report-legend i { width: 10px; height: 10px; border-radius: 3px; }
+.risk-dot,.delete-dot { background: var(--report-danger); }
+.add-dot { background: var(--report-warning); }
+.review-dot { background: var(--report-info); }
+.pass-dot { background: var(--report-success); }
+.report-state { min-height: 280px; display: flex; flex-direction: column; justify-content: center; }
+.report-state .state-kicker { color: var(--report-primary); font-size: 12px; font-weight: 800; letter-spacing: .08em; }
+.report-state h2 { margin: 8px 0 20px; }
+.report-state p { color: var(--report-text-2); margin: 13px 0 0; }
+
+@media (max-width: 1100px) {
+  .header-inner { padding: 0 16px; }
+  .brand-block small { display: none; }
+  .el-main { padding: 22px 16px 42px; }
+}

@@ -47,6 +47,8 @@ const labels: Record<string, string> = {
   DOCUMENT_ALIGNMENT: '文档对齐',
   TEMPLATE_COMPLETENESS: '模板填写完整性',
   CAPABILITY_LIMITATION: '能力边界',
+  FACT_CONSISTENCY: '跨资料事实一致性',
+  LEGACY_RESULT: '历史结果',
   PDF_EXTERNAL_PARSE_USED: '已使用外部 PDF 解析',
   PARSER_STRUCTURE_MISMATCH: '解析结构不一致',
   ALIGNMENT_UNRELIABLE: '对齐可靠性不足',
