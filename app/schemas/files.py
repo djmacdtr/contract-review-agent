@@ -17,7 +17,9 @@ class RemoteFile(BaseModel):
         default=None, max_length=200, description="调用方声明的 MIME 类型"
     )
     reference_type: ReferenceType | None = Field(
-        default=None, description="辅助资料类型；非辅助文件可不传"
+        default=None,
+        description="已弃用且被忽略；辅助资料类型由系统根据正文识别",
+        deprecated=True,
     )
     display_name: str | None = Field(
         default=None, max_length=200, description="控制台友好名称"
@@ -31,4 +33,3 @@ class TaskFileView(BaseModel):
     file_name: str
     safe_url: str
     sort_order: int
-

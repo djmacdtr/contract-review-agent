@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.files import RemoteFile
 
@@ -31,7 +31,6 @@ class DraftReviewCreate(BaseModel):
                     {
                         "url": "https://files.example.com/review.pdf?signature=example",
                         "file_name": "评审意见表.pdf",
-                        "reference_type": "REVIEW_OPINION",
                     }
                 ],
             }
@@ -41,12 +40,12 @@ class DraftReviewCreate(BaseModel):
     client_reference_id: str | None = Field(default=None, max_length=128)
     target_file: RemoteFile = Field(description="需要检查的合同")
     template_file: RemoteFile = Field(description="对应制式模板")
-    reference_files: list[RemoteFile] = Field(min_length=1, max_length=10)
+    reference_files: list[RemoteFile] = Field(
+        min_length=1,
+        max_length=100,
+        description="辅助资料列表；实际数量上限由 MAX_REFERENCE_FILES 配置",
+    )
     options: DraftReviewOptions = Field(default_factory=DraftReviewOptions)
-
-    @model_validator(mode="after")
-    def references_have_type(self) -> "DraftReviewCreate":
-        return self
 
 
 class FinalCompareOptions(BaseModel):
@@ -79,4 +78,3 @@ class FinalComparisonCreate(BaseModel):
     baseline_file: RemoteFile = Field(description="原文件或申请版")
     target_file: RemoteFile = Field(description="需要比对的文件")
     options: FinalCompareOptions = Field(default_factory=FinalCompareOptions)
-

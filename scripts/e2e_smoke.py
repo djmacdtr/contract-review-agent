@@ -1,56 +1,92 @@
-"""Verify the DRAFT_REVIEW Mock API -> Worker -> result loop."""
+"""Verify the real DRAFT_REVIEW API -> Worker -> parser -> result loop."""
+
+from __future__ import annotations
 
 import os
+import tempfile
+import threading
 import time
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
+from docx import Document
 
 BASE_URL = os.getenv("SMOKE_BASE_URL", "http://127.0.0.1:8000")
+FIXTURE_HOST = os.getenv("SMOKE_FIXTURE_HOST", "api")
+FIXTURE_PORT = int(os.getenv("SMOKE_FIXTURE_PORT", "18080"))
 
-PAYLOADS = [
-    (
-        "/api/v1/draft-reviews",
-        {
-            "client_reference_id": "docker-smoke-draft",
-            "target_file": {"url": "https://files.example.com/draft.docx?token=not-logged", "file_name": "draft.docx"},
-            "template_file": {"url": "https://files.example.com/template.docx?token=not-logged", "file_name": "template.docx"},
-            "reference_files": [{"url": "https://files.example.com/review.pdf?token=not-logged", "file_name": "review.pdf", "reference_type": "REVIEW_OPINION"}],
-        },
-    ),
-]
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        return None
+
+
+def write_docx(path: Path, title: str) -> None:
+    document = Document()
+    document.add_heading(title, level=1)
+    document.add_paragraph("这是完全合成的工程冒烟测试内容。")
+    document.save(path)
+
+
+def payload() -> dict:
+    base = f"http://{FIXTURE_HOST}:{FIXTURE_PORT}"
+    return {
+        "client_reference_id": "docker-smoke-draft-real-parse",
+        "target_file": {"url": f"{base}/target.docx", "file_name": "target.docx"},
+        "template_file": {"url": f"{base}/template.docx", "file_name": "template.docx"},
+        "reference_files": [
+            {"url": f"{base}/reference.docx", "file_name": "reference.docx"}
+        ],
+    }
 
 
 def main() -> None:
-    task_ids: list[str] = []
-    # Local verification must not be routed through workstation proxy settings.
-    with httpx.Client(base_url=BASE_URL, timeout=10, trust_env=False) as client:
-        for path, payload in PAYLOADS:
-            response = client.post(path, json=payload)
-            response.raise_for_status()
-            assert response.status_code == 202
-            task_ids.append(response.json()["data"]["task_id"])
-
-        for task_id in task_ids:
-            history: list[tuple[str, str, int]] = []
-            deadline = time.monotonic() + 40
-            while time.monotonic() < deadline:
-                detail = client.get(f"/api/v1/tasks/{task_id}")
-                detail.raise_for_status()
-                data = detail.json()["data"]
-                state = (data["status"], data["stage"], data["progress"])
-                if not history or history[-1] != state:
-                    history.append(state)
-                if data["status"] in {"SUCCEEDED", "FAILED"}:
-                    break
-                time.sleep(0.2)
-            assert data["status"] == "SUCCEEDED", (task_id, data)
-            result = client.get(f"/api/v1/tasks/{task_id}/result")
-            result.raise_for_status()
-            result_data = result.json()["data"]
-            assert result_data["mock"] is True
-            assert result_data["metadata"]["execution_mode"] == "MOCK"
-            assert result_data["warnings"][0]["code"] == "MOCK_RESULT"
-            print({"task_id": task_id, "history": history, "result": "valid-mock"})
+    with tempfile.TemporaryDirectory(prefix="contract-review-smoke-") as directory:
+        root = Path(directory)
+        write_docx(root / "target.docx", "目标合同")
+        write_docx(root / "template.docx", "合同模板")
+        write_docx(root / "reference.docx", "任意辅助资料")
+        handler = partial(QuietHandler, directory=directory)
+        server = ThreadingHTTPServer(("0.0.0.0", FIXTURE_PORT), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with httpx.Client(base_url=BASE_URL, timeout=10, trust_env=False) as client:
+                response = client.post("/api/v1/draft-reviews", json=payload())
+                response.raise_for_status()
+                assert response.status_code == 202
+                task_id = response.json()["data"]["task_id"]
+                history: list[tuple[str, str, int]] = []
+                deadline = time.monotonic() + 40
+                while time.monotonic() < deadline:
+                    detail = client.get(f"/api/v1/tasks/{task_id}")
+                    detail.raise_for_status()
+                    data = detail.json()["data"]
+                    state = (data["status"], data["stage"], data["progress"])
+                    if not history or history[-1] != state:
+                        history.append(state)
+                    if data["status"] in {"SUCCEEDED", "FAILED"}:
+                        break
+                    time.sleep(0.2)
+                assert data["status"] == "SUCCEEDED", (task_id, data)
+                result = client.get(f"/api/v1/tasks/{task_id}/result")
+                result.raise_for_status()
+                result_data = result.json()["data"]
+                assert result_data["mock"] is False
+                assert result_data["metadata"]["execution_mode"] == "PARSER_ONLY"
+                assert result_data["conclusion"] == "REVIEW_REQUIRED"
+                assert len(result_data["files"]) == 3
+                assert all(
+                    item["parser_name"] == "python-docx" for item in result_data["files"]
+                )
+                assert result_data["warnings"][-1]["code"] == "DRAFT_REVIEW_PARSE_ONLY"
+                print({"task_id": task_id, "history": history, "result": "valid-real-parse"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

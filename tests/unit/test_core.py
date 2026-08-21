@@ -23,6 +23,7 @@ def test_url_sanitizer_removes_credentials_query_and_fragment() -> None:
 
 def test_llm_configuration_defaults() -> None:
     settings = Settings(_env_file=None, DATABASE_URL="postgresql+asyncpg://x:x@db/test")
+    assert Settings.model_fields["MAX_REFERENCE_FILES"].default == 20
     assert settings.LLM_ENABLED is False
     assert settings.LLM_EXTRACTION_MODEL == "GLM-5.2"
     assert settings.LLM_ADVICE_MODEL == "GLM-5.2"

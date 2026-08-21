@@ -39,6 +39,17 @@
             <div v-if="file.parser_metadata?.engine_version" class="muted">引擎：{{ file.parser_metadata.engine_version }}</div>
             <div v-if="file.parser_metadata?.parse_mode" class="muted">解析模式：{{ file.parser_metadata.parse_mode }}</div>
             <div v-if="file.parser_metadata?.confidence_min != null" class="muted">最低置信度：{{ file.parser_metadata.confidence_min }}</div>
+            <div v-if="file.document_profile" class="muted">
+              文档类型：{{ displayLabel(file.document_profile.document_kind) }}
+              · 识别状态：{{ displayLabel(file.document_profile.generated_by) }}
+            </div>
+            <div v-if="file.content_structure" class="muted">
+              内容块：{{ file.content_structure.block_count }}
+              · 表格：{{ file.content_structure.table_count }}
+            </div>
+            <div v-if="file.content_structure?.sample_locations?.length" class="muted">
+              位置示例：{{ formatLocations(file.content_structure.sample_locations) }}
+            </div>
           </el-descriptions-item>
         </el-descriptions>
         <h4>处理警告</h4>

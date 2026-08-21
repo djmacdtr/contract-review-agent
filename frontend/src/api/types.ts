@@ -2,7 +2,7 @@ export type TaskType = 'DRAFT_REVIEW' | 'FINAL_COMPARE'
 export type TaskStatus = 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
 
 export interface Envelope<T> { code: string; message: string; request_id: string; data: T; error?: unknown }
-export interface RemoteFile { url: string; file_name: string; reference_type?: string }
+export interface RemoteFile { url: string; file_name: string }
 export interface TaskAccepted { task_id: string; task_type: TaskType; status: TaskStatus; progress: number }
 export interface TaskSummary {
   task_id: string; task_type: TaskType; client_reference_id?: string; status: TaskStatus; progress: number
@@ -30,6 +30,8 @@ export interface DiffItem {
 export interface ResultFile {
   file_id: string; role: string; file_name: string; safe_url: string; sha256?: string; page_count?: number
   parser_name: string; parse_status: string; parse_warnings?: Record<string, unknown>[]; parser_metadata?: Record<string, unknown>
+  document_profile?: { document_kind: string; title?: string; confidence: number; generated_by: string; evidence_locations: DocumentLocation[] }
+  content_structure?: { block_count: number; table_count: number; sample_locations: DocumentLocation[] }
 }
 export interface ComparisonDiagnostics {
   reliable: boolean
@@ -47,5 +49,5 @@ export interface TaskResult {
   fact_matrix: Record<string, unknown>[]; rule_checks: Record<string, unknown>[]
   warnings: { code: string; message: string; requires_manual_review?: boolean; page?: number; confidence?: number; details?: Record<string, unknown> }[]
   advice: Record<string, unknown>
-  metadata: { execution_mode: 'MOCK' | 'RULE_BASED'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics }
+  metadata: { execution_mode: 'MOCK' | 'PARSER_ONLY' | 'RULE_BASED'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics }
 }

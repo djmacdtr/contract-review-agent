@@ -2,8 +2,9 @@ from typing import Any
 
 from app.core.config import Settings
 from app.core.enums import TaskType
+from app.workflows.draft_review import DraftReviewWorkflowExecutor
 from app.workflows.final_compare import FinalCompareWorkflowExecutor
-from app.workflows.mock_graphs import MockWorkflowExecutor, ProgressCallback
+from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
 
@@ -12,10 +13,10 @@ class WorkflowRouter:
         self,
         settings: Settings,
         *,
-        mock: MockWorkflowExecutor | None = None,
+        draft_review: DraftReviewWorkflowExecutor | None = None,
         final_compare: FinalCompareWorkflowExecutor | None = None,
     ) -> None:
-        self.mock = mock or MockWorkflowExecutor(settings)
+        self.draft_review = draft_review or DraftReviewWorkflowExecutor(settings)
         self.final_compare = final_compare or FinalCompareWorkflowExecutor(settings)
 
     async def run(
@@ -35,11 +36,10 @@ class WorkflowRouter:
                 options=options,
                 progress_callback=progress_callback,
             )
-        result = await self.mock.run(
+        return await self.draft_review.run(
             task_id=task_id,
             task_type=task_type,
             files=files,
             options=options,
             progress_callback=progress_callback,
         )
-        return WorkflowOutput(result=result)

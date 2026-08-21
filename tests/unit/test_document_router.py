@@ -112,3 +112,36 @@ async def test_formal_pdf_does_not_fall_back_when_external_disabled(tmp_path: Pa
         await router.parse_final_compare([docx_file(tmp_path), scan_file(tmp_path)])
     assert caught.value.code == "OCR_NOT_CONFIGURED"
     assert local.calls == []
+
+
+async def test_draft_review_routes_each_docx_locally_and_each_pdf_external_auto(
+    tmp_path: Path,
+) -> None:
+    local = LocalParser(parsed())
+    external = ExternalParser(parsed())
+    router = DocumentParsingRouter(local=local, external=external)
+    files = [
+        docx_file(tmp_path, "TARGET"),
+        scan_file(tmp_path, "REFERENCE"),
+        docx_file(tmp_path, "TEMPLATE"),
+        scan_file(tmp_path, "REFERENCE-2"),
+    ]
+
+    assert len(await router.parse_draft_review(files)) == 4
+    assert local.calls == ["fil_target", "fil_template"]
+    assert external.calls == [
+        ("fil_reference", "auto"),
+        ("fil_reference-2", "auto"),
+    ]
+
+
+async def test_draft_review_pdf_requires_external_parser(tmp_path: Path) -> None:
+    local = LocalParser(parsed())
+    router = DocumentParsingRouter(local=local, external=None)
+
+    with pytest.raises(WorkflowError) as caught:
+        await router.parse_draft_review(
+            [docx_file(tmp_path, "TARGET"), scan_file(tmp_path, "REFERENCE")]
+        )
+
+    assert caught.value.code == "OCR_NOT_CONFIGURED"

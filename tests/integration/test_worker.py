@@ -16,6 +16,7 @@ from app.main import app
 from app.schemas.results import TaskResultData
 from app.services.downloader import SafeFileDownloadService
 from app.worker.runner import WorkerRunner
+from app.workflows.draft_review import DraftReviewWorkflowExecutor
 from app.workflows.final_compare import FinalCompareWorkflowExecutor
 from app.workflows.mock_graphs import MockWorkflowExecutor
 from tests.integration.helpers import DRAFT_PAYLOAD, FINAL_PAYLOAD
@@ -231,6 +232,88 @@ async def test_real_final_compare_worker_persists_result_and_file_metadata(tmp_p
     assert stored.model_name is None
     assert all(file.sha256 and file.parser_name == "python-docx" for file in files)
     assert "token=secret" not in str(stored.result)
+
+
+async def test_real_draft_review_worker_parses_all_files_and_persists_metadata(tmp_path) -> None:
+    bodies: dict[str, bytes] = {}
+    for name, title in (
+        ("target.docx", "目标合同"),
+        ("template.docx", "合同模板"),
+        ("reference.docx", "任意辅助资料"),
+    ):
+        path = tmp_path / name
+        document = Document()
+        document.add_heading(title, level=1)
+        document.add_paragraph("用于集成测试的合成正文。")
+        document.save(path)
+        bodies[f"/{name}"] = path.read_bytes()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=bodies[request.url.path], request=request)
+
+    async def resolver(host: str, port: int) -> list[str]:
+        return ["127.0.0.1"]
+
+    payload = {
+        "client_reference_id": "integration-real-draft",
+        "target_file": {
+            "url": "http://fixture-server/target.docx?token=secret",
+            "file_name": "target.docx",
+        },
+        "template_file": {
+            "url": "http://fixture-server/template.docx?token=secret",
+            "file_name": "template.docx",
+        },
+        "reference_files": [
+            {
+                "url": "http://fixture-server/reference.docx?token=secret",
+                "file_name": "reference.docx",
+            }
+        ],
+    }
+    task_id = await create("/api/v1/draft-reviews", payload)
+    real_settings = get_settings().model_copy(
+        update={
+            "TEMP_ROOT": str(tmp_path / "work-draft"),
+            "ALLOW_HTTP_DOWNLOADS": True,
+            "DOWNLOAD_HOST_ALLOWLIST": "fixture-server",
+            "OCR_ENABLED": False,
+        }
+    )
+    downloader = SafeFileDownloadService(
+        real_settings,
+        transport=httpx.MockTransport(handler),
+        resolver=resolver,
+    )
+    runner = WorkerRunner(
+        real_settings,
+        workflow=DraftReviewWorkflowExecutor(real_settings, downloader=downloader),
+    )
+    assert await runner.run_once() is True
+
+    async with SessionFactory() as session:
+        task = (
+            await session.execute(select(CheckTask).where(CheckTask.id == task_id))
+        ).scalar_one()
+        stored = (
+            await session.execute(select(TaskResult).where(TaskResult.task_id == task_id))
+        ).scalar_one()
+        files = (
+            (await session.execute(select(TaskFile).where(TaskFile.task_id == task_id)))
+            .scalars()
+            .all()
+        )
+
+    assert task.status == TaskStatus.SUCCEEDED
+    assert stored.result["mock"] is False
+    assert stored.result["metadata"]["execution_mode"] == "PARSER_ONLY"
+    assert stored.result["conclusion"] == "REVIEW_REQUIRED"
+    assert len(stored.result["files"]) == 3
+    assert stored.model_name is None
+    assert all(file.sha256 and file.parser_name == "python-docx" for file in files)
+    assert all(file.reference_type is None for file in files)
+    assert "token=secret" not in str(stored.result)
+    assert not any((tmp_path / "work-draft").iterdir())
 
 
 async def test_formal_pdf_without_external_parser_fails_safely_and_cleans_workspace(

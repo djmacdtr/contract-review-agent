@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.enums import EventType, FileRole, ReferenceType, TaskStage, TaskStatus, TaskType
+from app.core.enums import EventType, FileRole, TaskStage, TaskStatus, TaskType
 from app.core.errors import AppError, TaskNotFoundError
 from app.core.ids import new_file_id, new_task_id
 from app.db.models import CheckTask, TaskEvent, TaskFile, TaskResult
@@ -23,16 +23,35 @@ from app.services.url_security import sanitize_url
 
 
 class TaskService:
-    def __init__(self, session: AsyncSession, settings: Settings, repository: TaskRepository | None = None):
+    def __init__(
+        self,
+        session: AsyncSession,
+        settings: Settings,
+        repository: TaskRepository | None = None,
+    ):
         self.session = session
         self.settings = settings
         self.repository = repository or TaskRepository()
 
     async def create_draft(self, request: DraftReviewCreate, request_id: str) -> TaskAccepted:
+        reference_count = len(request.reference_files)
+        if reference_count > self.settings.MAX_REFERENCE_FILES:
+            raise AppError(
+                "INVALID_REQUEST",
+                "辅助资料数量超过当前配置上限",
+                status_code=400,
+                details={
+                    "max_reference_files": self.settings.MAX_REFERENCE_FILES,
+                    "actual_reference_files": reference_count,
+                },
+            )
         files = [
             (FileRole.TARGET, request.target_file, 0),
             (FileRole.TEMPLATE, request.template_file, 1),
-            *[(FileRole.REFERENCE, item, index + 2) for index, item in enumerate(request.reference_files)],
+            *[
+                (FileRole.REFERENCE, item, index + 2)
+                for index, item in enumerate(request.reference_files)
+            ],
         ]
         return await self._create(
             TaskType.DRAFT_REVIEW,
@@ -69,9 +88,9 @@ class TaskService:
         snapshot_files: list[dict] = []
         for role, remote, order in files:
             safe_url = sanitize_url(str(remote.url))
-            reference_type = remote.reference_type
-            if role == FileRole.REFERENCE and reference_type is None:
-                reference_type = ReferenceType.OTHER
+            # Legacy callers may still send reference_type. It is deliberately
+            # ignored because document classification is a system output.
+            reference_type = None
             file_rows.append(
                 TaskFile(
                     id=new_file_id(),
@@ -135,7 +154,9 @@ class TaskService:
         error = None
         if task.error_code:
             error = TaskErrorView(
-                code=task.error_code, message=task.error_message or "任务失败", details=task.error_details
+                code=task.error_code,
+                message=task.error_message or "任务失败",
+                details=task.error_details,
             )
         return TaskDetail(
             task_id=task.id,

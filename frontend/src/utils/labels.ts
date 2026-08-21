@@ -22,6 +22,7 @@ const labels: Record<string, string> = {
   RISK_FOUND: '发现风险',
   REVIEW_REQUIRED: '需要人工复核',
   RULE_BASED: '规则比对',
+  PARSER_ONLY: '真实解析',
   MOCK: '模拟执行',
   BASELINE: '基准文件',
   TARGET: '目标文件',
@@ -54,6 +55,9 @@ const labels: Record<string, string> = {
   'pdfplumber': 'PDF 解析器',
   'textin-document-parser': '外部文档解析器',
   'mock-parser': '模拟解析器',
+  UNKNOWN: '待自动识别',
+  DRAFT_REVIEW_PARSE_ONLY: '仅完成真实解析',
+  NOT_RUN: '尚未识别',
 }
 
 export function displayLabel(value: string | null | undefined): string {

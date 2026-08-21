@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     TEMP_ROOT: str = "/tmp/contract-review"
     MAX_FILE_SIZE_MB: float = Field(default=200, gt=0)
-    MAX_REFERENCE_FILES: int = Field(default=10, ge=1, le=100)
+    MAX_REFERENCE_FILES: int = Field(default=20, ge=1, le=100)
     DOWNLOAD_TIMEOUT_SECONDS: float = 120.0
     DOWNLOAD_MAX_REDIRECTS: int = 3
     PDF_MIN_TEXT_CHARS_PER_PAGE: int = Field(default=20, ge=1)

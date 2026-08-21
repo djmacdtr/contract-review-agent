@@ -22,8 +22,19 @@ class DocumentParsingRouter:
 
     def _require_external(self) -> ExternalDocumentParser:
         if self.external is None:
-            raise WorkflowError("OCR_NOT_CONFIGURED", "正式 PDF 比对需要外部文档解析服务")
+            raise WorkflowError("OCR_NOT_CONFIGURED", "正式 PDF 解析需要外部文档解析服务")
         return self.external
+
+    async def parse_draft_review(self, files: list[LocalFile]) -> list[ParsedDocument]:
+        parsed: list[ParsedDocument] = []
+        for file in files:
+            if file.detected_mime_type == DOCX_MIME:
+                parsed.append(await self.local.parse(file))
+            elif file.detected_mime_type == PDF_MIME:
+                parsed.append(await self._require_external().parse(file, mode="auto"))
+            else:
+                raise WorkflowError("UNSUPPORTED_FILE_TYPE", "起草检查仅支持 DOCX 或 PDF")
+        return parsed
 
     async def parse_final_compare(self, files: list[LocalFile]) -> list[ParsedDocument]:
         if len(files) != 2:

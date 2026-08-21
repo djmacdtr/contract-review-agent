@@ -1,13 +1,19 @@
 import httpx
 import pytest
+from sqlalchemy import select
 
+from app.core.config import get_settings
+from app.db.models import TaskFile
+from app.db.session import SessionFactory
 from app.main import app
 from tests.integration.helpers import DRAFT_PAYLOAD, FINAL_PAYLOAD
 
 
 @pytest.fixture
 async def client():
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as value:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as value:
         yield value
 
 
@@ -18,7 +24,9 @@ async def client():
         ("/api/v1/final-comparisons", FINAL_PAYLOAD, "FINAL_COMPARE"),
     ],
 )
-async def test_create_task_returns_202_and_queryable_detail(client, path, payload, expected_type) -> None:
+async def test_create_task_returns_202_and_queryable_detail(
+    client, path, payload, expected_type
+) -> None:
     response = await client.post(path, json=payload)
     assert response.status_code == 202, response.text
     body = response.json()
@@ -76,3 +84,47 @@ async def test_openapi_contains_required_endpoints_and_descriptions(client) -> N
     ):
         assert path in paths
 
+
+async def test_draft_legacy_reference_type_is_accepted_but_ignored(client) -> None:
+    payload = {
+        **DRAFT_PAYLOAD,
+        "reference_files": [
+            {**DRAFT_PAYLOAD["reference_files"][0], "reference_type": "REVIEW_OPINION"}
+        ],
+    }
+    response = await client.post("/api/v1/draft-reviews", json=payload)
+    assert response.status_code == 202
+    task_id = response.json()["data"]["task_id"]
+
+    async with SessionFactory() as session:
+        files = (
+            await session.execute(select(TaskFile).where(TaskFile.task_id == task_id))
+        ).scalars().all()
+    reference = next(item for item in files if item.role.value == "REFERENCE")
+    assert reference.reference_type is None
+
+
+async def test_draft_reference_limit_uses_runtime_configuration(client) -> None:
+    limited = get_settings().model_copy(update={"MAX_REFERENCE_FILES": 2})
+    app.dependency_overrides[get_settings] = lambda: limited
+    try:
+        payload = {
+            **DRAFT_PAYLOAD,
+            "reference_files": [DRAFT_PAYLOAD["reference_files"][0]] * 3,
+        }
+        response = await client.post("/api/v1/draft-reviews", json=payload)
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_REQUEST"
+    assert response.json()["error"]["details"] == {
+        "max_reference_files": 2,
+        "actual_reference_files": 3,
+    }
+
+
+async def test_draft_openapi_example_omits_reference_type(client) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    example = schema["components"]["schemas"]["DraftReviewCreate"]["example"]
+    assert "reference_type" not in example["reference_files"][0]
