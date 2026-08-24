@@ -44,6 +44,7 @@ class TemplateReviewDiagnostics(BaseModel):
     filtered_diff_count: int
     filtered_diff_items: list[FilteredTemplateDiff] = Field(default_factory=list)
     expanded_table_count: int = 0
+    expanded_table_indexes: list[int] = Field(default_factory=list)
     coalesced_fill_count: int = 0
 
 
@@ -263,7 +264,7 @@ def _table_cell_diff(
 
 def _compare_compatible_table_cells(
     template: ParsedDocument, target: ParsedDocument, start_index: int
-) -> tuple[list[DiffItem], int]:
+) -> tuple[list[DiffItem], list[int]]:
     template_shapes = _table_shapes(template)
     target_shapes = _table_shapes(target)
     compatible_indexes = {
@@ -286,12 +287,11 @@ def _compare_compatible_table_cells(
                 start_index + len(differences), template, target, before, after
             )
         )
-    expanded = sum(
-        1
-        for index, shape in template_shapes.items()
-        if index in target_shapes and target_shapes[index] != shape
+    expanded = sorted(
+        index
+        for index in set(template_shapes) | set(target_shapes)
+        if template_shapes.get(index) != target_shapes.get(index)
     )
-    expanded += len(set(template_shapes) ^ set(target_shapes))
     return differences, expanded
 
 
@@ -353,7 +353,7 @@ def analyze_template(
             ocr_low_confidence_threshold=ocr_low_confidence_threshold,
         ),
     )
-    table_differences, expanded_table_count = _compare_compatible_table_cells(
+    table_differences, expanded_table_indexes = _compare_compatible_table_cells(
         template, target, start_index=len(comparison.diff_items) + 1
     )
     raw_differences, coalesced_fill_count = _coalesce_positional_fills(
@@ -375,13 +375,13 @@ def analyze_template(
             _required_empty_table_rules(template, target, start_index=len(rule_checks) + 1)
         )
     warnings = list(comparison.warnings)
-    if expanded_table_count:
+    if expanded_table_indexes:
         warnings.append(
             ProcessingWarning(
                 code="TEMPLATE_TABLE_STRUCTURE_EXPANDED",
                 message="模板表格在目标合同中发生扩展，已跳过不可靠的逐单元格业务判断。",
                 requires_manual_review=True,
-                details={"count": expanded_table_count},
+                details={"count": len(expanded_table_indexes)},
             )
         )
     return TemplateReviewResult(
@@ -394,7 +394,8 @@ def analyze_template(
             retained_diff_count=len(retained),
             filtered_diff_count=len(filtered),
             filtered_diff_items=filtered,
-            expanded_table_count=expanded_table_count,
+            expanded_table_count=len(expanded_table_indexes),
+            expanded_table_indexes=expanded_table_indexes,
             coalesced_fill_count=coalesced_fill_count,
         ),
     )

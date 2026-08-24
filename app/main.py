@@ -32,8 +32,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同智能检查 Agent API",
-    description="FINAL_COMPARE 提供确定性文件版本比对；DRAFT_REVIEW 仍为 Mock。结果不构成合同审查或法律意见。",
-    version="0.2.0",
+    description=(
+        "FINAL_COMPARE 提供确定性文件版本比对；DRAFT_REVIEW 提供动态多文档起草检查。"
+        "结果不构成合同审查或法律意见。"
+    ),
+    version="0.2.2",
     default_response_class=ORJSONResponse,
     lifespan=lifespan,
 )

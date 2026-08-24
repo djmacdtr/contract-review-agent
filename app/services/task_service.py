@@ -207,7 +207,7 @@ class TaskService:
                     risk_count=row.risk_count,
                     review_count=row.review_count,
                     legacy_statistics=bool(
-                        row.result and row.result.schema_version != "2.0"
+                        row.result and row.result.schema_version not in {"2.0", "2.1"}
                     ),
                     created_at=row.created_at,
                     finished_at=row.finished_at,

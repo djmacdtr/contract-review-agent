@@ -1,8 +1,8 @@
 # 合同智能检查 Agent
 
-这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.4.2` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、可靠性保护和 OCR 人工复核；`DRAFT_REVIEW 0.3.1` 已支持真实多文档解析、模板固定内容比对、允许填写项过滤、未填占位符和基础表格必填检查。结果使用 Schema 2.0 的“风险 / 人工复核 / 通过”语义，不设置风险等级；事实矩阵和 LLM 尚未启用。
+这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.4.2` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、可靠性保护和 OCR 人工复核；`DRAFT_REVIEW 0.5.1 / rules 0.4.1` 已支持真实多文档解析、模板确定性检查、目标合同中心的跨资料事实映射、双模型共识和声明式数值校验。结果使用 Schema 2.1 的“风险 / 人工复核 / 通过”语义，不设置风险等级。
 
-> 所有结果都不构成合同审查、法律审核或放款意见。真实版本比对标记为 `RULE_BASED`；OCR 只负责文档结构解析，本版本不调用 LLM，也不检查印章。
+> 所有结果都不构成合同审查、法律审核或放款意见。FINAL_COMPARE 标记为 `RULE_BASED`；OCR 只负责文档结构解析，不检查印章。LLM 默认关闭，启用后仅用于 DRAFT_REVIEW 的可降级事实抽取，真实模型效果尚未完成验收。
 
 ## 入口
 
@@ -99,6 +99,10 @@ docker compose --profile fixtures stop fixture-server
 .\scripts\verify.ps1
 ```
 
+### 自动化与人工视觉验收边界
+
+Agent 不执行浏览器操作、截图或视觉验收。前端自动验证只包括 TypeScript/Vue typecheck、生产 build，以及必要的 API、路由和静态资源非视觉检查；HTTP 200 不代表页面视觉通过。页面布局、视觉效果和人工交互由用户手工确认，未执行视觉检查不再阻塞 Agent 的里程碑或 PR Ready，除非用户后续明确重新授权。历史进度记录中的浏览器待验收结论仅反映当时状态，不回写、不作为当前自动验收门。
+
 ## Alembic
 
 ```powershell
@@ -133,7 +137,7 @@ docker volume inspect contract-review-postgres-data
 
 复制 `.env.example` 为 `.env`。示例只包含开发默认值，LLM/OCR Key 为空，`.env` 已被 Git 忽略。
 
-- `LLM_ENABLED=false`，模型配置默认 `GLM-5.2`；当前工作流没有真实 LLM 调用路径。
+- `LLM_ENABLED=false`，模型配置默认 `GLM-5.2`；启用后 DRAFT_REVIEW 按文档分块抽取事实并校验证据，模型失败会安全降级为规则结果和人工复核。
 - `MOCK_STAGE_DELAY_SECONDS` 控制控制台可见的模拟阶段延时，测试中设为 `0`。
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
 - `ALLOW_HTTP_DOWNLOADS` 默认关闭；开发 fixture 需要显式开启，并将 `DOWNLOAD_HOST_ALLOWLIST` 精确设为 `fixture-server`。
@@ -142,7 +146,7 @@ docker volume inspect contract-review-postgres-data
 - DRAFT_REVIEW 的 `reference_type` 已弃用并被忽略；新请求只传 URL、文件名和可选 MIME/展示名，系统分类将在后续 LLM 阶段作为输出提供。
 - DRAFT_REVIEW 逐份真实解析：DOCX 使用 `python-docx`，PDF 使用外部解析器 `auto`；目标合同与模板正文使用可靠对齐，允许填写项保留过滤轨迹，扩展表格转为人工复核提示。结果标记为 `RULE_BASED / mock=false`，不会生成模拟或 LLM 结论。
 - `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
-- 新任务结果固定使用 `schema_version=2.0`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；OCR、解析和对齐不确定性进入 `review_items`；实际执行且通过的检查进入 `passed_checks`。旧 1.0 结果读取时转换为无等级统计并标记为 legacy。
+- 新任务结果固定使用 `schema_version=2.1`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；OCR、解析、对齐和模型共识不确定性进入 `review_items`；实际执行且通过的检查进入 `passed_checks`。旧 1.0/2.0 结果保持兼容读取。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
 - `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
 
@@ -196,4 +200,15 @@ docker compose logs worker
 
 已实现 FINAL_COMPARE 的受控下载、任务级一致解析计划、同步外部 PDF 解析，以及文字/数值/基础表格差异。DRAFT_REVIEW 已复用可靠正文对齐并增加模板填写区过滤、未填标记和保守的表格检查。对齐引擎会处理中文空格、软换行、零宽字符和已确认的解析器标记噪声，支持 1–4 对 1–4 条款合并/拆分、严格的 OCR 表格续行合并、表格兼容门控及页面文本 fallback；不可靠对齐不会直接生成业务风险。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。外部解析响应会校验业务码、有效页数、页面状态、段落和表格单元格完整性；不完整结果不会生成 `PASS`。
 
-尚未实现旧版 DOC、异步 OCR、真实 LLM、Embedding/Rerank、DRAFT_REVIEW 事实抽取/跨资料矩阵、复杂模板表格语义、合同数学规则、印章、上传、报告文件导出、鉴权和模板库。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
+尚未实现旧版 DOC、异步 OCR、Embedding/Rerank、复杂模板表格语义、印章、上传、报告文件导出、鉴权和模板库。真实 LLM 网关仍需能力探测和单文档人工验收；完整事实矩阵效果仍需更多真实样本评测和外部 OCR 恢复。现有黄金标注只是回归质量门，不定义生产支持的文档、字段或规则范围。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
+
+### 已确认的后续业务边界
+
+- `FINAL_COMPARE` 只比较打印前 DOCX 与盖章后扫描 PDF 是否属于同一内容版本，检查盖章前后是否被篡改；不承担跨资料计算、印章识别或真伪判断。
+- `DRAFT_REVIEW` 面对开放世界输入：辅助资料可能是任意数量、任意用途和此前从未见过的 DOCX/PDF。文档用途使用开放式 `document_kind`，常见类型和字段只能作为召回提示，不能成为封闭枚举或固定业务分支。
+- 通用数值一致性检查只属于 `DRAFT_REVIEW`。模板固定区、填写区、字段语义、跨资料对应关系和计算关系均从本次实际文档动态识别，不针对租金、设备数量、文件名、文件哈希、客户名称、合同正文或段落位置写死生产规则。
+- 系统应从目标合同动态提取所有可定位的金额、比例、利率、期限、期数、数量、日期等数值事实，再到全部辅助资料中查找语义对应项。其他文件提到同一事实且数值不一致时产生风险；一致时形成通过证据；未提到或无法可靠映射时只能形成缺失/人工复核状态，不能猜测值或误报冲突。
+- Schema 2.1 事实矩阵中的 `MISSING` 表示辅助资料未提及目标事实（`NOT_MENTIONED`），本身不产生风险；只有共识校验计划明确要求该来源必须出现时才进入人工复核。
+- 主模型负责抽取，独立评审模型核验证据、语义和公式。只有证据完整、双方一致且置信度不低于 `0.85` 的结论才可影响自动风险或通过；分歧、单模型、低置信度或外部失败进入人工复核。
+- 数值比较和计算由程序使用 `Decimal` 与白名单声明式 AST 执行，禁止执行模型生成代码。现有 29 个黄金候选只是当前脱敏样本在当前算法下产生的回归记录，不代表 29 种模板、资料类型、字段或检查大纲，也不构成生产合同特例。
+- 起草检查公开请求使用 `check_numeric_consistency=true` 执行动态数值一致性；`check_asset_schedule`、`check_rent_schedule` 已移除，旧客户端字段会按严格请求 Schema 拒绝。

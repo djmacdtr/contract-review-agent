@@ -134,14 +134,19 @@ class MockWorkflowExecutor:
                     "status": "CONFLICT",
                     "candidates": [
                         {
-                            "file_id": files[0]["file_id"],
+                            "field_key": "financing_amount",
+                            "display_name": "融资金额（模拟）",
+                            "value_type": "MONEY",
                             "raw_value": "5,000.00万元（模拟）",
+                            "normalized_hint": "50000000.00",
                             "normalized_value": "50000000.00",
-                            "unit": "CNY",
+                            "source_file_id": files[0]["file_id"],
+                            "evidence_text": "模拟事实，不代表合同正文",
                             "location": {"paragraph_index": 1},
                             "confidence": 0.0,
                         }
                     ],
+                    "missing_source_file_ids": [],
                 }
             ]
             rule_checks = [

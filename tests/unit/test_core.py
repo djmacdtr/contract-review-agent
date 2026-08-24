@@ -29,6 +29,17 @@ def test_llm_configuration_defaults() -> None:
     assert settings.LLM_ADVICE_MODEL == "GLM-5.2"
     assert settings.LLM_ENABLE_EMBEDDING is False
     assert settings.LLM_ENABLE_RERANK is False
+    assert settings.llm_configured is False
+
+
+def test_llm_configuration_requires_enablement_base_url_and_key() -> None:
+    settings = Settings(
+        _env_file=None,
+        LLM_ENABLED=True,
+        LLM_BASE_URL="https://llm.example.com/v1",
+        LLM_API_KEY="test-key",
+    )
+    assert settings.llm_configured is True
 
 
 def test_http_client_access_logs_are_suppressed() -> None:

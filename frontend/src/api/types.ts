@@ -56,7 +56,7 @@ export interface TemplateDiagnostics {
   expanded_table_count?: number; coalesced_fill_count?: number
 }
 export interface RuleCheck {
-  rule_id: string; rule_name: string; status: 'PASSED' | 'FAILED'
+  rule_id: string; rule_name: string; status: 'PASSED' | 'FAILED' | 'REVIEW_REQUIRED'
   location?: DocumentLocation & { file_id?: string }; inputs?: Record<string, unknown>
   expected?: string; actual?: string; message: string
 }
@@ -74,12 +74,26 @@ export interface ReviewItem {
   source_evidence: Record<string, unknown>[]; related_diff_ids: string[]; requires_manual_action: boolean
 }
 export interface PassedCheck { check_id: string; module_code: string; title: string; description: string }
+export interface FactMatrixCandidate {
+  field_key: string; display_name: string; value_type: string; raw_value: string; normalized_hint?: string
+  normalized_value: string; source_file_id: string; evidence_text: string; location: DocumentLocation; confidence: number
+}
+export interface FactReferenceResult {
+  source_file_id: string; status: 'CONSISTENT' | 'CONFLICT' | 'MISSING' | 'UNCERTAIN'
+  candidate?: FactMatrixCandidate; reason_code: string; requires_manual_review: boolean
+}
+export interface FactMatrixItem {
+  target_fact_id?: string
+  field_key: string; display_name: string; status: 'CONSISTENT' | 'CONFLICT' | 'MISSING' | 'UNCERTAIN'
+  target_candidate?: FactMatrixCandidate; candidates: FactMatrixCandidate[]
+  reference_results?: FactReferenceResult[]; missing_source_file_ids: string[]
+}
 export interface TaskResult {
   schema_version: string; task_id: string; task_type: TaskType; conclusion: string; mock: boolean
   summary: { title: string; description: string; statistics: ResultStatistics }
   files: ResultFile[]; risk_items: RiskItem[]; review_items: ReviewItem[]; passed_checks: PassedCheck[]; diff_items: DiffItem[]
-  fact_matrix: Record<string, unknown>[]; rule_checks: RuleCheck[]
+  fact_matrix: FactMatrixItem[]; rule_checks: RuleCheck[]
   warnings: { code: string; message: string; requires_manual_review?: boolean; page?: number; confidence?: number; details?: Record<string, unknown> }[]
   advice: Record<string, unknown>
-  metadata: { execution_mode: 'MOCK' | 'PARSER_ONLY' | 'RULE_BASED'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics; template_diagnostics?: TemplateDiagnostics }
+  metadata: { execution_mode: 'MOCK' | 'PARSER_ONLY' | 'RULE_BASED' | 'HYBRID'; workflow_version: string; rules_version: string; primary_model: string | null; model_runs: Record<string, unknown>[]; reviewed_files?: string[]; semantic_concepts?: Record<string, unknown>[]; validation_specs?: Record<string, unknown>[]; comparison_diagnostics?: ComparisonDiagnostics; template_diagnostics?: TemplateDiagnostics }
 }

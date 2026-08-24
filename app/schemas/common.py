@@ -25,4 +25,4 @@ class ReadyData(BaseModel):
     status: str = Field(description="就绪状态", examples=["ready"])
     database: str = Field(description="数据库状态", examples=["ok"])
     ocr_configured: bool = Field(description="是否配置 OCR；不影响 API 就绪")
-    llm_configured: bool = Field(description="是否启用 LLM；本阶段不会真实调用")
+    llm_configured: bool = Field(description="LLM 是否启用且连接参数完整")

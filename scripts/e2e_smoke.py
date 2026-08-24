@@ -74,10 +74,11 @@ def main() -> None:
                 result = client.get(f"/api/v1/tasks/{task_id}/result")
                 result.raise_for_status()
                 result_data = result.json()["data"]
-                assert result_data["schema_version"] == "2.0"
+                assert result_data["schema_version"] == "2.1"
                 assert result_data["mock"] is False
                 assert result_data["metadata"]["execution_mode"] == "RULE_BASED"
-                assert result_data["metadata"]["workflow_version"] == "0.3.1"
+                assert result_data["metadata"]["workflow_version"] == "0.5.1"
+                assert result_data["metadata"]["rules_version"] == "0.4.1"
                 assert result_data["conclusion"] == "PASS"
                 assert result_data["summary"]["statistics"]["risk_count"] == 0
                 assert len(result_data["files"]) == 3

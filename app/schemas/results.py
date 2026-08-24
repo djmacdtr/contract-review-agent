@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.comparison.models import DiffItem
 from app.core.enums import Conclusion, TaskType
 
-RESULT_SCHEMA_VERSION = "2.0"
+RESULT_SCHEMA_VERSION = "2.1"
 
 
 class ResultStatistics(BaseModel):
@@ -95,12 +95,46 @@ class PassedCheck(BaseModel):
     description: str
 
 
+class FactMatrixCandidate(BaseModel):
+    field_key: str
+    display_name: str
+    value_type: str
+    raw_value: str
+    normalized_hint: str | None = None
+    normalized_value: str
+    source_file_id: str
+    evidence_text: str
+    location: dict[str, Any]
+    confidence: float = Field(ge=0, le=1)
+
+
+class FactReferenceResult(BaseModel):
+    source_file_id: str
+    status: Literal["CONSISTENT", "CONFLICT", "MISSING", "UNCERTAIN"]
+    candidate: FactMatrixCandidate | None = None
+    reason_code: str
+    requires_manual_review: bool = False
+
+
+class FactMatrixItem(BaseModel):
+    target_fact_id: str | None = None
+    field_key: str
+    display_name: str
+    status: Literal["CONSISTENT", "CONFLICT", "MISSING", "UNCERTAIN"] = Field(
+        description="MISSING 表示辅助资料未提及目标事实（NOT_MENTIONED），不是冲突"
+    )
+    target_candidate: FactMatrixCandidate | None = None
+    candidates: list[FactMatrixCandidate] = Field(default_factory=list)
+    reference_results: list[FactReferenceResult] = Field(default_factory=list)
+    missing_source_file_ids: list[str] = Field(default_factory=list)
+
+
 class RuleCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     rule_id: str
     rule_name: str
-    status: Literal["PASSED", "FAILED"]
+    status: Literal["PASSED", "FAILED", "REVIEW_REQUIRED"]
     location: dict[str, Any] | None = None
     inputs: dict[str, Any] = Field(default_factory=dict)
     expected: str | None = None
@@ -111,7 +145,7 @@ class RuleCheck(BaseModel):
 class TaskResultData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    schema_version: str = Field(examples=["2.0"])
+    schema_version: str = Field(examples=["2.1"])
     task_id: str
     task_type: TaskType
     conclusion: Conclusion
@@ -121,7 +155,7 @@ class TaskResultData(BaseModel):
     review_items: list[ReviewItem] = Field(default_factory=list)
     passed_checks: list[PassedCheck] = Field(default_factory=list)
     diff_items: list[DiffItem]
-    fact_matrix: list[dict[str, Any]]
+    fact_matrix: list[FactMatrixItem]
     rule_checks: list[RuleCheck]
     warnings: list[dict[str, Any]]
     advice: dict[str, Any]
@@ -131,7 +165,7 @@ class TaskResultData(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def convert_legacy_risk_items(cls, value: Any) -> Any:
-        if not isinstance(value, dict) or value.get("schema_version") == "2.0":
+        if not isinstance(value, dict) or value.get("schema_version") in {"2.0", "2.1"}:
             return value
         converted = dict(value)
         legacy_items = []

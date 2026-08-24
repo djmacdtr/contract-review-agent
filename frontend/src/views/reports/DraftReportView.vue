@@ -32,6 +32,7 @@
       <CheckModule v-if="result.rule_checks.length" title="基础必填规则" eyebrow="RULE_CHECKS" :count="result.rule_checks.length">
         <article v-for="item in result.rule_checks" :key="item.rule_id" class="rule-result"><div><strong>{{ item.rule_name }}</strong><el-tag :type="item.status === 'PASSED' ? 'success' : 'danger'">{{ displayLabel(item.status) }}</el-tag></div><p>{{ item.message }}</p><small>期望：{{ item.expected || '—' }} · 实际：{{ item.actual || '—' }}</small></article>
       </CheckModule>
+      <CheckModule v-if="result.fact_matrix.length" title="跨资料事实矩阵" eyebrow="FACT_CONSISTENCY" :count="result.fact_matrix.length"><FactMatrix :items="result.fact_matrix" /></CheckModule>
       <CheckModule v-for="group in reviewGroups" :key="group.code" :title="group.title" :eyebrow="group.code" :count="group.items.length"><ReviewItemCard v-for="item in group.items" :key="item.review_id" :item="item" :evidence="relatedDiffs(item.related_diff_ids)" left-label="合同模板" /></CheckModule>
       <CheckModule v-for="group in passedGroups" :key="group.code" :title="group.title" :eyebrow="group.code" :count="group.items.length"><PassedCheckList :items="group.items" /></CheckModule>
       <CapabilityLimitations :items="limitations" />
@@ -47,6 +48,7 @@ import CheckModule from '../../components/report/CheckModule.vue'
 import ConclusionBanner from '../../components/report/ConclusionBanner.vue'
 import DiffEvidence from '../../components/report/DiffEvidence.vue'
 import FileSummary from '../../components/report/FileSummary.vue'
+import FactMatrix from '../../components/report/FactMatrix.vue'
 import PassedCheckList from '../../components/report/PassedCheckList.vue'
 import ReportHeader from '../../components/report/ReportHeader.vue'
 import ResultStatistics from '../../components/report/ResultStatistics.vue'
@@ -56,7 +58,7 @@ import { useTaskReport } from '../../composables/useTaskReport'
 import { displayLabel } from '../../utils/labels'
 
 const { taskId, detail, result, error, retrying, retryTask, reload } = useTaskReport('DRAFT_REVIEW')
-const moduleOrder = ['TEMPLATE_INTEGRITY', 'TEMPLATE_COMPLETENESS', 'TEMPLATE_RELIABILITY']
+const moduleOrder = ['TEMPLATE_INTEGRITY', 'TEMPLATE_COMPLETENESS', 'FACT_CONSISTENCY', 'TEMPLATE_RELIABILITY']
 const riskGroups = computed(() => group(result.value?.risk_items ?? [], '风险'))
 const reviewGroups = computed(() => group(result.value?.review_items ?? [], '人工复核'))
 const passedGroups = computed(() => group(result.value?.passed_checks ?? [], '校验通过'))

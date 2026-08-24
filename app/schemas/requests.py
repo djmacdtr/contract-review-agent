@@ -9,8 +9,7 @@ class DraftReviewOptions(BaseModel):
     ignore_formatting: bool = Field(default=True, description="忽略纯格式差异")
     ignore_headers_footers: bool = Field(default=True, description="忽略页眉页脚")
     check_blank_fields: bool = Field(default=True, description="检查疑似未填写字段")
-    check_asset_schedule: bool = Field(default=True, description="检查租赁物附表")
-    check_rent_schedule: bool = Field(default=True, description="检查租金计划")
+    check_numeric_consistency: bool = Field(default=True, description="检查动态数值一致性")
 
 
 class DraftReviewCreate(BaseModel):

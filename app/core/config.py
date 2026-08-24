@@ -45,18 +45,22 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = ""
     LLM_API_KEY: str = ""
     LLM_EXTRACTION_MODEL: str = "GLM-5.2"
+    LLM_REVIEW_MODEL: str = "GLM-5.2-reviewer"
     LLM_ADVICE_MODEL: str = "GLM-5.2"
     LLM_EMBEDDING_MODEL: str = "embedding"
     LLM_RERANK_MODEL: str = "rerank"
     LLM_TIMEOUT_SECONDS: float = 300.0
     LLM_MAX_CONCURRENCY: int = 1
     LLM_MAX_OUTPUT_TOKENS: int = 4096
+    LLM_CHUNK_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
     LLM_STRUCTURE_RETRY_ATTEMPTS: int = 2
+    LLM_CONSENSUS_MIN_CONFIDENCE: float = Field(default=0.85, ge=0, le=1)
+    LLM_REQUIRE_INDEPENDENT_MODEL: bool = True
     LLM_NATIVE_STRUCTURED_OUTPUT: bool = False
     LLM_ENABLE_EMBEDDING: bool = False
     LLM_ENABLE_RERANK: bool = False
 
-    RESULT_SCHEMA_VERSION: str = "2.0"
+    RESULT_SCHEMA_VERSION: str = "2.1"
     WORKFLOW_VERSION: str = "0.1.0"
     RULES_VERSION: str = "0.1.0"
 
@@ -64,6 +68,12 @@ class Settings(BaseSettings):
     def ocr_configured(self) -> bool:
         return self.OCR_ENABLED and all(
             value.strip() for value in (self.OCR_BASE_URL, self.OCR_API_KEY, self.OCR_AUTH_HEADER)
+        )
+
+    @property
+    def llm_configured(self) -> bool:
+        return self.LLM_ENABLED and all(
+            value.strip() for value in (self.LLM_BASE_URL, self.LLM_API_KEY)
         )
 
 

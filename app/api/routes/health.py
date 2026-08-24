@@ -40,6 +40,6 @@ async def ready(
             status="ready",
             database="ok",
             ocr_configured=settings.ocr_configured,
-            llm_configured=settings.LLM_ENABLED,
+            llm_configured=settings.llm_configured,
         ),
     )

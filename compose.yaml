@@ -13,6 +13,7 @@ x-app: &app
     MAX_REFERENCE_FILES: ${MAX_REFERENCE_FILES:-20}
     PDF_MIN_TEXT_CHARS_PER_PAGE: ${PDF_MIN_TEXT_CHARS_PER_PAGE:-20}
     OCR_ENABLED: ${OCR_ENABLED:-false}
+    LLM_ENABLED: ${LLM_ENABLED:-false}
     OCR_BASE_URL: ${OCR_BASE_URL:-}
     OCR_AUTH_HEADER: ${OCR_AUTH_HEADER:-}
   depends_on:
@@ -78,6 +79,8 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-contract}:${POSTGRES_PASSWORD:-contract}@postgres:5432/contract_review_test
       TEST_ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-contract}:${POSTGRES_PASSWORD:-contract}@postgres:5432/${POSTGRES_DB:-contract_review}
       MOCK_STAGE_DELAY_SECONDS: "0"
+      LLM_ENABLED: "false"
+      OCR_ENABLED: "false"
     depends_on:
       postgres:
         condition: service_healthy
