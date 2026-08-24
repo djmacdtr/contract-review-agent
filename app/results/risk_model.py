@@ -36,8 +36,6 @@ def build_risk_items(
 ) -> list[dict[str, Any]]:
     risks: list[dict[str, Any]] = []
     for diff in differences:
-        if is_ocr_review_only_diff(diff):
-            continue
         risk_type = (
             "DELETION_OR_MISSING"
             if diff.diff_type in DELETION_CHANGE_TYPES

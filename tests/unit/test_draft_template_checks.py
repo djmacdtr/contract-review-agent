@@ -1,4 +1,8 @@
+import pytest
+
 from app.comparison.models import DiffItem, DiffSide
+from app.core.config import Settings
+from app.core.errors import WorkflowError
 from app.documents.models import (
     DocumentBlock,
     DocumentLocation,
@@ -8,6 +12,7 @@ from app.documents.models import (
     TableRow,
 )
 from app.draft_review.template_checks import _coalesce_positional_fills, analyze_template
+from app.workflows.draft_review import DraftReviewWorkflowExecutor
 
 
 def paragraph_document(file_id: str, role: str, *texts: str) -> ParsedDocument:
@@ -220,6 +225,15 @@ def test_expanded_template_table_does_not_make_paragraph_alignment_unreliable() 
     assert [warning.code for warning in result.warnings] == [
         "TEMPLATE_TABLE_STRUCTURE_EXPANDED"
     ]
+    executor = DraftReviewWorkflowExecutor(Settings(_env_file=None))
+    with pytest.raises(WorkflowError, match="扩展表格"):
+        executor._build_result(
+            "tsk_expanded_table",
+            [],
+            [template, target],
+            result,
+            {},
+        )
 
 
 def test_positional_added_deleted_placeholder_pair_is_coalesced() -> None:

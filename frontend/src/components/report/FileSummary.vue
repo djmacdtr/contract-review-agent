@@ -1,8 +1,8 @@
 <template>
   <div class="files">
     <article v-for="file in files" :key="file.file_id">
-      <div class="file-title"><span>{{ displayLabel(file.role) }}</span><el-tag size="small" effect="plain">{{ displayLabel(file.parse_status) }}</el-tag></div><strong>{{ file.file_name }}</strong>
-      <small>{{ displayLabel(file.parser_name) }} · {{ displayLabel(file.parse_status) }}<template v-if="file.page_count"> · {{ file.page_count }} 页</template></small>
+      <div class="file-title"><span>{{ displayLabel(file.role) }}</span></div><strong>{{ file.file_name }}</strong>
+      <small v-if="file.page_count">共 {{ file.page_count }} 页</small>
     </article>
   </div>
 </template>

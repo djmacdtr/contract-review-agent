@@ -67,7 +67,7 @@ export interface ResultStatistics {
 export interface RiskItem {
   risk_id: string; module_code: string; risk_type: 'DELETION_OR_MISSING' | 'ADDITION_OR_CHANGE'
   change_type: string; title: string; description: string; source_evidence: Record<string, unknown>[]
-  related_diff_ids: string[]; related_rule_ids: string[]; requires_manual_action: boolean
+  related_diff_ids: string[]; related_rule_ids: string[]; requires_manual_action: boolean; analysis_advice?: string
 }
 export interface ReviewItem {
   review_id: string; module_code: string; reason_code: string; title: string; description: string

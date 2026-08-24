@@ -109,7 +109,7 @@ class MockWorkflowExecutor:
         shared_warning = {
             "code": "MOCK_RESULT",
             "message": "这是工程闭环模拟结果，未下载、解析或审查任何真实合同。",
-            "requires_manual_review": True,
+            "requires_manual_review": False,
         }
         if task_type == TaskType.DRAFT_REVIEW:
             risk_items = [
@@ -124,6 +124,7 @@ class MockWorkflowExecutor:
                     "related_diff_ids": [],
                     "related_rule_ids": [],
                     "requires_manual_action": True,
+                    "analysis_advice": "请核对模拟融资金额风险对应的目标合同与辅助资料来源。",
                 }
             ]
             diff_items: list[dict[str, Any]] = []
@@ -208,27 +209,17 @@ class MockWorkflowExecutor:
                     "related_diff_ids": [f"diff_{task_id[-8:]}"],
                     "related_rule_ids": [],
                     "requires_manual_action": True,
+                    "analysis_advice": "请核对模拟期限由 24 个月变为 36 个月的业务依据。",
                 }
             ]
             title = "模拟放款比对结果"
 
-        review_items = [
-            {
-                "review_id": f"review_mock_{task_id[-8:]}",
-                "module_code": "CAPABILITY_LIMITATION",
-                "reason_code": "MOCK_RESULT",
-                "title": "模拟结果需要人工确认",
-                "description": "未执行真实下载、解析或合同检查。",
-                "source_evidence": [],
-                "related_diff_ids": [],
-                "requires_manual_action": True,
-            }
-        ]
+        review_items: list[dict[str, Any]] = []
         return {
             "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": task_type.value,
-            "conclusion": "RISK_FOUND",
+            "conclusion": "RISK_FOUND" if risk_items else "PASS",
             "summary": {
                 "title": title,
                 "description": "模拟结果仅用于验证任务、API 和控制台闭环，不构成合同审查意见。",
@@ -236,7 +227,7 @@ class MockWorkflowExecutor:
                     "risk_count": len(risk_items),
                     "deletion_or_missing_count": 0,
                     "addition_or_change_count": len(risk_items),
-                    "review_count": len(review_items),
+                    "review_count": 0,
                     "passed_check_count": 0,
                     "legacy_statistics": False,
                 },

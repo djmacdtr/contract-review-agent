@@ -8,6 +8,7 @@ from app.adapters.llm.base import LlmResult
 from app.adapters.llm.openai_client import LlmClientError
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
+from app.core.errors import WorkflowError
 from app.schemas.results import TaskResultData
 from app.services.downloader import SafeFileDownloadService
 from app.workflows.draft_review import DraftReviewWorkflowExecutor
@@ -86,6 +87,7 @@ class ConsensusFixtureLlm:
         self.include_numeric_rule = include_numeric_rule
         self.review_rule_mismatch = review_rule_mismatch
         self.invalid_advice_evidence = invalid_advice_evidence
+        self.advice_calls = 0
 
     async def probe_models(self) -> list[str]:
         return [self.extraction_model, self.review_model]
@@ -227,16 +229,29 @@ class ConsensusFixtureLlm:
         )
 
     async def generate_advice(self, payload: dict) -> LlmResult:
-        refs = list(payload.get("evidence_refs", []))
+        self.advice_calls += 1
+        risk_advices = [
+            {
+                "risk_id": risk["risk_id"],
+                "analysis_advice": f"请结合当前文件位置核对{risk['title']}的业务依据。",
+            }
+            for risk in payload.get("risk_items", [])
+        ]
         if self.invalid_advice_evidence:
-            refs.append({"file_id": "fil_unknown", "location": {"paragraph_index": 99}})
+            risk_advices.append(
+                {
+                    "risk_id": "risk_unknown",
+                    "analysis_advice": "这条建议不属于当前任务。",
+                }
+            )
         return LlmResult(
             value={
                 "overall_advice": "请复核已有证据。",
                 "priority_actions": [],
                 "manual_review_focus": [],
                 "limitations": [],
-                "evidence_refs": refs,
+                "evidence_refs": [],
+                "risk_advices": risk_advices,
             },
             configured_model=self.extraction_model,
             actual_model=self.extraction_model,
@@ -386,8 +401,8 @@ async def test_draft_review_downloads_and_parses_every_file_without_mocking(
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["schema_version"] == "2.1"
-    assert result["metadata"]["workflow_version"] == "0.5.1"
-    assert result["metadata"]["rules_version"] == "0.4.1"
+    assert result["metadata"]["workflow_version"] == "0.6.0"
+    assert result["metadata"]["rules_version"] == "0.5.0"
     assert result["metadata"]["primary_model"] is None
     assert result["conclusion"] == "PASS"
     assert result["diff_items"] == []
@@ -491,33 +506,25 @@ async def test_draft_review_uses_evidenced_llm_results_without_losing_rule_resul
 async def test_consensus_gate_never_auto_accepts_unsafe_fact_result(
     tmp_path: Path, kwargs: dict
 ) -> None:
-    result = await run_consensus_fixture(tmp_path, ConsensusFixtureLlm(**kwargs))
-
-    fact_reviews = [
-        item for item in result["review_items"] if item["module_code"] == "FACT_CONSISTENCY"
-    ]
-    assert fact_reviews
-    assert not any(item["module_code"] == "FACT_CONSISTENCY" for item in result["risk_items"])
-    assert not any(item["module_code"] == "FACT_CONSISTENCY" for item in result["passed_checks"])
-    assert result["conclusion"] == "REVIEW_REQUIRED"
+    with pytest.raises(WorkflowError, match="动态事实检查"):
+        await run_consensus_fixture(tmp_path, ConsensusFixtureLlm(**kwargs))
 
 
-async def test_invalid_advice_evidence_is_filtered_and_requires_review(tmp_path: Path) -> None:
+async def test_invalid_advice_risk_id_falls_back_without_changing_result(
+    tmp_path: Path,
+) -> None:
+    llm = ConsensusFixtureLlm(invalid_advice_evidence=True)
     result = await run_consensus_fixture(
         tmp_path,
-        ConsensusFixtureLlm(invalid_advice_evidence=True),
+        llm,
     )
 
-    assert result["advice"]["evidence_refs"] == []
-    assert "部分建议证据引用未能回查，已移除。" in result["advice"]["limitations"]
+    assert llm.advice_calls == 1
+    assert result["conclusion"] == "PASS"
+    assert result["review_items"] == []
+    assert result["summary"]["statistics"]["review_count"] == 0
     assert any(
-        item["reason_code"] == "LLM_ADVICE_EVIDENCE_UNVERIFIED"
-        for item in result["review_items"]
-    )
-    assert result["conclusion"] == "REVIEW_REQUIRED"
-    assert result["summary"]["statistics"]["review_count"] == len(result["review_items"])
-    assert any(
-        warning["code"] == "LLM_ADVICE_EVIDENCE_REVIEW_REQUIRED"
+        warning["code"] == "LLM_ADVICE_UNAVAILABLE"
         for warning in result["warnings"]
     )
 
@@ -546,14 +553,8 @@ async def test_numeric_consistency_false_skips_dynamic_rules(tmp_path: Path) -> 
 async def test_numeric_rule_requires_exact_primary_and_reviewer_consensus(
     tmp_path: Path,
 ) -> None:
-    result = await run_consensus_fixture(
-        tmp_path,
-        ConsensusFixtureLlm(include_numeric_rule=True, review_rule_mismatch=True),
-    )
-    assert any(
-        item["reason_code"] == "NUMERIC_RULE_UNCERTAIN"
-        for item in result["review_items"]
-    ), [item["reason_code"] for item in result["review_items"]]
-    assert not any(
-        item.get("module_code") == "NUMERIC_CONSISTENCY" for item in result["risk_items"]
-    )
+    with pytest.raises(WorkflowError, match="动态数值检查"):
+        await run_consensus_fixture(
+            tmp_path,
+            ConsensusFixtureLlm(include_numeric_rule=True, review_rule_mismatch=True),
+        )

@@ -636,19 +636,21 @@ def fact_matrix_result_items(
                 }
             )
         if required_missing_relations:
-            reviews.append(
+            risks.append(
                 {
-                    "review_id": f"review_fact_missing_{item_suffix}",
+                    "risk_id": f"risk_fact_missing_{item_suffix}",
                     "module_code": "FACT_CONSISTENCY",
-                    "reason_code": "FACT_MISSING",
+                    "risk_type": "DELETION_OR_MISSING",
+                    "change_type": "REQUIRED_SOURCE_MISSING",
                     "title": f"{item['display_name']}在要求的资料中未提及",
-                    "description": "共识校验计划要求该来源包含此事实，但未找到可靠对应项。",
+                    "description": "经可靠校验计划确认，该来源应包含此事实，但未找到对应内容。",
                     "source_evidence": [target_evidence],
                     "related_diff_ids": [],
+                    "related_rule_ids": [],
                     "requires_manual_action": True,
                 }
             )
-        if item["status"] == "CONSISTENT":
+        if item["status"] == "CONSISTENT" and not required_missing_relations:
             passed.append(
                 {
                     "check_id": f"check_fact_{item_suffix}",

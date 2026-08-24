@@ -180,9 +180,15 @@ class AdviceEvidence(StrictLlmSchema):
     location: DocumentLocation
 
 
+class RiskAdvice(StrictLlmSchema):
+    risk_id: str = Field(min_length=1, max_length=160)
+    analysis_advice: str = Field(min_length=1, max_length=2000)
+
+
 class AdviceResponse(StrictLlmSchema):
     overall_advice: str = Field(min_length=1, max_length=4000)
     priority_actions: list[str] = Field(default_factory=list, max_length=20)
     manual_review_focus: list[str] = Field(default_factory=list, max_length=20)
     limitations: list[str] = Field(default_factory=list, max_length=20)
     evidence_refs: list[AdviceEvidence] = Field(default_factory=list, max_length=50)
+    risk_advices: list[RiskAdvice] = Field(max_length=500)

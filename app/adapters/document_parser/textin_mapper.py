@@ -211,12 +211,15 @@ def map_textin_document(
         )
     if not blocks:
         raise WorkflowError("OCR_PARSE_FAILED", "OCR 未提取到可比较内容")
+    parsed_pages = {block.location.page for block in blocks if block.location.page is not None}
+    if len(parsed_pages) < total:
+        raise WorkflowError("OCR_PARTIAL_FAILURE", "OCR 未形成完整的逐页可比较内容")
     confidence_values = list(page_confidence.values())
     table_count = sum(block.table is not None for block in blocks)
     cell_count = sum(
         len(row.cells) for block in blocks if block.table is not None for row in block.table.rows
     )
-    detail_page_count = len({block.location.page for block in blocks if block.location.page})
+    detail_page_count = len(parsed_pages)
     bbox_block_count = sum(block.location.bbox is not None for block in blocks)
     bbox_cell_count = sum(
         cell.location.bbox is not None

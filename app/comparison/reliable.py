@@ -37,6 +37,7 @@ CLAUSE_SPLIT_PATTERN = re.compile(
 )
 INTER_CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
+MARKDOWN_EMPHASIS = re.compile(r"\*{2,}")
 LATEX_ROMAN = re.compile(r"\\mathrm\s*\{([^{}]*)\}")
 IGNORABLE_PUNCTUATION = str.maketrans("", "", "，,。；;：:“”\"‘’'（）()【】[]、 *|~")
 TABLE_CONTINUATION_HEADERS = (
@@ -132,12 +133,22 @@ class ComparableTableRow:
     source_rows: tuple[int, ...]
 
 
-def comparison_normalize(text: str) -> tuple[str, str]:
+def comparison_display_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
     normalized = normalized.replace("\u200b", "").replace("\u00ad", "")
-    normalized = HTML_BREAK.sub(" ", normalized)
+    normalized = HTML_BREAK.sub("\n", normalized)
     normalized = LATEX_ROMAN.sub(r"\1", normalized)
     normalized = normalized.replace("\\sim", "~").replace("$", "")
+    normalized = MARKDOWN_EMPHASIS.sub("", normalized)
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"[\t\f\v ]+", " ", normalized)
+    normalized = re.sub(r" *\n *", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def comparison_normalize(text: str) -> tuple[str, str]:
+    normalized = comparison_display_text(text)
     normalized = INTER_CJK_SPACE.sub("", normalized)
     normalized = " ".join(normalized.split())
     normalized = normalized.replace("：", ":").replace("，", ",")
@@ -556,27 +567,46 @@ def _page_flat(document: ComparableDocument) -> ComparableDocument | None:
     return ComparableDocument(source=document.source, units=tuple(units))
 
 
-def _segments(before: str, after: str) -> list[DiffSegment]:
-    segments = []
-    for operation, i1, i2, j1, j2 in SequenceMatcher(None, before, after).get_opcodes():
+def build_diff_segments(
+    before: str, after: str
+) -> tuple[list[DiffSegment], str, str]:
+    clean_before = comparison_display_text(before)
+    clean_after = comparison_display_text(after)
+    segments: list[DiffSegment] = []
+    for operation, i1, i2, j1, j2 in SequenceMatcher(
+        None, clean_before, clean_after
+    ).get_opcodes():
+        left = clean_before[i1:i2]
+        right = clean_after[j1:j2]
+        if operation != "equal" and not left.strip() and not right.strip():
+            canonical = "\n" if "\n" in left or "\n" in right else " "
+            if canonical:
+                segments.append(DiffSegment(operation="EQUAL", text=canonical))
+            continue
         if operation in {"equal", "delete", "replace"} and i1 != i2:
             segments.append(
                 DiffSegment(
-                    operation="EQUAL" if operation == "equal" else "DELETE", text=before[i1:i2]
+                    operation="EQUAL" if operation == "equal" else "DELETE", text=left
                 )
             )
         if operation in {"insert", "replace"} and j1 != j2:
-            segments.append(DiffSegment(operation="INSERT", text=after[j1:j2]))
-    return segments
+            segments.append(DiffSegment(operation="INSERT", text=right))
+    baseline_text = "".join(
+        item.text for item in segments if item.operation != "INSERT"
+    )
+    target_text = "".join(item.text for item in segments if item.operation != "DELETE")
+    return segments, baseline_text, target_text
 
 
-def _side(document: ParsedDocument, units: tuple[ComparableUnit, ...]) -> DiffSide:
+def _side(
+    document: ParsedDocument, units: tuple[ComparableUnit, ...], *, text: str | None = None
+) -> DiffSide:
     locations = [location for unit in units for location in unit.locations]
     return DiffSide(
         file_id=document.file_id,
         location=locations[0],
         locations=locations,
-        text=_join_raw(units),
+        text=text if text is not None else comparison_display_text(_join_raw(units)),
     )
 
 
@@ -590,7 +620,13 @@ def _make_diff(
     similarity: float,
     options: CompareOptionsLike,
 ) -> DiffItem:
-    before, after = _join_raw(left), _join_raw(right)
+    before_raw, after_raw = _join_raw(left), _join_raw(right)
+    if left and right:
+        segments, before, after = build_diff_segments(before_raw, after_raw)
+    else:
+        segments = []
+        before = comparison_display_text(before_raw)
+        after = comparison_display_text(after_raw)
     labels = {
         "ADDED": "目标文件新增内容",
         "DELETED": "目标文件缺少内容",
@@ -646,9 +682,9 @@ def _make_diff(
         diff_id=f"diff_{index:06d}",
         diff_type=diff_type,
         title=labels[diff_type],
-        baseline=_side(baseline, left) if left else None,
-        target=_side(target, right) if right else None,
-        segments=_segments(before, after) if left and right else [],
+        baseline=_side(baseline, left, text=before) if left else None,
+        target=_side(target, right, text=after) if right else None,
+        segments=segments,
         confidence=round(max(0.0, min(confidence, 1.0)), 4),
         review_reason=review_reason,
     )

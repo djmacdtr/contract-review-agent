@@ -36,7 +36,7 @@ def test_confirmed_difference_becomes_ungraded_risk() -> None:
     assert "severity" not in risks[0]
 
 
-def test_uncertain_ocr_difference_and_warning_only_become_review_items() -> None:
+def test_ocr_difference_becomes_risk_while_legacy_review_builder_remains_compatible() -> None:
     diff = difference(review_reason="OCR_LOW_CONFIDENCE_VARIANCE")
     warning = ProcessingWarning(code="ALIGNMENT_UNRELIABLE", message="对齐不可靠")
 
@@ -45,7 +45,8 @@ def test_uncertain_ocr_difference_and_warning_only_become_review_items() -> None
         [diff], [warning], module_code="DOCUMENT_RELIABILITY"
     )
 
-    assert risks == []
+    assert len(risks) == 1
+    assert risks[0]["risk_type"] == "ADDITION_OR_CHANGE"
     assert {item["reason_code"] for item in reviews} == {
         "OCR_LOW_CONFIDENCE_VARIANCE",
         "ALIGNMENT_UNRELIABLE",

@@ -106,6 +106,18 @@ def test_mapper_rejects_partial_pages_or_incomplete_tables(tmp_path: Path) -> No
         )
     assert caught.value.code == "OCR_RESPONSE_INVALID"
 
+    payload = load_response().model_dump(mode="json")
+    payload["data"]["result"]["total_page_number"] = 2
+    payload["data"]["result"]["valid_page_number"] = 2
+    payload["data"]["result"]["pages"].append(
+        {**payload["data"]["result"]["pages"][0], "page_id": 2}
+    )
+    with pytest.raises(WorkflowError) as caught:
+        map_textin_document(
+            TextInParseResponse.model_validate(payload), local_file(tmp_path), low_confidence=0.8
+        )
+    assert caught.value.code == "OCR_PARTIAL_FAILURE"
+
 
 def test_mapper_warns_when_merged_cells_are_simplified(tmp_path: Path) -> None:
     payload = load_response().model_dump(mode="json")

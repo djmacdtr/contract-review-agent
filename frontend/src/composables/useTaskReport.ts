@@ -31,7 +31,7 @@ export function useTaskReport(expectedType: TaskType) {
     try {
       detail.value = await api.detail(taskId)
       if (detail.value.task_type !== expectedType) {
-        error.value = `任务类型不匹配：当前页面只接受 ${expectedType}`
+        error.value = '当前链接与本报告类型不一致，请从原检查入口重新打开。'
         stop()
         return
       }
@@ -44,7 +44,10 @@ export function useTaskReport(expectedType: TaskType) {
         stop()
       }
     } catch (caught) {
-      error.value = String(caught)
+      const message = caught instanceof Error ? caught.message : ''
+      error.value = message && message !== 'Failed to fetch'
+        ? message.replace(/^[A-Z][A-Z0-9_]*:\s*/, '')
+        : '报告数据暂时无法加载，请稍后重试。'
       stop()
     }
   }

@@ -1,7 +1,7 @@
 import pytest
 
 from app.comparison.engine import CompareOptions, compare_documents
-from app.comparison.reliable import comparison_normalize
+from app.comparison.reliable import build_diff_segments, comparison_normalize
 from app.documents.models import (
     DocumentBlock,
     DocumentLocation,
@@ -289,6 +289,66 @@ def test_comparison_normalization_suppresses_external_parser_markup(
     assert comparison_normalize(baseline)[1] == comparison_normalize(target)[1]
 
 
+@pytest.mark.parametrize(
+    "separator",
+    ["<br>", "<br/>", "<br />", "\n", "\r\n", "\u200b"],
+)
+def test_display_only_break_and_zero_width_noise_does_not_create_diff(
+    separator: str,
+) -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["付款日期为2026年8月20日。"]),
+        paragraph_document("target", [f"付款日期为{separator}2026年8月20日。"]),
+        CompareOptions(),
+    )
+
+    assert compared.diff_items == []
+
+
+def test_noise_plus_real_change_only_emits_business_text_segments() -> None:
+    compared = compare_documents(
+        paragraph_document("base", ["付款<br>日期为2026年8月20日。"]),
+        paragraph_document("target", ["付款\n日期为2026年9月20日。\u200b"]),
+        CompareOptions(),
+    )
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "NUMERIC_CHANGED"
+    segment_text = "".join(segment.text for segment in item.segments)
+    assert "<br" not in segment_text.lower()
+    assert "\u200b" not in segment_text
+    assert "\r" not in segment_text
+    assert "".join(
+        segment.text for segment in item.segments if segment.operation != "INSERT"
+    ) == item.baseline.text
+    assert "".join(
+        segment.text for segment in item.segments if segment.operation != "DELETE"
+    ) == item.target.text
+    assert [
+        segment.text for segment in item.segments if segment.operation == "DELETE"
+    ] == ["8"]
+    assert [
+        segment.text for segment in item.segments if segment.operation == "INSERT"
+    ] == ["9"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "operation"),
+    [("原完整条款", "", "DELETE"), ("", "新增完整条款", "INSERT")],
+)
+def test_pure_addition_or_deletion_uses_cleaned_full_text_segment(
+    before: str, after: str, operation: str
+) -> None:
+    segments, baseline_text, target_text = build_diff_segments(before, after)
+
+    assert [(segment.operation, segment.text) for segment in segments] == [
+        (operation, before or after)
+    ]
+    assert baseline_text == before
+    assert target_text == after
+
+
 def test_legal_clause_single_character_ocr_variance_is_retained_as_review_only() -> None:
     prefix = "第十条争议解决条款约定双方应当依约履行义务" * 5
     compared = compare_documents(
@@ -458,6 +518,7 @@ def test_real_table_cell_changes_are_not_absorbed(
     assert item.target.location.column == column
     assert item.baseline.text == before
     assert item.target.text == after
+    assert item.segments
 
 
 @pytest.mark.parametrize(

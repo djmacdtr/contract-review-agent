@@ -1,6 +1,6 @@
 <template>
   <el-container class="shell">
-    <el-header class="console-header">
+    <el-header v-if="!isFormalReport" class="console-header">
       <div class="header-inner">
         <div class="brand-block">
           <span class="brand-mark">AI</span>
@@ -14,7 +14,7 @@
         </el-menu>
       </div>
     </el-header>
-    <el-main><router-view :key="$route.fullPath" /></el-main>
+    <el-main :class="{ 'formal-report-main': isFormalReport }"><router-view :key="$route.fullPath" /></el-main>
   </el-container>
 </template>
 
@@ -22,6 +22,7 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 const route = useRoute()
+const isFormalReport = computed(() => route.meta.formalReport === true)
 const activeMenu = computed(() => {
   if (route.path.startsWith('/reports/') || /^\/tasks\/[^/]+$/.test(route.path)) return '/tasks'
   return route.path

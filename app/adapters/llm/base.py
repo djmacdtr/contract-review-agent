@@ -82,12 +82,20 @@ class MockContractLlmClient:
         )
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
+        risk_advices = [
+            {
+                "risk_id": item["risk_id"],
+                "analysis_advice": f"请核对“{item.get('title', '该差异')}”的来源文件和对应位置。",
+            }
+            for item in payload.get("risk_items", [])
+        ]
         return LlmResult(
             value={
                 "overall_advice": "模拟建议：请结合原始文件进行人工复核。",
                 "priority_actions": ["核对金额、期限及合同主体"],
                 "manual_review_focus": ["模拟风险与差异项"],
                 "limitations": ["本结果未下载或解析任何合同，也未调用真实大模型"],
+                "risk_advices": risk_advices,
             },
             configured_model=self.model,
             actual_model=None,

@@ -5,6 +5,9 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
+from app.adapters.llm.base import ContractLlmClient
+from app.adapters.llm.openai_client import OpenAIContractLlmClient
+from app.adapters.llm.schemas import AdviceResponse
 from app.comparison.engine import (
     CompareOptions,
     compare_documents,
@@ -16,15 +19,21 @@ from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
-from app.results.risk_model import build_review_items, build_risk_items, build_statistics
+from app.results.advice import (
+    advice_payload,
+    ensure_fallback_risk_advices,
+    merge_model_advice,
+)
+from app.results.passed_checks import build_comparison_passed_checks
+from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.4.2"
-FINAL_COMPARE_RULES_VERSION = "0.4.2"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.5.0"
+FINAL_COMPARE_RULES_VERSION = "0.5.0"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -45,6 +54,7 @@ class FinalCompareWorkflowExecutor:
         downloader: SafeFileDownloadService | None = None,
         parsers: ParserRegistry | None = None,
         document_router: DocumentParsingRouter | None = None,
+        llm: ContractLlmClient | None = None,
     ) -> None:
         self.settings = settings
         self.downloader = downloader or SafeFileDownloadService(settings)
@@ -55,6 +65,12 @@ class FinalCompareWorkflowExecutor:
             local=local_parsers,
             external=TextInDocumentParser(settings) if settings.OCR_ENABLED else None,
         )
+        if llm is not None:
+            self.llm = llm
+        elif settings.llm_configured:
+            self.llm = OpenAIContractLlmClient(settings)
+        else:
+            self.llm = None
 
     def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
         graph = StateGraph(FinalCompareState)
@@ -84,13 +100,53 @@ class FinalCompareWorkflowExecutor:
                     ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
                 ),
             )
+            if not compared.diagnostics.reliable:
+                raise WorkflowError(
+                    "COMPARISON_UNRELIABLE",
+                    "两份合同的内容对齐覆盖率不足，未生成正式报告",
+                )
             return {"comparison": compared}
 
         async def build_result(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.RULE_CHECKING, 86, "正在分类差异并生成固定规则摘要")
             result = self._build_result(
-                state["task_id"], state["files"], state["parsed_documents"], state["comparison"]
+                state["task_id"],
+                state["files"],
+                state["parsed_documents"],
+                state["comparison"],
+                state.get("options", {}),
             )
+            return {"result": result}
+
+        async def generate_advice(state: FinalCompareState) -> dict[str, Any]:
+            result = state["result"]
+            if self.llm is None or not hasattr(self.llm, "generate_advice"):
+                return {}
+            await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
+            try:
+                generated = await self.llm.generate_advice(advice_payload(result))
+                merge_model_advice(result, AdviceResponse.model_validate(generated.value))
+                result["metadata"].setdefault("model_runs", []).append(
+                    {
+                        "purpose": "RISK_ADVICE",
+                        "configured_model": generated.configured_model,
+                        "actual_model": generated.actual_model,
+                        "duration_ms": generated.duration_ms,
+                        "request_attempts": generated.request_attempts,
+                        "structure_retries": generated.structure_retries,
+                        "status": "SUCCEEDED",
+                    }
+                )
+            except Exception:
+                # Advice is supplemental and must never invalidate deterministic results.
+                result.setdefault("warnings", []).append(
+                    {
+                        "code": "LLM_ADVICE_UNAVAILABLE",
+                        "message": "模型建议未完成，已保留确定性分析建议。",
+                        "requires_manual_review": False,
+                    }
+                )
+                ensure_fallback_risk_advices(result)
             return {"result": result}
 
         async def persist_result(state: FinalCompareState) -> dict[str, Any]:
@@ -101,12 +157,14 @@ class FinalCompareWorkflowExecutor:
         graph.add_node("parse_documents", parse_documents)
         graph.add_node("compare_versions", compare_versions)
         graph.add_node("build_result", build_result)
+        graph.add_node("generate_advice", generate_advice)
         graph.add_node("persist_result", persist_result)
         graph.add_edge(START, "download_files")
         graph.add_edge("download_files", "parse_documents")
         graph.add_edge("parse_documents", "compare_versions")
         graph.add_edge("compare_versions", "build_result")
-        graph.add_edge("build_result", "persist_result")
+        graph.add_edge("build_result", "generate_advice")
+        graph.add_edge("generate_advice", "persist_result")
         graph.add_edge("persist_result", END)
         return graph.compile()
 
@@ -116,7 +174,13 @@ class FinalCompareWorkflowExecutor:
         input_files: list[dict[str, Any]],
         documents: list[ParsedDocument],
         comparison: ComparisonResult,
+        options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not comparison.diagnostics.reliable:
+            raise WorkflowError(
+                "COMPARISON_UNRELIABLE",
+                "合同版本对齐覆盖率不足，未生成正式报告",
+            )
         input_by_id = {item["file_id"]: item for item in input_files}
         files = [
             {
@@ -143,30 +207,17 @@ class FinalCompareWorkflowExecutor:
         risk_items = build_risk_items(
             comparison.diff_items, module_code="VERSION_CHANGE"
         )
-        review_items = build_review_items(
+        passed_checks = build_comparison_passed_checks(
+            documents,
             comparison.diff_items,
-            comparison.warnings,
-            module_code="DOCUMENT_RELIABILITY",
+            comparison.diagnostics,
+            check_prefix="check_final",
+            module_code="VERSION_CHANGE",
+            content_title="合同内容未发生变化",
+            numeric_sensitive=(options or {}).get("numeric_sensitive", True),
         )
-        passed_checks = (
-            [
-                {
-                    "check_id": "check_document_alignment",
-                    "module_code": "DOCUMENT_ALIGNMENT",
-                    "title": "文档对齐可靠",
-                    "description": "双方文档达到确定性比对可靠性阈值。",
-                }
-            ]
-            if comparison.diagnostics.reliable
-            else []
-        )
-        statistics = build_statistics(risk_items, review_items, passed_checks)
-        if risk_items:
-            conclusion = "RISK_FOUND"
-        elif review_items:
-            conclusion = "REVIEW_REQUIRED"
-        else:
-            conclusion = "PASS"
+        statistics = build_statistics(risk_items, [], passed_checks)
+        conclusion = "RISK_FOUND" if risk_items else "PASS"
         warnings = [warning.model_dump(mode="json") for warning in comparison.warnings]
         warnings.append(
             ProcessingWarning(
@@ -178,7 +229,7 @@ class FinalCompareWorkflowExecutor:
                 requires_manual_review=False,
             ).model_dump(mode="json")
         )
-        return {
+        result = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": TaskType.FINAL_COMPARE.value,
@@ -186,13 +237,13 @@ class FinalCompareWorkflowExecutor:
             "summary": {
                 "title": "确定性合同版本比对结果",
                 "description": (
-                    f"确认 {len(risk_items)} 项风险，另有 {len(review_items)} 项需要人工复核。"
+                    f"确认 {len(risk_items)} 项风险，{len(passed_checks)} 项校验通过。"
                 ),
                 "statistics": statistics,
             },
             "files": files,
             "risk_items": risk_items,
-            "review_items": review_items,
+            "review_items": [],
             "passed_checks": passed_checks,
             "diff_items": diffs,
             "fact_matrix": [],
@@ -214,6 +265,8 @@ class FinalCompareWorkflowExecutor:
             },
             "mock": False,
         }
+        ensure_fallback_risk_advices(result)
+        return result
 
     async def run(
         self,

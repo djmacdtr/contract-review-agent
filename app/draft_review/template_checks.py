@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 
 from app.comparison.engine import NUMBER_PATTERN, CompareOptions, compare_documents
 from app.comparison.models import ComparisonDiagnostics, DiffItem, DiffSide
-from app.comparison.reliable import comparison_normalize
+from app.comparison.reliable import (
+    build_diff_segments,
+    comparison_display_text,
+    comparison_normalize,
+)
 from app.documents.models import DocumentLocation, ParsedDocument, ProcessingWarning, TableCell
 
 SYMBOLIC_PLACEHOLDER = re.compile(
@@ -236,8 +240,7 @@ def _table_cell_diff(
     before: TableCell,
     after: TableCell,
 ) -> DiffItem:
-    before_text = before.raw_text
-    after_text = after.raw_text
+    segments, before_text, after_text = build_diff_segments(before.raw_text, after.raw_text)
     numeric_changed = (
         bool(NUMBER_PATTERN.search(before_text) and NUMBER_PATTERN.search(after_text))
         and NUMBER_PATTERN.findall(before_text) != NUMBER_PATTERN.findall(after_text)
@@ -250,14 +253,15 @@ def _table_cell_diff(
             file_id=template.file_id,
             location=before.location,
             locations=[before.location],
-            text=before_text,
+            text=comparison_display_text(before_text),
         ),
         target=DiffSide(
             file_id=target.file_id,
             location=after.location,
             locations=[after.location],
-            text=after_text,
+            text=comparison_display_text(after_text),
         ),
+        segments=segments,
         confidence=0.95,
     )
 

@@ -183,8 +183,11 @@ class OpenAIContractLlmClient:
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
         system = (
-            "你只能根据输入中的既有风险、复核项和证据生成建议，不得新增事实或结论。"
-            "建议中的证据引用必须逐字使用输入提供的 file_id 和位置；无法引用时留空并说明限制。"
+            "你只能根据输入中的既有风险、关联差异、文件名和证据位置生成建议，不得新增事实或结论。"
+            "面向业务人员的建议不得出现 file_id、内部坐标或其他技术标识。"
+            "必须在 risk_advices 中按 risk_id 为每条输入风险给出针对其差异文字、"
+            "文件和位置的分析建议，"
+            "不得使用同一句通用模板。"
             "只返回符合 AdviceResponse 的 JSON 对象。"
         )
 

@@ -204,7 +204,7 @@ def test_currency_or_mapping_uncertainty_never_becomes_conflict() -> None:
     assert risks == [] and reviews[0]["reason_code"] == "FACT_UNCERTAIN"
 
 
-def test_not_mentioned_only_requires_review_when_consensus_plan_requires_it() -> None:
+def test_reliably_required_but_missing_source_becomes_deletion_risk() -> None:
     target = extraction("fil_target", "1000万元")
     matrix = build_fact_matrix(
         {"fil_target": target, "fil_reference": extraction("fil_reference", "5")},
@@ -215,8 +215,38 @@ def test_not_mentioned_only_requires_review_when_consensus_plan_requires_it() ->
     )
     assert matrix[0]["status"] == "MISSING"
     risks, reviews, passed = fact_matrix_result_items(matrix)
-    assert risks == [] and passed == []
-    assert reviews[0]["reason_code"] == "FACT_MISSING"
+    assert reviews == [] and passed == []
+    assert risks[0]["risk_type"] == "DELETION_OR_MISSING"
+    assert risks[0]["change_type"] == "REQUIRED_SOURCE_MISSING"
+
+
+def test_required_missing_source_prevents_pass_for_same_fact() -> None:
+    target = extraction("fil_target", "1000万元")
+    matching = extraction("fil_matching", "10000000元")
+    matrix = build_fact_matrix(
+        {
+            "fil_target": target,
+            "fil_matching": matching,
+            "fil_missing": extraction("fil_missing", "5", field_key="other_fact"),
+        },
+        target_file_id="fil_target",
+        reference_file_ids=["fil_matching", "fil_missing"],
+        mapping_records=[
+            {
+                "target_fact_id": "target_fact_000001",
+                "source_file_id": "fil_matching",
+                "reference_field_key": "financing_amount",
+                "reference_location": {"paragraph_index": 0},
+                "status": "ACCEPT",
+            }
+        ],
+        required_missing={("target_fact_000001", "fil_missing")},
+    )
+
+    risks, reviews, passed = fact_matrix_result_items(matrix)
+    assert risks[0]["change_type"] == "REQUIRED_SOURCE_MISSING"
+    assert reviews == []
+    assert passed == []
 
 
 def test_chunk_merge_preserves_concepts_and_validation_specs() -> None:

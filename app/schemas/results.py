@@ -75,6 +75,7 @@ class RiskItem(BaseModel):
     related_diff_ids: list[str] = Field(default_factory=list)
     related_rule_ids: list[str] = Field(default_factory=list)
     requires_manual_action: bool = True
+    analysis_advice: str | None = None
 
 
 class ReviewItem(BaseModel):

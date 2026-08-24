@@ -35,35 +35,21 @@ from app.draft_review.facts import (
 )
 from app.draft_review.numeric_rules import evaluate_validation_spec
 from app.draft_review.template_checks import TemplateReviewResult, analyze_template
-from app.results.risk_model import build_review_items, build_risk_items, build_statistics
+from app.results.advice import (
+    advice_payload,
+    ensure_fallback_risk_advices,
+    merge_model_advice,
+)
+from app.results.passed_checks import build_comparison_passed_checks
+from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-DRAFT_REVIEW_WORKFLOW_VERSION = "0.5.1"
-DRAFT_REVIEW_RULES_VERSION = "0.4.1"
-
-
-def _refresh_result_status(result: dict[str, Any]) -> None:
-    """Keep late-stage review additions reflected in conclusion and statistics."""
-    risk_items = result.get("risk_items", [])
-    review_items = result.get("review_items", [])
-    passed_checks = result.get("passed_checks", [])
-    result["summary"]["statistics"] = build_statistics(
-        risk_items, review_items, passed_checks
-    )
-    result["summary"]["description"] = (
-        f"已解析 {len(result.get('files', []))} 份文件，确认 {len(risk_items)} 项风险，"
-        f"另有 {len(review_items)} 项需要人工复核。"
-    )
-    if risk_items:
-        result["conclusion"] = "RISK_FOUND"
-    elif review_items:
-        result["conclusion"] = "REVIEW_REQUIRED"
-    else:
-        result["conclusion"] = "PASS"
+DRAFT_REVIEW_WORKFLOW_VERSION = "0.6.0"
+DRAFT_REVIEW_RULES_VERSION = "0.5.0"
 
 
 class DraftReviewState(TypedDict, total=False):
@@ -125,16 +111,22 @@ class DraftReviewWorkflowExecutor:
             if "TARGET" not in by_role or "TEMPLATE" not in by_role:
                 raise WorkflowError("COMPARISON_FAILED", "起草检查缺少目标合同或模板")
             options = state.get("options", {})
-            return {
-                "template_review": analyze_template(
-                    by_role["TEMPLATE"],
-                    by_role["TARGET"],
-                    ignore_formatting=options.get("ignore_formatting", True),
-                    ignore_headers_footers=options.get("ignore_headers_footers", True),
-                    check_blank_fields=options.get("check_blank_fields", True),
-                    ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
+            review = analyze_template(
+                by_role["TEMPLATE"],
+                by_role["TARGET"],
+                ignore_formatting=options.get("ignore_formatting", True),
+                ignore_headers_footers=options.get("ignore_headers_footers", True),
+                check_blank_fields=options.get("check_blank_fields", True),
+                ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
+            )
+            if not review.diagnostics.comparison.reliable:
+                raise WorkflowError("COMPARISON_UNRELIABLE", "目标合同与模板的对齐覆盖率不足")
+            if review.diagnostics.expanded_table_count:
+                raise WorkflowError(
+                    "COMPARISON_INCOMPLETE",
+                    "目标合同与模板存在无法可靠完成逐项检查的表格结构变化",
                 )
-            }
+            return {"template_review": review}
 
         async def extract_facts(state: DraftReviewState) -> dict[str, Any]:
             if self.llm is None:
@@ -236,15 +228,10 @@ class DraftReviewWorkflowExecutor:
                     ValidationError,
                     TimeoutError,
                 ) as exc:
-                    if document.file_id not in extractions:
-                        extractions[document.file_id] = {
-                            "error": getattr(exc, "code", "LLM_EVIDENCE_INVALID"),
-                            "message": "辅助资料事实抽取未完成，需要人工复核。",
-                        }
-                    reviews[document.file_id] = {
-                        "error": getattr(exc, "code", "LLM_REVIEW_INVALID"),
-                        "message": "独立事实评审未完成，需要人工复核。",
-                    }
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        f"文件 {document.file_name} 的动态事实检查未能可靠完成",
+                    ) from exc
             return {"llm_extractions": extractions, "llm_reviews": reviews}
 
         async def map_cross_document_facts(state: DraftReviewState) -> dict[str, Any]:
@@ -366,15 +353,10 @@ class DraftReviewWorkflowExecutor:
                     ValidationError,
                     TimeoutError,
                 ) as exc:
-                    if document.file_id not in mappings:
-                        mappings[document.file_id] = {
-                            "error": getattr(exc, "code", "LLM_MAPPING_INVALID"),
-                            "message": "跨资料事实映射未完成，需要人工复核。",
-                        }
-                    mapping_reviews[document.file_id] = {
-                        "error": getattr(exc, "code", "LLM_MAPPING_REVIEW_INVALID"),
-                        "message": "独立映射评审未完成，需要人工复核。",
-                    }
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        f"文件 {document.file_name} 的跨资料事实映射未能可靠完成",
+                    ) from exc
             return {"llm_mappings": mappings, "llm_mapping_reviews": mapping_reviews}
 
         async def build_result(state: DraftReviewState) -> dict[str, Any]:
@@ -397,81 +379,30 @@ class DraftReviewWorkflowExecutor:
             if self.llm is None or not hasattr(self.llm, "generate_advice"):
                 return {}
             await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
-            evidence_refs = []
-            for item in result.get("risk_items", []) + result.get("review_items", []):
-                evidence_refs.extend(
-                    {"file_id": evidence.get("file_id"), "location": evidence.get("location")}
-                    for evidence in item.get("source_evidence", [])
-                    if evidence.get("file_id") and evidence.get("location")
-                )
-            payload = {
-                "risk_items": result.get("risk_items", []),
-                "review_items": result.get("review_items", []),
-                "passed_checks": result.get("passed_checks", []),
-                "fact_matrix": result.get("fact_matrix", []),
-                "rule_checks": result.get("rule_checks", []),
-                "evidence_refs": evidence_refs,
-            }
             try:
-                advice = AdviceResponse.model_validate(
-                    (await self.llm.generate_advice(payload)).value
-                ).model_dump(mode="json")
-                valid = {(ref["file_id"], location_key(ref["location"])) for ref in evidence_refs}
-                raw_refs = advice.pop("evidence_refs", [])
-                filtered = []
-                for ref in raw_refs:
-                    if (ref["file_id"], location_key(ref["location"])) in valid:
-                        filtered.append(ref)
-                advice["evidence_refs"] = filtered
-                if len(filtered) != len(raw_refs):
-                    advice.setdefault("limitations", []).append(
-                        "部分建议证据引用未能回查，已移除。"
-                    )
-                    result.setdefault("warnings", []).append(
-                        {
-                            "code": "LLM_ADVICE_EVIDENCE_REVIEW_REQUIRED",
-                            "message": "部分模型建议证据引用无法回查，需要人工复核。",
-                            "requires_manual_review": True,
-                        }
-                    )
-                    result.setdefault("review_items", []).append(
-                        {
-                            "review_id": "review_llm_advice_evidence",
-                            "module_code": "LLM_ADVICE",
-                            "reason_code": "LLM_ADVICE_EVIDENCE_UNVERIFIED",
-                            "title": "模型建议证据需要人工复核",
-                            "description": "部分建议引用不属于已生成的风险或复核证据，已过滤。",
-                            "source_evidence": [],
-                            "related_diff_ids": [],
-                            "requires_manual_action": True,
-                        }
-                    )
-                result["advice"] = advice
-                _refresh_result_status(result)
-            except (LlmClientError, ValidationError, ValueError, AssertionError):
+                generated = await self.llm.generate_advice(advice_payload(result))
+                merge_model_advice(result, AdviceResponse.model_validate(generated.value))
+                result["metadata"].setdefault("model_runs", []).append(
+                    {
+                        "purpose": "RISK_ADVICE",
+                        "configured_model": generated.configured_model,
+                        "actual_model": generated.actual_model,
+                        "duration_ms": generated.duration_ms,
+                        "request_attempts": generated.request_attempts,
+                        "structure_retries": generated.structure_retries,
+                        "status": "SUCCEEDED",
+                    }
+                )
+            except Exception:
+                # Advice is supplemental and must never invalidate deterministic results.
                 result.setdefault("warnings", []).append(
                     {
-                        "code": "LLM_ADVICE_REVIEW_REQUIRED",
-                        "message": "模型建议未完成，需要人工复核已有证据。",
-                        "requires_manual_review": True,
+                        "code": "LLM_ADVICE_UNAVAILABLE",
+                        "message": "模型建议未完成，已保留确定性分析建议。",
+                        "requires_manual_review": False,
                     }
                 )
-                result.setdefault("review_items", []).append(
-                    {
-                        "review_id": "review_llm_advice",
-                        "module_code": "LLM_ADVICE",
-                        "reason_code": "LLM_ADVICE_UNAVAILABLE",
-                        "title": "模型建议不可用",
-                        "description": "建议生成失败不影响确定性检查结果。",
-                        "source_evidence": [],
-                        "related_diff_ids": [],
-                        "requires_manual_action": True,
-                    }
-                )
-                result["summary"]["statistics"] = build_statistics(
-                    result["risk_items"], result["review_items"], result["passed_checks"]
-                )
-                _refresh_result_status(result)
+                ensure_fallback_risk_advices(result)
             return {"result": result}
 
         async def persist_result(state: DraftReviewState) -> dict[str, Any]:
@@ -528,15 +459,66 @@ class DraftReviewWorkflowExecutor:
         llm_mapping_reviews: dict[str, dict[str, Any]] | None = None,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not template_review.diagnostics.comparison.reliable:
+            raise WorkflowError(
+                "COMPARISON_UNRELIABLE",
+                "目标合同与模板的对齐覆盖率不足，未生成正式报告",
+            )
+        if template_review.diagnostics.expanded_table_count:
+            raise WorkflowError(
+                "UNSUPPORTED_TABLE_EXPANSION",
+                "目标合同包含无法可靠检查的扩展表格，未生成正式报告",
+            )
         input_by_id = {item["file_id"]: item for item in input_files}
         files: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
-        review_warnings: list[ProcessingWarning] = []
         llm_reviews = llm_reviews or {}
         llm_mappings = llm_mappings or {}
         llm_mapping_reviews = llm_mapping_reviews or {}
         options = options or {}
         review_enforced = self.llm is not None and hasattr(self.llm, "review_facts")
+        mapping_enforced = self.llm is not None and hasattr(self.llm, "map_facts")
+        mapping_review_enforced = self.llm is not None and hasattr(
+            self.llm, "review_mappings"
+        )
+        dynamic_documents = [
+            document for document in documents if document.role != "TEMPLATE"
+        ]
+        if self.llm is not None and any(
+            not llm_extractions.get(document.file_id, {}).get("value")
+            for document in dynamic_documents
+        ):
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "已启用的动态事实检查未覆盖全部业务文件，未生成正式报告",
+            )
+        if review_enforced and any(
+            not llm_reviews.get(document.file_id, {}).get("value")
+            for document in dynamic_documents
+        ):
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "已启用的独立事实评审未覆盖全部业务文件，未生成正式报告",
+            )
+        reference_documents = [
+            document for document in documents if document.role == "REFERENCE"
+        ]
+        if mapping_enforced and any(
+            not llm_mappings.get(document.file_id, {}).get("value")
+            for document in reference_documents
+        ):
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "已启用的跨资料事实映射未覆盖全部参考文件，未生成正式报告",
+            )
+        if mapping_review_enforced and any(
+            not llm_mapping_reviews.get(document.file_id, {}).get("value")
+            for document in reference_documents
+        ):
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "已启用的跨资料映射评审未覆盖全部参考文件，未生成正式报告",
+            )
         extractions_by_file: dict[str, DocumentFactExtraction] = {}
         consensus_fields: set[tuple[str, str, tuple[object, ...]]] = set()
         strict_review_files: set[str] = set()
@@ -552,7 +534,6 @@ class DraftReviewWorkflowExecutor:
             for warning in document_warnings:
                 warning["file_id"] = warning.get("file_id") or document.file_id
                 warnings.append(warning)
-            review_warnings.extend(document.warnings)
             extraction = llm_extractions.get(document.file_id, {})
             extracted_value = extraction.get("value") or {}
             profile = extracted_value.get("profile") or {
@@ -626,15 +607,6 @@ class DraftReviewWorkflowExecutor:
                             and review_obj.evidence_complete
                         ):
                             accepted_spec_ids.add(reviewed_spec.validation_id)
-                elif review.get("error"):
-                    review_warning = ProcessingWarning(
-                        code=str(review["error"]),
-                        message="独立事实评审未完成，需要人工复核。",
-                        requires_manual_review=True,
-                        file_id=document.file_id,
-                    )
-                    review_warnings.append(review_warning)
-                    warnings.append(review_warning.model_dump(mode="json"))
                 if not hasattr(self.llm, "review_facts"):
                     consensus_fields.update(
                         (fact.field_key, fact.source_file_id, location_key(fact.location))
@@ -667,22 +639,6 @@ class DraftReviewWorkflowExecutor:
                             "status": "SUCCEEDED",
                         }
                     )
-            elif extraction.get("error"):
-                llm_warning = ProcessingWarning(
-                    code=str(extraction["error"]),
-                    message="辅助资料事实抽取未完成，需要人工复核。",
-                    requires_manual_review=True,
-                    file_id=document.file_id,
-                )
-                review_warnings.append(llm_warning)
-                warnings.append(llm_warning.model_dump(mode="json"))
-                profile = {
-                    "document_kind": "UNKNOWN",
-                    "title": None,
-                    "confidence": 0.0,
-                    "generated_by": "FAILED",
-                    "evidence_locations": [],
-                }
             files.append(
                 {
                     "file_id": document.file_id,
@@ -699,7 +655,6 @@ class DraftReviewWorkflowExecutor:
                     "content_structure": self._content_structure(document),
                 }
             )
-        mapping_enforced = self.llm is not None and hasattr(self.llm, "map_facts")
         if mapping_enforced:
             for document in documents:
                 if document.role != "REFERENCE":
@@ -821,7 +776,6 @@ class DraftReviewWorkflowExecutor:
             for warning in template_review.warnings
             if warning.code not in existing_warning_codes
         )
-        review_warnings.extend(template_review.warnings)
         if not successful_extractions:
             warnings.append(
                 ProcessingWarning(
@@ -882,29 +836,30 @@ class DraftReviewWorkflowExecutor:
                                 "requires_manual_action": True,
                             }
                         )
+        if fact_reviews:
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "动态事实检查存在无法可靠确认的内容，未生成正式报告",
+            )
         risk_items = build_risk_items(
             template_review.diff_items,
             module_code="TEMPLATE_INTEGRITY",
             failed_rules=failed_rules,
         )
-        review_items = build_review_items(
-            template_review.diff_items,
-            review_warnings,
-            module_code="TEMPLATE_RELIABILITY",
-        )
         risk_items.extend(fact_risks)
-        review_items.extend(fact_reviews)
-        passed_checks = []
-        if template_review.diagnostics.comparison.reliable:
-            passed_checks.append(
-                {
-                    "check_id": "check_template_alignment",
-                    "module_code": "TEMPLATE_INTEGRITY",
-                    "title": "模板正文对齐可靠",
-                    "description": "目标合同和模板正文达到确定性对齐阈值。",
-                }
-            )
-        if not failed_rules:
+        comparison_documents = [
+            document for document in documents if document.role in {"TEMPLATE", "TARGET"}
+        ]
+        passed_checks = build_comparison_passed_checks(
+            comparison_documents,
+            template_review.diff_items,
+            template_review.diagnostics.comparison,
+            check_prefix="check_template",
+            module_code="TEMPLATE_INTEGRITY",
+            content_title="模板固定内容未发现变化",
+            numeric_sensitive=True,
+        )
+        if options.get("check_blank_fields", True) and not failed_rules:
             passed_checks.append(
                 {
                     "check_id": "check_required_fields",
@@ -1020,16 +975,15 @@ class DraftReviewWorkflowExecutor:
                             "description": check["message"],
                         }
                     )
-        numeric_risks and risk_items.extend(numeric_risks)
-        numeric_reviews and review_items.extend(numeric_reviews)
-        statistics = build_statistics(risk_items, review_items, passed_checks)
-        if risk_items:
-            conclusion = "RISK_FOUND"
-        elif review_items:
-            conclusion = "REVIEW_REQUIRED"
-        else:
-            conclusion = "PASS"
-        return {
+        if numeric_reviews:
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "动态数值检查存在无法可靠执行的规则，未生成正式报告",
+            )
+        risk_items.extend(numeric_risks)
+        statistics = build_statistics(risk_items, [], passed_checks)
+        conclusion = "RISK_FOUND" if risk_items else "PASS"
+        result = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "task_id": task_id,
             "task_type": TaskType.DRAFT_REVIEW.value,
@@ -1037,14 +991,14 @@ class DraftReviewWorkflowExecutor:
             "summary": {
                 "title": "起草合同模板确定性检查结果",
                 "description": (
-                    f"已解析 {len(files)} 份文件，确认 {len(risk_items)} 项风险，"
-                    f"另有 {len(review_items)} 项需要人工复核。"
+                    f"已完成 {len(files)} 份文件检查，确认 {len(risk_items)} 项风险，"
+                    f"{len(passed_checks)} 项校验通过。"
                 ),
                 "statistics": statistics,
             },
             "files": files,
             "risk_items": risk_items,
-            "review_items": review_items,
+            "review_items": [],
             "passed_checks": passed_checks,
             "diff_items": [item.model_dump(mode="json") for item in template_review.diff_items],
             "fact_matrix": fact_matrix,
@@ -1086,6 +1040,8 @@ class DraftReviewWorkflowExecutor:
             },
             "mock": False,
         }
+        ensure_fallback_risk_advices(result)
+        return result
 
     async def run(
         self,

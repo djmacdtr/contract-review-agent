@@ -1,12 +1,15 @@
 from pathlib import Path
 
 import httpx
+import pytest
 from docx import Document
 from reportlab.pdfgen.canvas import Canvas
 
+from app.adapters.llm.base import LlmResult
 from app.comparison.engine import CompareOptions, compare_documents
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
+from app.core.errors import WorkflowError
 from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
@@ -24,6 +27,36 @@ def build_docx(path: Path, amount: str) -> bytes:
 
 async def resolver(host: str, port: int) -> list[str]:
     return ["127.0.0.1"]
+
+
+class BatchAdviceLlm:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate_advice(self, payload: dict) -> LlmResult:
+        self.calls += 1
+        assert payload["risk_items"]
+        return LlmResult(
+            value={
+                "overall_advice": "请处理已确认的合同差异。",
+                "priority_actions": [],
+                "manual_review_focus": [],
+                "limitations": [],
+                "evidence_refs": [],
+                "risk_advices": [
+                    {
+                        "risk_id": risk["risk_id"],
+                        "analysis_advice": (
+                            f"请核对{risk['title']}涉及的前后内容及其业务审批依据。"
+                        ),
+                    }
+                    for risk in payload["risk_items"]
+                ],
+            },
+            configured_model="fixture-advice",
+            actual_model="fixture-advice-v1",
+            mock=True,
+        )
 
 
 async def test_final_compare_graph_returns_rule_based_traceable_result_and_cleans(
@@ -48,7 +81,8 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
         transport=httpx.MockTransport(handler),
         resolver=resolver,
     )
-    executor = FinalCompareWorkflowExecutor(settings, downloader=downloader)
+    llm = BatchAdviceLlm()
+    executor = FinalCompareWorkflowExecutor(settings, downloader=downloader, llm=llm)
     updates: list[tuple[TaskStage, int]] = []
 
     async def progress(stage: TaskStage, value: int, message: str) -> None:
@@ -80,14 +114,16 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["schema_version"] == "2.1"
-    assert result["metadata"]["workflow_version"] == "0.4.2"
-    assert result["metadata"]["rules_version"] == "0.4.2"
+    assert result["metadata"]["workflow_version"] == "0.5.0"
+    assert result["metadata"]["rules_version"] == "0.5.0"
     assert result["metadata"]["comparison_diagnostics"]["reliable"] is True
     assert result["metadata"]["primary_model"] is None
-    assert result["metadata"]["model_runs"] == []
+    assert llm.calls == 1
+    assert [run["purpose"] for run in result["metadata"]["model_runs"]] == ["RISK_ADVICE"]
     assert result["conclusion"] == "RISK_FOUND"
     assert result["summary"]["statistics"]["risk_count"] >= 1
     assert result["risk_items"]
+    assert all(item["analysis_advice"] for item in result["risk_items"])
     assert any(item["diff_type"] == "NUMERIC_CHANGED" for item in result["diff_items"])
     assert result["files"][0]["sha256"] == output.file_metadata[0]["sha256"]
     assert "token=secret" not in str(result)
@@ -191,7 +227,7 @@ async def test_scan_pdf_graph_uses_external_parser_and_exposes_metadata(tmp_path
     assert not any((tmp_path / "workspaces").iterdir())
 
 
-def test_only_low_confidence_ocr_text_diffs_require_review_instead_of_risk() -> None:
+def test_low_confidence_ocr_text_diff_is_still_a_formal_risk() -> None:
     settings = Settings(_env_file=None, OCR_LOW_CONFIDENCE_THRESHOLD=0.8)
     documents = []
     for file_id, role, text in (
@@ -241,8 +277,47 @@ def test_only_low_confidence_ocr_text_diffs_require_review_instead_of_risk() -> 
         documents,
         comparison,
     )
-    assert result["conclusion"] == "REVIEW_REQUIRED"
+    assert result["conclusion"] == "RISK_FOUND"
     assert "severity" not in result["diff_items"][0]
     assert result["diff_items"][0]["review_reason"] == "OCR_LOW_CONFIDENCE_VARIANCE"
-    assert result["risk_items"] == []
-    assert result["review_items"]
+    assert result["risk_items"]
+    assert result["risk_items"][0]["analysis_advice"]
+    assert result["review_items"] == []
+    assert result["summary"]["statistics"]["review_count"] == 0
+
+
+def test_unreliable_document_pair_cannot_build_formal_result() -> None:
+    documents = []
+    for file_id, role, text in (
+        ("fil_base", "BASELINE", "第一条融资租赁合同金额为100万元。"),
+        ("fil_target", "TARGET", "天气预报显示明日有雨，出行请携带雨具。"),
+    ):
+        documents.append(
+            ParsedDocument(
+                file_id=file_id,
+                role=role,
+                file_name=f"{role.lower()}.docx",
+                sha256="d" * 64,
+                page_count=1,
+                blocks=[
+                    DocumentBlock(
+                        block_id=f"{file_id}_p0",
+                        type="PARAGRAPH",
+                        order=0,
+                        raw_text=text,
+                        normalized_text=text,
+                        location=DocumentLocation(page=1, paragraph_index=0),
+                    )
+                ],
+                parser_name="fixture",
+            )
+        )
+    comparison = compare_documents(documents[0], documents[1], CompareOptions())
+
+    with pytest.raises(WorkflowError, match="对齐覆盖率不足"):
+        FinalCompareWorkflowExecutor(Settings(_env_file=None))._build_result(
+            "tsk_unreliable",
+            [],
+            documents,
+            comparison,
+        )

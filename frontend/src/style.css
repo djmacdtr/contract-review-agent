@@ -50,13 +50,7 @@ body { margin: 0; background: var(--report-bg); color: var(--report-text); -webk
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111827; color: #e5e7eb; padding: 16px; border-radius: 8px; max-height: 520px; overflow: auto; }
 
 .report-page { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 15px; }
-.report-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 11px 16px; background: #fff; border: 1px solid var(--report-border); border-radius: 10px; box-shadow: var(--report-shadow); color: var(--report-text-2); font-size: 12px; }
-.report-legend span { display: inline-flex; align-items: center; gap: 6px; }
-.report-legend i { width: 10px; height: 10px; border-radius: 3px; }
-.risk-dot,.delete-dot { background: var(--report-danger); }
-.add-dot { background: var(--report-warning); }
-.review-dot { background: var(--report-info); }
-.pass-dot { background: var(--report-success); }
+.formal-report-main { padding-top: 22px; }
 .report-state { min-height: 280px; display: flex; flex-direction: column; justify-content: center; }
 .report-state .state-kicker { color: var(--report-primary); font-size: 12px; font-weight: 800; letter-spacing: .08em; }
 .report-state h2 { margin: 8px 0 20px; }

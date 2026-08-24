@@ -9,34 +9,26 @@
 </template>
 
 <script setup lang="ts">
-defineProps<{ items: Record<string, unknown>[] }>()
+import { computed } from 'vue'
+import type { DocumentLocation, ResultFile } from '../../api/types'
+import { fileNameMap, formatBusinessLocations } from '../../utils/reportEvidence'
+
+const props = withDefaults(defineProps<{ items: Record<string, unknown>[]; files?: ResultFile[] }>(), { files: () => [] })
+const names = computed(() => fileNameMap(props.files))
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
 function evidenceHeading(item: Record<string, unknown>) {
-  const side = item.side === 'BASELINE' ? '基准证据' : item.side === 'TARGET' ? '当前证据' : '来源证据'
-  return typeof item.file_id === 'string' ? `${side} · ${item.file_id}` : side
+  return item.side === 'BASELINE' ? '基准证据' : item.side === 'TARGET' ? '当前证据' : '来源证据'
 }
 function evidenceText(item: Record<string, unknown>) { return typeof item.text === 'string' ? item.text : '' }
 function evidenceLocation(item: Record<string, unknown>) {
   const direct = record(item.location)
   const values = Array.isArray(item.locations) ? item.locations.map(record).filter(Boolean) as Record<string, unknown>[] : []
   const locations = values.length ? values : direct ? [direct] : []
-  if (!locations.length) return '未提供结构位置'
-  const start = formatLocation(locations[0])
-  const end = locations.length > 1 ? formatLocation(locations[locations.length - 1]) : ''
-  return end && end !== start ? `${start} → ${end}` : start
-}
-function formatLocation(value: Record<string, unknown>) {
-  const parts: string[] = []
-  if (value.page != null) parts.push(`第 ${value.page} 页`)
-  if (value.paragraph_index != null) parts.push(`段落 ${value.paragraph_index}`)
-  if (value.table_index != null) parts.push(`表格 ${value.table_index}`)
-  if (value.row != null) parts.push(`行 ${value.row}`)
-  if (value.column != null) parts.push(`列 ${value.column}`)
-  if (typeof value.section === 'string') parts.push(value.section)
-  return parts.join(' · ') || '结构位置未知'
+  const fileId = typeof item.file_id === 'string' ? item.file_id : undefined
+  return formatBusinessLocations(locations as DocumentLocation[], fileId, names.value)
 }
 </script>
 
