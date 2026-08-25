@@ -1,4 +1,4 @@
-from app.comparison.models import DiffItem, DiffSide
+from app.comparison.models import DiffItem, DiffSegment, DiffSide, MissingDetail
 from app.documents.models import DocumentLocation, ProcessingWarning
 from app.results.risk_model import build_review_items, build_risk_items, build_statistics
 
@@ -71,3 +71,44 @@ def test_failed_required_rule_becomes_deletion_or_missing_risk() -> None:
 
     assert risks[0]["risk_type"] == "DELETION_OR_MISSING"
     assert risks[0]["change_type"] == "RULE_FAILED"
+
+
+def test_page_and_content_block_missing_are_deletion_risks() -> None:
+    differences = []
+    for index, diff_type in enumerate(
+        ("PAGE_MISSING", "CONTENT_BLOCK_MISSING"), start=1
+    ):
+        differences.append(
+            DiffItem(
+                diff_id=f"diff_{index:06d}",
+                diff_type=diff_type,
+                title="页面内容缺失" if diff_type == "PAGE_MISSING" else "连续内容块缺失",
+                baseline=DiffSide(
+                    file_id="fil_base",
+                    location=DocumentLocation(paragraph_index=4),
+                    text="连续缺失内容",
+                ),
+                target=DiffSide(
+                    file_id="fil_target",
+                    location=DocumentLocation(page=2),
+                    text="",
+                ),
+                segments=[DiffSegment(operation="DELETE", text="连续缺失内容")],
+                confidence=0.99,
+                certainty="CONFIRMED",
+                missing_detail=MissingDetail(
+                    boundary="MIDDLE",
+                    structure_unit_count=2,
+                    aggregated_diff_count=2,
+                    content_summary="连续缺失内容",
+                ),
+            )
+        )
+
+    risks = build_risk_items(differences, module_code="VERSION_CHANGE")
+
+    assert [item["risk_type"] for item in risks] == [
+        "DELETION_OR_MISSING",
+        "DELETION_OR_MISSING",
+    ]
+    assert all("连续内容" in item["description"] for item in risks)

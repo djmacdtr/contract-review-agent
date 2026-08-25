@@ -114,8 +114,8 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["schema_version"] == "2.1"
-    assert result["metadata"]["workflow_version"] == "0.5.0"
-    assert result["metadata"]["rules_version"] == "0.5.0"
+    assert result["metadata"]["workflow_version"] == "0.6.0"
+    assert result["metadata"]["rules_version"] == "0.6.0"
     assert result["metadata"]["comparison_diagnostics"]["reliable"] is True
     assert result["metadata"]["primary_model"] is None
     assert llm.calls == 1
@@ -321,3 +321,69 @@ def test_unreliable_document_pair_cannot_build_formal_result() -> None:
             documents,
             comparison,
         )
+
+
+def test_final_result_keeps_aggregated_missing_content_as_one_risk() -> None:
+    documents = []
+    for file_id, role, texts in (
+        (
+            "fil_base",
+            "BASELINE",
+            [
+                "第一条 共同开始内容。",
+                "第二条 连续缺失内容甲。",
+                "第三条 连续缺失内容乙。",
+                "第四条 共同结束内容。",
+            ],
+        ),
+        (
+            "fil_target",
+            "TARGET",
+            ["第一条 共同开始内容。", "第四条 共同结束内容。"],
+        ),
+    ):
+        documents.append(
+            ParsedDocument(
+                file_id=file_id,
+                role=role,
+                file_name=f"{role.lower()}.docx",
+                sha256="e" * 64,
+                page_count=None,
+                blocks=[
+                    DocumentBlock(
+                        block_id=f"{file_id}_p{index}",
+                        type="PARAGRAPH",
+                        order=index,
+                        raw_text=text,
+                        normalized_text=text,
+                        location=DocumentLocation(paragraph_index=index),
+                    )
+                    for index, text in enumerate(texts)
+                ],
+                parser_name="python-docx",
+                parser_metadata={"physical_page_numbers": False},
+            )
+        )
+    comparison = compare_documents(documents[0], documents[1], CompareOptions())
+
+    result = FinalCompareWorkflowExecutor(Settings(_env_file=None))._build_result(
+        "tsk_missing_block",
+        [
+            {
+                "file_id": "fil_base",
+                "safe_url": "https://example.test/baseline.docx",
+            },
+            {
+                "file_id": "fil_target",
+                "safe_url": "https://example.test/target.docx",
+            },
+        ],
+        documents,
+        comparison,
+    )
+
+    assert result["conclusion"] == "RISK_FOUND"
+    assert len(result["risk_items"]) == 1
+    assert result["risk_items"][0]["risk_type"] == "DELETION_OR_MISSING"
+    assert result["risk_items"][0]["change_type"] == "CONTENT_BLOCK_MISSING"
+    assert "连续内容" in result["risk_items"][0]["analysis_advice"]

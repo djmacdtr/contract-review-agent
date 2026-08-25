@@ -45,6 +45,46 @@ def paragraph_document(
     )
 
 
+def paged_document(
+    file_id: str,
+    pages: list[list[str]],
+    *,
+    physical_pages: bool = True,
+) -> ParsedDocument:
+    blocks = []
+    order = 0
+    paragraph_index = 0
+    for page, texts in enumerate(pages, start=1):
+        for text in texts:
+            blocks.append(
+                DocumentBlock(
+                    block_id=f"{file_id}_p{paragraph_index}",
+                    type="PARAGRAPH",
+                    order=order,
+                    raw_text=text,
+                    normalized_text=text,
+                    location=DocumentLocation(
+                        page=page,
+                        paragraph_index=paragraph_index,
+                        source="OCR",
+                        confidence=0.99,
+                    ),
+                )
+            )
+            order += 1
+            paragraph_index += 1
+    return ParsedDocument(
+        file_id=file_id,
+        role="BASELINE" if file_id == "base" else "TARGET",
+        file_name=f"{file_id}.pdf",
+        sha256="c" * 64,
+        page_count=len(pages),
+        blocks=blocks,
+        parser_name="fixture",
+        parser_metadata={"physical_page_numbers": physical_pages},
+    )
+
+
 def table_document_from_rows(
     file_id: str,
     values_by_row: list[tuple[str, ...]],
@@ -647,3 +687,258 @@ def test_incompatible_tables_fall_back_without_row_explosion() -> None:
     assert any(warning.code == "TABLE_STRUCTURE_INCOMPATIBLE" for warning in compared.warnings)
     assert not any(item.diff_type.startswith("TABLE_") for item in compared.diff_items)
     assert compared.diagnostics.compatible_table_count == 0
+
+
+def test_pdf_whole_page_deletion_is_one_confirmed_page_missing_diff() -> None:
+    baseline = paged_document(
+        "base",
+        [
+            ["第一条 双方确认本合同共同内容。"],
+            ["第二条 本页包含连续缺失内容甲。", "第三条 本页包含连续缺失内容乙。"],
+            ["第四条 双方继续履行共同内容。"],
+        ],
+    )
+    target = paged_document(
+        "target",
+        [
+            ["第一条 双方确认本合同共同内容。"],
+            ["第四条 双方继续履行共同内容。"],
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert compared.diagnostics.reliable is True
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "PAGE_MISSING"
+    assert item.certainty == "CONFIRMED"
+    assert item.missing_detail is not None
+    assert item.missing_detail.baseline_page_start == 2
+    assert item.missing_detail.baseline_page_end == 2
+    assert item.missing_detail.target_anchor_before_page == 1
+    assert item.missing_detail.target_anchor_after_page == 2
+    assert item.missing_detail.aggregated_diff_count == 2
+    assert item.target is not None and item.target.text == ""
+    assert [(segment.operation, segment.text) for segment in item.segments] == [
+        ("DELETE", item.baseline.text)
+    ]
+
+
+def test_docx_to_pdf_page_equivalent_is_inferred_page_missing() -> None:
+    common_before = "第一条 " + "共同起始内容" * 8
+    common_after = "第四条 " + "共同后续内容" * 8
+    baseline = paragraph_document(
+        "base",
+        [
+            common_before,
+            "第二条 " + "连续缺失正文甲" * 6,
+            "第三条 " + "连续缺失正文乙" * 6,
+            common_after,
+        ],
+    )
+    target = paged_document("target", [[common_before], [common_after]])
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "PAGE_MISSING"
+    assert item.certainty == "INFERRED"
+    assert item.missing_detail is not None
+    assert item.missing_detail.estimated_page_equivalent >= 0.8
+    assert item.missing_detail.structure_unit_count == 2
+
+
+def test_short_contiguous_deletion_is_content_block_missing() -> None:
+    common_before = "第一条 " + "共同起始内容" * 20
+    common_after = "第四条 " + "共同后续内容" * 20
+    baseline = paragraph_document(
+        "base",
+        [common_before, "第二条 短内容甲。", "第三条 短内容乙。", common_after],
+    )
+    target = paged_document("target", [[common_before], [common_after]])
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "CONTENT_BLOCK_MISSING"
+    assert item.certainty == "CONFIRMED"
+    assert item.missing_detail is not None
+    assert item.missing_detail.boundary == "MIDDLE"
+
+
+def test_single_long_unit_can_be_inferred_as_a_missing_page() -> None:
+    common_before = "第一条 " + "共同起始内容" * 6
+    common_after = "第三条 " + "共同后续内容" * 6
+    baseline = paragraph_document(
+        "base",
+        [common_before, "第二条 " + "单个超长正文块" * 18, common_after],
+    )
+    target = paged_document("target", [[common_before], [common_after]])
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert [item.diff_type for item in compared.diff_items] == ["PAGE_MISSING"]
+    assert compared.diff_items[0].certainty == "INFERRED"
+
+
+def test_boundary_missing_uses_document_boundary_as_anchor() -> None:
+    baseline = paged_document(
+        "base",
+        [
+            ["第一条 文件开头整页缺失内容。"],
+            ["第二条 其余合同内容保持一致。"],
+            ["第三条 合同结尾内容保持一致。"],
+        ],
+    )
+    target = paged_document(
+        "target",
+        [
+            ["第二条 其余合同内容保持一致。"],
+            ["第三条 合同结尾内容保持一致。"],
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "PAGE_MISSING"
+    assert item.certainty == "CONFIRMED"
+    assert item.missing_detail is not None
+    assert item.missing_detail.boundary == "START"
+    assert item.missing_detail.target_anchor_before_page is None
+    assert item.missing_detail.target_anchor_after_page == 1
+
+
+def test_document_end_missing_uses_document_boundary_as_anchor() -> None:
+    baseline = paged_document(
+        "base",
+        [
+            ["第一条 合同开始内容保持一致。"],
+            ["第二条 其余合同内容保持一致。"],
+            ["第三条 文件末尾整页缺失内容。"],
+        ],
+    )
+    target = paged_document(
+        "target",
+        [
+            ["第一条 合同开始内容保持一致。"],
+            ["第二条 其余合同内容保持一致。"],
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "PAGE_MISSING"
+    assert item.missing_detail is not None
+    assert item.missing_detail.boundary == "END"
+    assert item.missing_detail.target_anchor_before_page == 2
+    assert item.missing_detail.target_anchor_after_page is None
+
+
+def test_separate_missing_pages_remain_separate_aggregated_diffs() -> None:
+    baseline = paged_document(
+        "base",
+        [[f"第{page}条 第{page}页独立合同内容。"] for page in range(1, 6)],
+    )
+    target = paged_document(
+        "target",
+        [
+            ["第1条 第1页独立合同内容。"],
+            ["第3条 第3页独立合同内容。"],
+            ["第5条 第5页独立合同内容。"],
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert [item.diff_type for item in compared.diff_items] == [
+        "PAGE_MISSING",
+        "PAGE_MISSING",
+    ]
+    assert [item.missing_detail.baseline_page_start for item in compared.diff_items] == [
+        2,
+        4,
+    ]
+
+
+def test_page_sized_deletion_inside_one_target_page_is_content_block_missing() -> None:
+    common_before = "第一条 " + "共同起始内容" * 8
+    common_after = "第四条 " + "共同后续内容" * 8
+    baseline = paragraph_document(
+        "base",
+        [
+            common_before,
+            "第二条 " + "连续缺失正文甲" * 8,
+            "第三条 " + "连续缺失正文乙" * 8,
+            common_after,
+        ],
+    )
+    target = paged_document("target", [[common_before, common_after]])
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert [item.diff_type for item in compared.diff_items] == [
+        "CONTENT_BLOCK_MISSING"
+    ]
+
+
+def test_content_moved_to_another_position_is_not_labeled_missing() -> None:
+    baseline = paragraph_document(
+        "base",
+        [
+            "第一条 共同开始。",
+            "第二条 移动内容甲。",
+            "第三条 移动内容乙。",
+            "第四条 共同中段。",
+            "第五条 共同结尾。",
+        ],
+    )
+    target = paragraph_document(
+        "target",
+        [
+            "第一条 共同开始。",
+            "第四条 共同中段。",
+            "第五条 共同结尾。",
+            "第二条 移动内容甲。",
+            "第三条 移动内容乙。",
+        ],
+    )
+
+    compared = compare_documents(baseline, target, CompareOptions())
+
+    assert not any(
+        item.diff_type in {"PAGE_MISSING", "CONTENT_BLOCK_MISSING"}
+        for item in compared.diff_items
+    )
+    assert {item.diff_type for item in compared.diff_items} == {"ADDED", "DELETED"}
+
+
+def test_large_confirmed_page_range_uses_effective_coverage() -> None:
+    baseline_pages = [
+        [f"第{page}条 " + ("合同页面内容" * 8)] for page in range(1, 11)
+    ]
+    target_pages = [baseline_pages[0], baseline_pages[-1]]
+
+    compared = compare_documents(
+        paged_document("base", baseline_pages),
+        paged_document("target", target_pages),
+        CompareOptions(),
+    )
+
+    assert compared.diagnostics.alignment_coverage_baseline < 0.3
+    assert compared.diagnostics.effective_alignment_coverage_baseline == 1.0
+    assert compared.diagnostics.reliable is True
+    assert len(compared.diff_items) == 1
+    item = compared.diff_items[0]
+    assert item.diff_type == "PAGE_MISSING"
+    assert item.missing_detail is not None
+    assert (
+        item.missing_detail.baseline_page_start,
+        item.missing_detail.baseline_page_end,
+    ) == (2, 9)

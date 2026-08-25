@@ -62,6 +62,10 @@ class ResultMetadata(BaseModel):
     rules_version: str
     primary_model: str | None
     model_runs: list[dict[str, Any]]
+    independent_review: bool | None = None
+    review_mode: Literal[
+        "NOT_RUN", "INDEPENDENT_MODEL", "SAME_MODEL_DIAGNOSTIC"
+    ] | None = None
 
 
 class RiskItem(BaseModel):

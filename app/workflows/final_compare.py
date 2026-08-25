@@ -32,8 +32,8 @@ from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.5.0"
-FINAL_COMPARE_RULES_VERSION = "0.5.0"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.6.0"
+FINAL_COMPARE_RULES_VERSION = "0.6.0"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -98,6 +98,15 @@ class FinalCompareWorkflowExecutor:
                     ignore_headers_footers=raw_options.get("ignore_headers_footers", True),
                     numeric_sensitive=raw_options.get("numeric_sensitive", True),
                     ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
+                    page_missing_min_equivalent=(
+                        self.settings.PAGE_MISSING_MIN_EQUIVALENT
+                    ),
+                    page_missing_min_anchor_similarity=(
+                        self.settings.PAGE_MISSING_MIN_ANCHOR_SIMILARITY
+                    ),
+                    page_missing_min_structure_units=(
+                        self.settings.PAGE_MISSING_MIN_STRUCTURE_UNITS
+                    ),
                 ),
             )
             if not compared.diagnostics.reliable:

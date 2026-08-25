@@ -36,9 +36,20 @@ async def test_docx_parser_preserves_paragraph_table_order_and_locations(tmp_pat
     document.save(path)
 
     parsed = await DocxParser().parse(
-        local_file(path, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        local_file(
+            path,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        )
     )
-    assert [block.type for block in parsed.blocks] == ["PARAGRAPH", "PARAGRAPH", "TABLE", "PARAGRAPH"]
+    assert [block.type for block in parsed.blocks] == [
+        "PARAGRAPH",
+        "PARAGRAPH",
+        "TABLE",
+        "PARAGRAPH",
+    ]
     table_block = parsed.blocks[2]
     assert table_block.table is not None
     assert table_block.table.rows[1].cells[1].raw_text == "100万元"
@@ -58,6 +69,7 @@ async def test_text_pdf_parser_has_page_locations_and_rejects_empty_pdf(tmp_path
     )
     assert parsed.page_count == 2
     assert {block.location.page for block in parsed.blocks} == {1, 2}
+    assert parsed.parser_metadata["physical_page_numbers"] is True
 
     empty_path = tmp_path / "empty.pdf"
     empty = Canvas(str(empty_path))

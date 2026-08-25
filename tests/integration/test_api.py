@@ -132,5 +132,10 @@ async def test_draft_openapi_example_omits_reference_type(client) -> None:
     example = schema["components"]["schemas"]["DraftReviewCreate"]["example"]
     assert "reference_type" not in example["reference_files"][0]
     assert "severity" not in schema["components"]["schemas"]["DiffItem"]["properties"]
+    diff_schema = schema["components"]["schemas"]["DiffItem"]
+    assert {"certainty", "missing_detail"} <= diff_schema["properties"].keys()
+    assert {"PAGE_MISSING", "CONTENT_BLOCK_MISSING"} <= set(
+        diff_schema["properties"]["diff_type"]["enum"]
+    )
     statistics = schema["components"]["schemas"]["ResultStatistics"]["properties"]
     assert {"risk_count", "review_count", "passed_check_count"} <= statistics.keys()

@@ -28,11 +28,24 @@ export interface DocumentLocation {
 }
 export interface DiffSide { file_id: string; location: DocumentLocation; locations?: DocumentLocation[]; text: string }
 export interface DiffSegment { operation: 'EQUAL' | 'DELETE' | 'INSERT'; text: string }
+export interface MissingDetail {
+  boundary: 'START' | 'MIDDLE' | 'END'
+  estimated_page_equivalent?: number
+  baseline_page_start?: number
+  baseline_page_end?: number
+  target_anchor_before_page?: number
+  target_anchor_after_page?: number
+  structure_unit_count: number
+  aggregated_diff_count: number
+  content_summary: string
+}
 export interface DiffItem {
   diff_id: string
-  diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED'
+  diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED' | 'PAGE_MISSING' | 'CONTENT_BLOCK_MISSING'
   title: string; baseline?: DiffSide; target?: DiffSide; segments: DiffSegment[]; confidence: number; requires_manual_review: boolean
   review_reason?: 'OCR_SINGLE_CHAR_VARIANCE' | 'OCR_PLACEHOLDER_VARIANCE' | 'OCR_READING_ORDER_VARIANCE' | 'OCR_LOW_CONFIDENCE_VARIANCE'
+  certainty?: 'CONFIRMED' | 'INFERRED'
+  missing_detail?: MissingDetail
 }
 export interface ResultFile {
   file_id: string; role: string; file_name: string; safe_url: string; sha256?: string; page_count?: number
@@ -45,6 +58,7 @@ export interface ComparisonDiagnostics {
   baseline_unit_count: number; target_unit_count: number; aligned_unit_count: number
   unmatched_baseline_count: number; unmatched_target_count: number
   alignment_coverage_baseline: number; alignment_coverage_target: number
+  effective_alignment_coverage_baseline?: number; explained_missing_baseline_count?: number
   unmatched_ratio_baseline: number; unmatched_ratio_target: number
   global_text_similarity: number; candidate_diff_count: number; emitted_diff_count: number
   compatible_table_count: number; fallback_mode: string; reasons: string[]

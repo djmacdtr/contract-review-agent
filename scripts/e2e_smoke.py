@@ -77,8 +77,8 @@ def main() -> None:
                 assert result_data["schema_version"] == "2.1"
                 assert result_data["mock"] is False
                 assert result_data["metadata"]["execution_mode"] == "RULE_BASED"
-                assert result_data["metadata"]["workflow_version"] == "0.6.0"
-                assert result_data["metadata"]["rules_version"] == "0.5.0"
+                assert result_data["metadata"]["workflow_version"] == "0.7.0"
+                assert result_data["metadata"]["rules_version"] == "0.6.0"
                 assert result_data["conclusion"] == "PASS"
                 assert result_data["summary"]["statistics"]["risk_count"] == 0
                 assert len(result_data["files"]) == 3

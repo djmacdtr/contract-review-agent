@@ -112,6 +112,30 @@ def test_filled_template_placeholder_is_filtered_but_retained_for_traceability()
     assert filtered.diff.baseline and filtered.diff.target
 
 
+def test_draft_template_aggregates_contiguous_missing_content() -> None:
+    template = paragraph_document(
+        "fil_template",
+        "TEMPLATE",
+        "第一条 共同开始内容。",
+        "第二条 连续缺失内容甲。",
+        "第三条 连续缺失内容乙。",
+        "第四条 共同结束内容。",
+    )
+    target = paragraph_document(
+        "fil_target",
+        "TARGET",
+        "第一条 共同开始内容。",
+        "第四条 共同结束内容。",
+    )
+
+    result = analyze_template(template, target)
+
+    assert len(result.diff_items) == 1
+    assert result.diff_items[0].diff_type == "CONTENT_BLOCK_MISSING"
+    assert result.diff_items[0].missing_detail is not None
+    assert result.diff_items[0].missing_detail.structure_unit_count == 2
+
+
 def test_unreplaced_placeholder_and_blank_marker_fail_with_locations() -> None:
     template = paragraph_document(
         "fil_template",

@@ -308,8 +308,8 @@ async def test_real_draft_review_worker_parses_all_files_and_persists_metadata(t
     assert stored.result["mock"] is False
     assert stored.result["metadata"]["execution_mode"] == "RULE_BASED"
     assert stored.result["schema_version"] == "2.1"
-    assert stored.result["metadata"]["workflow_version"] == "0.6.0"
-    assert stored.result["metadata"]["rules_version"] == "0.5.0"
+    assert stored.result["metadata"]["workflow_version"] == "0.7.0"
+    assert stored.result["metadata"]["rules_version"] == "0.6.0"
     assert stored.result["conclusion"] == "PASS"
     assert task.risk_count == 0
     assert task.review_count == stored.result["summary"]["statistics"]["review_count"]

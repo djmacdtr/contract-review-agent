@@ -15,6 +15,7 @@ class LlmResult:
 
 class ContractLlmClient(Protocol):
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult: ...
     async def map_facts(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult: ...
@@ -51,6 +52,18 @@ class MockContractLlmClient:
                 "evidence_complete": False,
             },
             configured_model=f"{self.model}-reviewer",
+            actual_model=None,
+            mock=True,
+        )
+
+    async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult:
+        return LlmResult(
+            value={
+                "file_id": payload.get("file_id", "unknown"),
+                "semantic_concepts": [],
+                "validation_specs": [],
+            },
+            configured_model=self.model,
             actual_model=None,
             mock=True,
         )

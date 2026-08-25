@@ -6,7 +6,12 @@ from app.comparison.engine import is_ocr_review_only_diff
 from app.comparison.models import DiffItem
 from app.documents.models import ProcessingWarning
 
-DELETION_CHANGE_TYPES = {"DELETED", "TABLE_ROW_DELETED"}
+DELETION_CHANGE_TYPES = {
+    "DELETED",
+    "TABLE_ROW_DELETED",
+    "PAGE_MISSING",
+    "CONTENT_BLOCK_MISSING",
+}
 
 
 def _diff_evidence(diff: DiffItem) -> list[dict[str, Any]]:
@@ -48,7 +53,11 @@ def build_risk_items(
                 "risk_type": risk_type,
                 "change_type": diff.diff_type,
                 "title": diff.title,
-                "description": "检测到未经允许的确定性内容差异，请结合来源证据处理。",
+                "description": (
+                    "当前文件未找到基准文件对应的连续内容，请结合缺失范围和来源文件核对。"
+                    if diff.diff_type in {"PAGE_MISSING", "CONTENT_BLOCK_MISSING"}
+                    else "检测到未经允许的确定性内容差异，请结合来源证据处理。"
+                ),
                 "source_evidence": _diff_evidence(diff),
                 "related_diff_ids": [diff.diff_id],
                 "related_rule_ids": [],

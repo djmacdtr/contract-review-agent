@@ -346,6 +346,9 @@ def analyze_template(
     ignore_headers_footers: bool = True,
     check_blank_fields: bool = True,
     ocr_low_confidence_threshold: float = 0.8,
+    page_missing_min_equivalent: float = 0.8,
+    page_missing_min_anchor_similarity: float = 0.85,
+    page_missing_min_structure_units: int = 2,
 ) -> TemplateReviewResult:
     comparison = compare_documents(
         _without_tables(template),
@@ -355,6 +358,9 @@ def analyze_template(
             ignore_headers_footers=ignore_headers_footers,
             numeric_sensitive=True,
             ocr_low_confidence_threshold=ocr_low_confidence_threshold,
+            page_missing_min_equivalent=page_missing_min_equivalent,
+            page_missing_min_anchor_similarity=page_missing_min_anchor_similarity,
+            page_missing_min_structure_units=page_missing_min_structure_units,
         ),
     )
     table_differences, expanded_table_indexes = _compare_compatible_table_cells(

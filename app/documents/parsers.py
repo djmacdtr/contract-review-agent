@@ -42,7 +42,12 @@ class DocxParser:
                     raw = paragraph.text.strip()
                     if not raw:
                         continue
-                    section = raw if paragraph.style.name.startswith("Heading") or CLAUSE_PATTERN.match(raw) else None
+                    section = (
+                        raw
+                        if paragraph.style.name.startswith("Heading")
+                        or CLAUSE_PATTERN.match(raw)
+                        else None
+                    )
                     blocks.append(
                         DocumentBlock(
                             block_id=f"{file.file_id}_p{paragraph_index:06d}",
@@ -50,7 +55,9 @@ class DocxParser:
                             order=order,
                             raw_text=raw,
                             normalized_text=normalize_text(raw),
-                            location=DocumentLocation(paragraph_index=paragraph_index, section=section),
+                            location=DocumentLocation(
+                                paragraph_index=paragraph_index, section=section
+                            ),
                         )
                     )
                     paragraph_index += 1
@@ -71,12 +78,18 @@ class DocxParser:
                                 TableCell(
                                     raw_text=raw,
                                     normalized_text=normalize_text(raw),
-                                    location=DocumentLocation(table_index=table_index, row=row_index, column=column),
+                                    location=DocumentLocation(
+                                        table_index=table_index,
+                                        row=row_index,
+                                        column=column,
+                                    ),
                                 )
                             )
                         rows.append(TableRow(row=row_index, cells=cells))
                     parsed_table = ParsedTable(table_index=table_index, rows=rows)
-                    raw_table = "\n".join("\t".join(cell.raw_text for cell in row.cells) for row in rows)
+                    raw_table = "\n".join(
+                        "\t".join(cell.raw_text for cell in row.cells) for row in rows
+                    )
                     blocks.append(
                         DocumentBlock(
                             block_id=f"{file.file_id}_t{table_index:06d}",
@@ -92,7 +105,10 @@ class DocxParser:
                         warnings.append(
                             ProcessingWarning(
                                 code="DOCX_MERGED_CELLS_SIMPLIFIED",
-                                message=f"表格 {table_index} 包含合并单元格，已按可见单元格简化处理",
+                                message=(
+                                    f"表格 {table_index} 包含合并单元格，"
+                                    "已按可见单元格简化处理"
+                                ),
                             )
                         )
                     table_index += 1
@@ -141,7 +157,9 @@ class TextPdfParser:
                                 order=order,
                                 raw_text=raw,
                                 normalized_text=normalize_text(raw),
-                                location=DocumentLocation(page=page_number, paragraph_index=line_index),
+                                location=DocumentLocation(
+                                    page=page_number, paragraph_index=line_index
+                                ),
                             )
                         )
                         order += 1
@@ -155,7 +173,11 @@ class TextPdfParser:
                 page_count=page_count,
                 blocks=blocks,
                 parser_name=self.name,
-                parser_metadata={"pdf_tables_structured": False, "text_chars": total_chars},
+                parser_metadata={
+                    "pdf_tables_structured": False,
+                    "physical_page_numbers": True,
+                    "text_chars": total_chars,
+                },
             )
         except WorkflowError:
             raise

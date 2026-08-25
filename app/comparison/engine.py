@@ -20,6 +20,9 @@ class CompareOptions:
     ignore_headers_footers: bool = True
     numeric_sensitive: bool = True
     ocr_low_confidence_threshold: float = 0.8
+    page_missing_min_equivalent: float = 0.8
+    page_missing_min_anchor_similarity: float = 0.85
+    page_missing_min_structure_units: int = 2
 
 
 def _side(document: ParsedDocument, block: DocumentBlock) -> DiffSide:

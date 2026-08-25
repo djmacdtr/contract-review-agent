@@ -1,6 +1,7 @@
 from functools import lru_cache
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +41,10 @@ class Settings(BaseSettings):
     OCR_RETRY_BACKOFF_SECONDS: float = Field(default=0.5, ge=0, le=30)
     OCR_LOW_CONFIDENCE_THRESHOLD: float = Field(default=0.8, ge=0, le=1)
 
+    PAGE_MISSING_MIN_EQUIVALENT: float = Field(default=0.8, gt=0)
+    PAGE_MISSING_MIN_ANCHOR_SIMILARITY: float = Field(default=0.85, ge=0, le=1)
+    PAGE_MISSING_MIN_STRUCTURE_UNITS: int = Field(default=2, ge=1)
+
     LLM_ENABLED: bool = False
     LLM_PROTOCOL: str = "openai"
     LLM_BASE_URL: str = ""
@@ -53,9 +58,12 @@ class Settings(BaseSettings):
     LLM_MAX_CONCURRENCY: int = 1
     LLM_MAX_OUTPUT_TOKENS: int = 4096
     LLM_CHUNK_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
+    LLM_REVIEW_BATCH_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
+    LLM_REVIEW_CONTEXT_BLOCKS: int = Field(default=1, ge=0, le=10)
     LLM_STRUCTURE_RETRY_ATTEMPTS: int = 2
     LLM_CONSENSUS_MIN_CONFIDENCE: float = Field(default=0.85, ge=0, le=1)
     LLM_REQUIRE_INDEPENDENT_MODEL: bool = True
+    LLM_SAME_MODEL_DIAGNOSTIC: bool = False
     LLM_NATIVE_STRUCTURED_OUTPUT: bool = False
     LLM_ENABLE_EMBEDDING: bool = False
     LLM_ENABLE_RERANK: bool = False
@@ -75,6 +83,23 @@ class Settings(BaseSettings):
         return self.LLM_ENABLED and all(
             value.strip() for value in (self.LLM_BASE_URL, self.LLM_API_KEY)
         )
+
+    @model_validator(mode="after")
+    def validate_llm_review_mode(self) -> Self:
+        if not self.LLM_REQUIRE_INDEPENDENT_MODEL:
+            raise ValueError(
+                "LLM_REQUIRE_INDEPENDENT_MODEL must remain true; use "
+                "LLM_SAME_MODEL_DIAGNOSTIC for non-consensus development runs"
+            )
+        if self.LLM_SAME_MODEL_DIAGNOSTIC and self.APP_ENV.casefold() not in {
+            "development",
+            "test",
+            "evaluation",
+        }:
+            raise ValueError(
+                "LLM_SAME_MODEL_DIAGNOSTIC is only allowed in development, test, or evaluation"
+            )
+        return self
 
 
 @lru_cache

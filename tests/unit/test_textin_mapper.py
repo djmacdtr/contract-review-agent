@@ -59,6 +59,7 @@ def test_mapper_preserves_paragraph_table_location_and_confidence(tmp_path: Path
     assert document.parser_metadata["table_count"] == 1
     assert document.parser_metadata["cell_count"] == 4
     assert document.parser_metadata["detail_page_count"] == 1
+    assert document.parser_metadata["physical_page_numbers"] is True
     assert document.parser_metadata["bbox_block_count"] == 2
     assert document.parser_metadata["bbox_cell_count"] == 4
     assert [block.type for block in document.blocks] == ["PARAGRAPH", "TABLE"]

@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from app.core.config import Settings
 from app.core.ids import new_file_id, new_request_id, new_task_id
 from app.core.logging import configure_logging
@@ -29,7 +31,31 @@ def test_llm_configuration_defaults() -> None:
     assert settings.LLM_ADVICE_MODEL == "GLM-5.2"
     assert settings.LLM_ENABLE_EMBEDDING is False
     assert settings.LLM_ENABLE_RERANK is False
+    assert settings.LLM_REVIEW_BATCH_MAX_CHARS == 12000
+    assert settings.LLM_REVIEW_CONTEXT_BLOCKS == 1
+    assert settings.LLM_SAME_MODEL_DIAGNOSTIC is False
+    assert settings.PAGE_MISSING_MIN_EQUIVALENT == 0.8
+    assert settings.PAGE_MISSING_MIN_ANCHOR_SIMILARITY == 0.85
+    assert settings.PAGE_MISSING_MIN_STRUCTURE_UNITS == 2
     assert settings.llm_configured is False
+
+
+def test_same_model_diagnostic_is_explicit_and_non_production_only() -> None:
+    diagnostic = Settings(
+        _env_file=None,
+        APP_ENV="evaluation",
+        LLM_SAME_MODEL_DIAGNOSTIC=True,
+    )
+    assert diagnostic.LLM_REQUIRE_INDEPENDENT_MODEL is True
+
+    with pytest.raises(ValueError, match="only allowed"):
+        Settings(
+            _env_file=None,
+            APP_ENV="production",
+            LLM_SAME_MODEL_DIAGNOSTIC=True,
+        )
+    with pytest.raises(ValueError, match="must remain true"):
+        Settings(_env_file=None, LLM_REQUIRE_INDEPENDENT_MODEL=False)
 
 
 def test_llm_configuration_requires_enablement_base_url_and_key() -> None:

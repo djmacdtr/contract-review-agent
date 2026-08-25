@@ -19,6 +19,18 @@ class DiffSegment(BaseModel):
     text: str
 
 
+class MissingDetail(BaseModel):
+    boundary: Literal["START", "MIDDLE", "END"]
+    estimated_page_equivalent: float | None = Field(default=None, ge=0)
+    baseline_page_start: int | None = Field(default=None, ge=1)
+    baseline_page_end: int | None = Field(default=None, ge=1)
+    target_anchor_before_page: int | None = Field(default=None, ge=1)
+    target_anchor_after_page: int | None = Field(default=None, ge=1)
+    structure_unit_count: int = Field(ge=1)
+    aggregated_diff_count: int = Field(ge=1)
+    content_summary: str
+
+
 class DiffItem(BaseModel):
     diff_id: str
     diff_type: Literal[
@@ -29,6 +41,8 @@ class DiffItem(BaseModel):
         "TABLE_ROW_ADDED",
         "TABLE_ROW_DELETED",
         "TABLE_CELL_CHANGED",
+        "PAGE_MISSING",
+        "CONTENT_BLOCK_MISSING",
     ]
     title: str
     baseline: DiffSide | None
@@ -42,6 +56,8 @@ class DiffItem(BaseModel):
         "OCR_READING_ORDER_VARIANCE",
         "OCR_LOW_CONFIDENCE_VARIANCE",
     ] | None = None
+    certainty: Literal["CONFIRMED", "INFERRED"] | None = None
+    missing_detail: MissingDetail | None = None
 
 
 class ComparisonDiagnostics(BaseModel):
@@ -53,6 +69,8 @@ class ComparisonDiagnostics(BaseModel):
     unmatched_target_count: int
     alignment_coverage_baseline: float = Field(ge=0, le=1)
     alignment_coverage_target: float = Field(ge=0, le=1)
+    effective_alignment_coverage_baseline: float = Field(default=0, ge=0, le=1)
+    explained_missing_baseline_count: int = Field(default=0, ge=0)
     unmatched_ratio_baseline: float = Field(ge=0, le=1)
     unmatched_ratio_target: float = Field(ge=0, le=1)
     global_text_similarity: float = Field(ge=0, le=1)

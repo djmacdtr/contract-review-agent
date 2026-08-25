@@ -1,6 +1,9 @@
 from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
 from app.adapters.llm.schemas import (
     AdviceResponse,
+    CompactDocumentFactExtraction,
+    CompactDocumentProfile,
+    CompactFactCandidate,
     DocumentFactExtraction,
     DocumentProfile,
     FactCandidate,
@@ -10,11 +13,15 @@ from app.adapters.llm.schemas import (
     FactReview,
     FactReviewDecision,
     SemanticConcept,
+    SemanticPlanResponse,
     ValidationSpec,
 )
 
 __all__ = [
     "DocumentFactExtraction",
+    "CompactDocumentFactExtraction",
+    "CompactDocumentProfile",
+    "CompactFactCandidate",
     "DocumentProfile",
     "FactCandidate",
     "FactMapping",
@@ -23,6 +30,7 @@ __all__ = [
     "FactReview",
     "FactReviewDecision",
     "SemanticConcept",
+    "SemanticPlanResponse",
     "ValidationSpec",
     "AdviceResponse",
     "LlmClientError",

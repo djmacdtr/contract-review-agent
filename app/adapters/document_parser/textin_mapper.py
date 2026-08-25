@@ -238,6 +238,7 @@ def map_textin_document(
         parser_name="textin-document-parser",
         parser_metadata={
             "ocr": True,
+            "physical_page_numbers": True,
             "engine_version": response.data.version,
             "duration_ms": response.data.duration,
             "response_size_bytes": response._response_size_bytes,

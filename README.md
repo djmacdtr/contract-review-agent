@@ -1,6 +1,6 @@
 # 合同智能检查 Agent
 
-这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.5.0` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、可靠性失败门和风险级批量建议；`DRAFT_REVIEW 0.6.0 / rules 0.5.0` 已支持真实多文档解析、模板确定性检查、目标合同中心的跨资料事实映射、双模型共识、声明式数值校验和动态通过项。结果继续使用 Schema 2.1，不设置风险等级；新任务成功时只产生 `RISK_FOUND` 或 `PASS`，检查不完整时任务直接失败。
+这是方案 v0.2.2 的合同检查工程：FastAPI、PostgreSQL 持久化任务队列、独立 Worker、LangGraph 工作流和 Vue 3 测试控制台。`FINAL_COMPARE 0.6.0` 已支持受控 URL 下载、配对一致的文档解析、可追溯 N:M 条款对齐、真实缺页聚合、可靠性失败门和风险级批量建议；`DRAFT_REVIEW 0.7.0 / rules 0.6.0` 已支持真实多文档解析、模板确定性检查、目标合同中心的跨资料事实映射、双模型共识、声明式数值校验、真实缺页聚合和动态通过项。结果继续使用 Schema 2.1，不设置风险等级；正式任务成功时只产生 `RISK_FOUND` 或 `PASS`，检查不完整时任务直接失败。
 
 > 所有结果都不构成合同审查、法律审核或放款意见。FINAL_COMPARE 标记为 `RULE_BASED`；OCR 只负责文档结构解析，不检查印章。LLM 默认关闭；启用的事实抽取、独立评审或跨文件映射未完成时任务失败，只有补充性的 Advice 生成允许使用确定性建议安全降级。
 
@@ -146,9 +146,16 @@ docker volume inspect contract-review-postgres-data
 - DRAFT_REVIEW 的 `reference_type` 已弃用并被忽略；新请求只传 URL、文件名和可选 MIME/展示名，系统分类将在后续 LLM 阶段作为输出提供。
 - DRAFT_REVIEW 逐份真实解析：DOCX 使用 `python-docx`，PDF 使用外部解析器 `auto`；目标合同与模板正文使用可靠对齐，允许填写项保留过滤轨迹，无法可靠处理的扩展表格会令任务失败。结果标记为 `RULE_BASED` 或 `HYBRID`、`mock=false`。
 - `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
-- 新任务结果固定使用 `schema_version=2.1`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；实际启用、可靠完成且未发现对应风险的动态检查进入 `passed_checks`。成功结果固定 `review_items=[]`、`review_count=0`，结论只为 `RISK_FOUND` 或 `PASS`；解析、OCR、对齐或已启用动态能力未完成时任务直接失败。旧结果的 review/warning 字段和 `REVIEW_REQUIRED` 继续兼容读取。
+- 正式新任务结果固定使用 `schema_version=2.1`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；实际启用、可靠完成且未发现对应风险的动态检查进入 `passed_checks`。正式成功结果固定 `review_items=[]`、`review_count=0`，结论只为 `RISK_FOUND` 或 `PASS`；解析、OCR、对齐或已启用动态能力未完成时任务直接失败。显式同模诊断是开发环境例外，只能输出 `REVIEW_REQUIRED/RISK_FOUND` 和待复核项。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
 - `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
+- `PAGE_MISSING_MIN_EQUIVALENT=0.8`、`PAGE_MISSING_MIN_ANCHOR_SIMILARITY=0.85` 和 `PAGE_MISSING_MIN_STRUCTURE_UNITS=2` 控制连续缺失内容的页级识别；缺失规模不会单独触发任务失败。
+- `LLM_REVIEW_BATCH_MAX_CHARS=12000` 与 `LLM_REVIEW_CONTEXT_BLOCKS=1` 将事实评审限制为候选证据块及邻近上下文，并按 payload 大小分批；不会把整份长合同一次性发送给评审模型。
+- DRAFT_REVIEW 事实抽取使用紧凑两阶段链路：第一阶段只返回开放式 profile/facts，证据正文由程序按位置回查；数值候选由程序高召回定位并交给模型分类。事实完成证据评审和跨文档映射后，内部 `plan_semantics` 才生成动态语义概念及声明式数值规则；该步骤不改变公开 API，也不接入 FINAL_COMPARE。
+- 紧凑抽取和语义规划均限制数组、字段长度及数值 AST 深度/节点数；超过安全边界时分批处理或失败，不静默截断。抽取阶段不生成 `missing_field_keys`、`semantic_concepts` 或 `validation_specs`，完整结果字段由程序兼容性回填。
+- 事实评审的 JSON Schema 至少要求一个决策，并按当前批次候选数动态设置 `minItems=maxItems=N`；Adapter 继续校验候选身份恰好覆盖一次，失败时最多执行一次只包含遗漏身份的结构纠错。
+- `LLM_SAME_MODEL_DIAGNOSTIC=false` 仅供 development/test/evaluation 显式联调。同模型评审不会形成独立共识、模型风险或模型通过项，且不能生成正式 `PASS`；正式模式必须保持 `LLM_REQUIRE_INDEPENDENT_MODEL=true`。
+- 模型事实与跨文档映射只补充跨文档一致性分析，不能删除、合并、过滤或覆盖确定性文本对齐生成的原始版本差异。
 
 ### 本机真实 OCR 验证
 

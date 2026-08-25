@@ -6,6 +6,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from statistics import median
 from typing import Protocol
 
 from rapidfuzz.fuzz import ratio
@@ -16,6 +17,7 @@ from app.comparison.models import (
     DiffItem,
     DiffSegment,
     DiffSide,
+    MissingDetail,
 )
 from app.documents.models import (
     DocumentBlock,
@@ -76,6 +78,9 @@ class CompareOptionsLike(Protocol):
     ignore_headers_footers: bool
     numeric_sensitive: bool
     ocr_low_confidence_threshold: float
+    page_missing_min_equivalent: float
+    page_missing_min_anchor_similarity: float
+    page_missing_min_structure_units: int
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,22 @@ class AlignmentOutcome:
     coverage_target: float
     unmatched_baseline: int
     unmatched_target: int
+
+
+@dataclass(frozen=True)
+class MissingRange:
+    start_step: int
+    end_step: int
+    units: tuple[ComparableUnit, ...]
+    target_anchors: tuple[ComparableUnit, ...]
+    boundary: str
+    diff_type: str
+    certainty: str
+    estimated_page_equivalent: float | None
+    baseline_page_start: int | None
+    baseline_page_end: int | None
+    target_anchor_before_page: int | None
+    target_anchor_after_page: int | None
 
 
 @dataclass(frozen=True)
@@ -567,6 +588,212 @@ def _page_flat(document: ComparableDocument) -> ComparableDocument | None:
     return ComparableDocument(source=document.source, units=tuple(units))
 
 
+def _has_physical_pages(document: ComparableDocument) -> bool:
+    return bool(
+        document.source.page_count
+        and document.source.parser_metadata.get("physical_page_numbers") is not False
+        and document.units
+        and all(unit.page is not None for unit in document.units)
+    )
+
+
+def _page_character_median(document: ComparableDocument) -> float | None:
+    if not _has_physical_pages(document):
+        return None
+    by_page: dict[int, int] = {}
+    for unit in document.units:
+        assert unit.page is not None
+        by_page[unit.page] = by_page.get(unit.page, 0) + len(unit.match_text)
+    values = [value for value in by_page.values() if value]
+    return float(median(values)) if values else None
+
+
+def _whole_physical_pages(
+    units: tuple[ComparableUnit, ...], document: ComparableDocument
+) -> tuple[int, int] | None:
+    if not _has_physical_pages(document) or any(unit.page is None for unit in units):
+        return None
+    pages = sorted({unit.page for unit in units if unit.page is not None})
+    if not pages or pages != list(range(pages[0], pages[-1] + 1)):
+        return None
+    unit_ids = {unit.unit_id for unit in units}
+    page_unit_ids = {
+        unit.unit_id for unit in document.units if unit.page is not None and unit.page in pages
+    }
+    return (pages[0], pages[-1]) if unit_ids == page_unit_ids else None
+
+
+def _is_probably_moved(
+    units: tuple[ComparableUnit, ...], target: ComparableDocument
+) -> bool:
+    total = sum(len(unit.match_text) for unit in units)
+    if not total:
+        return False
+    matched = 0
+    for unit in units:
+        if any(
+            unit.match_text == candidate.match_text
+            or (
+                unit.clause_key is not None
+                and unit.clause_key == candidate.clause_key
+                and min(len(unit.match_text), len(candidate.match_text)) >= 12
+                and ratio(unit.match_text, candidate.match_text) >= 92
+            )
+            for candidate in target.units
+        ):
+            matched += len(unit.match_text)
+    return matched / total >= 0.8
+
+
+def _moved_unit_ids(outcome: AlignmentOutcome) -> tuple[set[str], set[str]]:
+    unmatched_baseline = [
+        unit
+        for step in outcome.steps
+        if step.baseline and not step.target
+        for unit in step.baseline
+    ]
+    unmatched_target = [
+        unit
+        for step in outcome.steps
+        if step.target and not step.baseline
+        for unit in step.target
+    ]
+    target_by_text: dict[str, list[ComparableUnit]] = {}
+    for unit in unmatched_target:
+        target_by_text.setdefault(unit.match_text, []).append(unit)
+    moved_baseline: set[str] = set()
+    moved_target: set[str] = set()
+    for unit in unmatched_baseline:
+        candidates = target_by_text.get(unit.match_text, [])
+        candidate = next(
+            (item for item in candidates if item.unit_id not in moved_target), None
+        )
+        if candidate is not None:
+            moved_baseline.add(unit.unit_id)
+            moved_target.add(candidate.unit_id)
+    return moved_baseline, moved_target
+
+
+def _nearest_aligned_step(
+    steps: tuple[AlignmentStep, ...], start: int, direction: int
+) -> AlignmentStep | None:
+    index = start
+    while 0 <= index < len(steps):
+        step = steps[index]
+        if step.baseline and step.target:
+            return step
+        index += direction
+    return None
+
+
+def _anchor_page(step: AlignmentStep | None, *, last: bool) -> int | None:
+    if step is None or not step.target:
+        return None
+    units = reversed(step.target) if last else iter(step.target)
+    return next((unit.page for unit in units if unit.page is not None), None)
+
+
+def _missing_ranges(
+    outcome: AlignmentOutcome,
+    baseline: ComparableDocument,
+    target: ComparableDocument,
+    options: CompareOptionsLike,
+) -> list[MissingRange]:
+    ranges: list[MissingRange] = []
+    index = 0
+    page_median = _page_character_median(target) or _page_character_median(baseline)
+    while index < len(outcome.steps):
+        step = outcome.steps[index]
+        if not step.baseline or step.target:
+            index += 1
+            continue
+        start = index
+        deleted: list[ComparableUnit] = []
+        while index < len(outcome.steps):
+            current = outcome.steps[index]
+            if not current.baseline or current.target:
+                break
+            deleted.extend(current.baseline)
+            index += 1
+        end = index - 1
+        units = tuple(deleted)
+        if _is_probably_moved(units, target):
+            continue
+        before = _nearest_aligned_step(outcome.steps, start - 1, -1)
+        after = _nearest_aligned_step(outcome.steps, end + 1, 1)
+        boundary = "START" if before is None else "END" if after is None else "MIDDLE"
+        required_anchors = [candidate for candidate in (before, after) if candidate is not None]
+        anchors_reliable = bool(required_anchors) and all(
+            candidate.similarity >= options.page_missing_min_anchor_similarity
+            for candidate in required_anchors
+        )
+        if not anchors_reliable:
+            continue
+        target_anchors = tuple(
+            unit
+            for candidate in (before, after)
+            if candidate is not None
+            for unit in candidate.target
+        )
+        missing_chars = sum(len(unit.match_text) for unit in units)
+        estimated = missing_chars / page_median if page_median else None
+        before_page = _anchor_page(before, last=True)
+        after_page = _anchor_page(after, last=False)
+        target_page_boundary_supported = bool(
+            boundary != "MIDDLE"
+            or not _has_physical_pages(target)
+            or (
+                before_page is not None
+                and after_page is not None
+                and after_page == before_page + 1
+            )
+        )
+        exact_pages = (
+            _whole_physical_pages(units, baseline)
+            if _has_physical_pages(baseline)
+            and _has_physical_pages(target)
+            and target_page_boundary_supported
+            else None
+        )
+        enough_units = len(units) >= options.page_missing_min_structure_units
+        page_sized = bool(
+            estimated is not None
+            and estimated >= options.page_missing_min_equivalent
+            and target_page_boundary_supported
+            and (enough_units or len(units) == 1)
+        )
+        if exact_pages:
+            diff_type, certainty = "PAGE_MISSING", "CONFIRMED"
+        elif page_sized:
+            diff_type, certainty = "PAGE_MISSING", "INFERRED"
+        elif enough_units:
+            diff_type, certainty = "CONTENT_BLOCK_MISSING", "CONFIRMED"
+        else:
+            continue
+        ranges.append(
+            MissingRange(
+                start_step=start,
+                end_step=end,
+                units=units,
+                target_anchors=target_anchors,
+                boundary=boundary,
+                diff_type=diff_type,
+                certainty=certainty,
+                estimated_page_equivalent=estimated,
+                baseline_page_start=exact_pages[0] if exact_pages else None,
+                baseline_page_end=exact_pages[1] if exact_pages else None,
+                target_anchor_before_page=before_page,
+                target_anchor_after_page=after_page,
+            )
+        )
+    return ranges
+
+
+def _content_summary(text: str, limit: int = 180) -> str:
+    value = " ".join(comparison_display_text(text).split())
+    return value if len(value) <= limit else f"{value[:limit]}…"
+
+
 def build_diff_segments(
     before: str, after: str
 ) -> tuple[list[DiffSegment], str, str]:
@@ -690,6 +917,61 @@ def _make_diff(
     )
 
 
+def _make_missing_diff(
+    index: int,
+    missing: MissingRange,
+    baseline: ParsedDocument,
+    target: ParsedDocument,
+) -> DiffItem:
+    text = comparison_display_text(_join_raw(missing.units))
+    target_locations = [
+        location for unit in missing.target_anchors for location in unit.locations
+    ]
+    if missing.diff_type == "PAGE_MISSING":
+        title = (
+            "页面内容缺失"
+            if missing.certainty == "CONFIRMED"
+            else "疑似整页或连续大段内容缺失"
+        )
+    else:
+        title = {
+            "START": "文档开头内容缺失",
+            "MIDDLE": "连续内容块缺失",
+            "END": "文档末尾内容缺失",
+        }[missing.boundary]
+    confidence_values = [unit.confidence for unit in (*missing.units, *missing.target_anchors)]
+    return DiffItem(
+        diff_id=f"diff_{index:06d}",
+        diff_type=missing.diff_type,
+        title=title,
+        baseline=_side(baseline, missing.units, text=text),
+        target=DiffSide(
+            file_id=target.file_id,
+            location=target_locations[0],
+            locations=target_locations,
+            text="",
+        ),
+        segments=[DiffSegment(operation="DELETE", text=text)],
+        confidence=round(min(confidence_values), 4),
+        certainty=missing.certainty,
+        missing_detail=MissingDetail(
+            boundary=missing.boundary,
+            estimated_page_equivalent=(
+                round(missing.estimated_page_equivalent, 2)
+                if missing.estimated_page_equivalent is not None
+                else None
+            ),
+            baseline_page_start=missing.baseline_page_start,
+            baseline_page_end=missing.baseline_page_end,
+            target_anchor_before_page=missing.target_anchor_before_page,
+            target_anchor_after_page=missing.target_anchor_after_page,
+            structure_unit_count=len(missing.units),
+            aggregated_diff_count=missing.end_step - missing.start_step + 1,
+            content_summary=_content_summary(text),
+        ),
+    )
+
+
 def _numeric_changed(before: str, after: str) -> bool:
     return NUMBER_PATTERN.findall(before) != NUMBER_PATTERN.findall(after) and bool(
         NUMBER_PATTERN.search(before) and NUMBER_PATTERN.search(after)
@@ -701,9 +983,24 @@ def _candidate_diffs(
     baseline: ParsedDocument,
     target: ParsedDocument,
     options: CompareOptionsLike,
+    missing_ranges: list[MissingRange],
 ) -> list[DiffItem]:
     differences = []
-    for step in outcome.steps:
+    missing_by_start = {item.start_step: item for item in missing_ranges}
+    skipped_steps = {
+        index
+        for item in missing_ranges
+        for index in range(item.start_step, item.end_step + 1)
+    }
+    for step_index, step in enumerate(outcome.steps):
+        missing = missing_by_start.get(step_index)
+        if missing is not None:
+            differences.append(
+                _make_missing_diff(len(differences) + 1, missing, baseline, target)
+            )
+            continue
+        if step_index in skipped_steps:
+            continue
         if step.baseline and step.target and _join_match(step.baseline) == _join_match(step.target):
             continue
         if step.baseline and step.target:
@@ -925,7 +1222,11 @@ def compare_documents_reliably(
             base, compared_target = flat_base, flat_target
             fallback_mode = "PAGE_FLAT"
     outcome = align_documents(base, compared_target)
-    candidates = _candidate_diffs(outcome, baseline, target, options)
+    missing_ranges = _missing_ranges(outcome, base, compared_target, options)
+    moved_baseline_ids, moved_target_ids = _moved_unit_ids(outcome)
+    candidates = _candidate_diffs(
+        outcome, baseline, target, options, missing_ranges
+    )
     candidates.extend(
         _compare_table_matches(
             table_matches, baseline, target, options, start=len(candidates) + 1
@@ -935,18 +1236,84 @@ def compare_documents_reliably(
     base_count, target_count = len(base.units), len(compared_target.units)
     unmatched_base_ratio = outcome.unmatched_baseline / base_count if base_count else 0.0
     unmatched_target_ratio = outcome.unmatched_target / target_count if target_count else 0.0
+    explained_missing_ids = {
+        unit.unit_id for missing in missing_ranges for unit in missing.units
+    }
+    explained_missing_chars = sum(
+        len(unit.match_text) for unit in base.units if unit.unit_id in explained_missing_ids
+    )
+    explained_missing_count = len(explained_missing_ids)
+    moved_baseline_chars = sum(
+        len(unit.match_text) for unit in base.units if unit.unit_id in moved_baseline_ids
+    )
+    moved_target_chars = sum(
+        len(unit.match_text)
+        for unit in compared_target.units
+        if unit.unit_id in moved_target_ids
+    )
+    base_chars = sum(len(unit.match_text) for unit in base.units)
+    matched_base_chars = sum(
+        sum(len(unit.match_text) for unit in step.baseline)
+        for step in outcome.steps
+        if step.baseline and step.target
+    )
+    effective_base_chars = max(
+        0, base_chars - explained_missing_chars - moved_baseline_chars
+    )
+    effective_baseline_coverage = (
+        matched_base_chars / effective_base_chars if effective_base_chars else 1.0
+    )
+    target_chars = sum(len(unit.match_text) for unit in compared_target.units)
+    matched_target_chars = sum(
+        sum(len(unit.match_text) for unit in step.target)
+        for step in outcome.steps
+        if step.baseline and step.target
+    )
+    effective_target_chars = max(0, target_chars - moved_target_chars)
+    effective_target_coverage = (
+        matched_target_chars / effective_target_chars if effective_target_chars else 1.0
+    )
+    unexplained_base_count = max(
+        0,
+        outcome.unmatched_baseline
+        - explained_missing_count
+        - len(moved_baseline_ids),
+    )
+    unexplained_target_count = max(
+        0, outcome.unmatched_target - len(moved_target_ids)
+    )
+    unexplained_base_ratio = unexplained_base_count / base_count if base_count else 0.0
+    unexplained_target_ratio = (
+        unexplained_target_count / target_count if target_count else 0.0
+    )
     total_units = base_count + target_count
     reasons: list[str] = []
     shared_clause_keys = {
         unit.clause_key for unit in base.units if unit.clause_key
     } & {unit.clause_key for unit in compared_target.units if unit.clause_key}
-    if global_similarity < 0.3 and not shared_clause_keys:
+    strong_remaining_alignment = any(
+        step.baseline
+        and step.target
+        and step.similarity >= options.page_missing_min_anchor_similarity
+        for step in outcome.steps
+    )
+    missing_explains_low_global_similarity = bool(
+        missing_ranges
+        and strong_remaining_alignment
+        and effective_baseline_coverage >= 0.7
+        and effective_target_coverage >= 0.7
+    )
+    if (
+        global_similarity < 0.3
+        and not shared_clause_keys
+        and not missing_explains_low_global_similarity
+    ):
         reasons.append("DOCUMENT_PAIR_UNRELATED")
     if total_units >= 10 and (
-        outcome.coverage_baseline < 0.7 or outcome.coverage_target < 0.7
+        effective_baseline_coverage < 0.7 or effective_target_coverage < 0.7
     ):
         reasons.append("ALIGNMENT_UNRELIABLE")
-    if unit_ratio > 3 and max(unmatched_base_ratio, unmatched_target_ratio) > 0.3:
+    if unit_ratio > 3 and max(unexplained_base_ratio, unexplained_target_ratio) > 0.3:
         reasons.extend(["PARSER_STRUCTURE_MISMATCH", "ALIGNMENT_UNRELIABLE"])
     if global_similarity > 0.85 and len(candidates) > max(200, total_units * 0.5):
         reasons.append("ALIGNMENT_UNRELIABLE")
@@ -1007,6 +1374,8 @@ def compare_documents_reliably(
         unmatched_target_count=outcome.unmatched_target,
         alignment_coverage_baseline=round(outcome.coverage_baseline, 4),
         alignment_coverage_target=round(outcome.coverage_target, 4),
+        effective_alignment_coverage_baseline=round(effective_baseline_coverage, 4),
+        explained_missing_baseline_count=explained_missing_count,
         unmatched_ratio_baseline=round(unmatched_base_ratio, 4),
         unmatched_ratio_target=round(unmatched_target_ratio, 4),
         global_text_similarity=round(global_similarity, 4),
