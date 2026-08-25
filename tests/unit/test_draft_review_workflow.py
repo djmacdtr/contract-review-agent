@@ -669,9 +669,30 @@ async def test_dynamic_extraction_failure_logs_safe_category_only(
         "document_role": "TARGET",
         "chunk_index": 1,
         "error_category": "FACT_LOCATION_NOT_FOUND",
+        "error_code": "LLM_EXTRACTION_EVIDENCE_INVALID",
         "affected_count": 1,
         "failure_counts": {"FACT_LOCATION_NOT_FOUND": 1},
     }
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_category"),
+    [
+        ("LLM_INVALID_JSON", "LLM_RESPONSE_JSON_INVALID"),
+        ("LLM_RESPONSE_INVALID", "LLM_RESPONSE_ENVELOPE_INVALID"),
+        ("LLM_SCHEMA_INVALID", "LLM_RESPONSE_SCHEMA_INVALID"),
+    ],
+)
+def test_dynamic_failure_code_separates_response_failure_types(
+    error_code: str, expected_category: str
+) -> None:
+    assert _dynamic_failure_code(LlmClientError(error_code, "safe failure")) == expected_category
+
+
+def test_dynamic_failure_code_preserves_unknown_llm_error_code() -> None:
+    assert _dynamic_failure_code(
+        LlmClientError("LLM_SEMANTIC_PLAN_INVALID", "safe failure")
+    ) == "LLM_SEMANTIC_PLAN_INVALID"
 
 
 async def test_dynamic_schema_failure_logs_safe_validation_summary(
@@ -692,6 +713,7 @@ async def test_dynamic_schema_failure_logs_safe_validation_summary(
     assert len(events) == 1
     fields = events[0][1]
     assert fields["error_category"] == "LLM_RESPONSE_SCHEMA_INVALID"
+    assert fields["error_code"] == "LLM_SCHEMA_INVALID"
     assert fields["validation_summary_status"] == "PRESENT"
     assert fields["validation_summary"] == [
         {
@@ -717,6 +739,7 @@ async def test_dynamic_schema_failure_without_summary_logs_missing_status(
 
     assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
     fields = events[0][1]
+    assert fields["error_code"] == "LLM_SCHEMA_INVALID"
     assert fields["validation_summary_status"] == "MISSING"
     assert "validation_summary" not in fields
 

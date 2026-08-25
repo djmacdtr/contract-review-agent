@@ -74,6 +74,12 @@ def _dynamic_failure_code(exc: BaseException) -> str:
     if isinstance(exc, LlmClientError):
         if exc.failure_code:
             return exc.failure_code
+        if exc.code == "LLM_INVALID_JSON":
+            return "LLM_RESPONSE_JSON_INVALID"
+        if exc.code == "LLM_RESPONSE_INVALID":
+            return "LLM_RESPONSE_ENVELOPE_INVALID"
+        if exc.code == "LLM_SCHEMA_INVALID":
+            return "LLM_RESPONSE_SCHEMA_INVALID"
         if exc.code in {
             "LLM_TIMEOUT",
             "LLM_NETWORK_ERROR",
@@ -81,7 +87,7 @@ def _dynamic_failure_code(exc: BaseException) -> str:
             "LLM_RATE_LIMITED",
         }:
             return "LLM_UPSTREAM_FAILED"
-        return "LLM_RESPONSE_SCHEMA_INVALID"
+        return exc.code
     if isinstance(exc, ValidationError):
         return "LLM_RESPONSE_SCHEMA_INVALID"
     if isinstance(exc, TimeoutError):
@@ -300,6 +306,8 @@ class DraftReviewWorkflowExecutor:
                         "affected_count": 1,
                         "failure_counts": failure_counts,
                     }
+                    if isinstance(exc, LlmClientError):
+                        log_fields["error_code"] = exc.code
                     validation_items = _safe_validation_items(exc)
                     if error_category == "LLM_RESPONSE_SCHEMA_INVALID":
                         log_fields["validation_summary_status"] = (
