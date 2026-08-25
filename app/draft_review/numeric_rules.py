@@ -27,6 +27,8 @@ COMPARE_OPS = {
     "greater_or_equal",
 }
 _ALL_OPS = ARITHMETIC_OPS | COMPARE_OPS
+MAX_AST_NODES = 24
+MAX_AST_DEPTH = 6
 
 
 def _require_mapping(node: Any) -> dict[str, Any]:
@@ -35,9 +37,32 @@ def _require_mapping(node: Any) -> dict[str, Any]:
     return node
 
 
-def validate_ast(node: Any, *, _root: bool = True) -> None:
+def validate_ast(
+    node: Any,
+    *,
+    _root: bool = True,
+    _depth: int = 0,
+    _budget: list[int] | None = None,
+) -> None:
+    if _budget is None:
+        _budget = [0]
+    if _depth > MAX_AST_DEPTH:
+        raise NumericAstError("numeric AST exceeds maximum depth")
+    _budget[0] += 1
+    if _budget[0] > MAX_AST_NODES:
+        raise NumericAstError("numeric AST exceeds maximum node count")
     value = _require_mapping(node)
-    if set(value) - {"op", "value", "concept_id", "args", "left", "right", "tolerance"}:
+    if set(value) - {
+        "op",
+        "value",
+        "concept_id",
+        "fact_id",
+        "source_file_id",
+        "args",
+        "left",
+        "right",
+        "tolerance",
+    }:
         raise NumericAstError("numeric AST contains unsupported fields")
     op = value.get("op")
     if op == "literal":
@@ -52,11 +77,21 @@ def validate_ast(node: Any, *, _root: bool = True) -> None:
             raise NumericAstError("literal node has unsupported fields")
         return
     if op == "fact":
-        concept_id = value.get("concept_id")
-        if not isinstance(concept_id, str) or not concept_id:
-            raise NumericAstError("fact nodes require concept_id")
-        if set(value) != {"op", "concept_id"}:
-            raise NumericAstError("fact node has unsupported fields")
+        if "fact_id" in value or "source_file_id" in value:
+            fact_id = value.get("fact_id")
+            source_file_id = value.get("source_file_id")
+            if not isinstance(fact_id, str) or not fact_id:
+                raise NumericAstError("fact nodes require fact_id")
+            if not isinstance(source_file_id, str) or not source_file_id:
+                raise NumericAstError("fact nodes require source_file_id")
+            if set(value) != {"op", "fact_id", "source_file_id"}:
+                raise NumericAstError("qualified fact node has unsupported fields")
+        else:
+            concept_id = value.get("concept_id")
+            if not isinstance(concept_id, str) or not concept_id:
+                raise NumericAstError("fact nodes require concept_id")
+            if set(value) != {"op", "concept_id"}:
+                raise NumericAstError("fact node has unsupported fields")
         return
     if op not in _ALL_OPS:
         raise NumericAstError("numeric AST operation is not allowlisted")
@@ -67,7 +102,7 @@ def validate_ast(node: Any, *, _root: bool = True) -> None:
         if set(value) != {"op", "args"}:
             raise NumericAstError("arithmetic node has unsupported fields")
         for child in args:
-            validate_ast(child, _root=False)
+            validate_ast(child, _root=False, _depth=_depth + 1, _budget=_budget)
         return
     if (
         set(value) - {"op", "left", "right", "tolerance"}
@@ -86,8 +121,8 @@ def validate_ast(node: Any, *, _root: bool = True) -> None:
                 raise NumericAstError("tolerance must not be negative")
         except InvalidOperation as exc:
             raise NumericAstError("tolerance is invalid") from exc
-    validate_ast(value["left"], _root=False)
-    validate_ast(value["right"], _root=False)
+    validate_ast(value["left"], _root=False, _depth=_depth + 1, _budget=_budget)
+    validate_ast(value["right"], _root=False, _depth=_depth + 1, _budget=_budget)
 
 
 def _decimal_for_fact(fact: FactCandidate) -> Decimal:
@@ -123,6 +158,27 @@ def referenced_fact_ids(node: Any) -> set[str]:
     return references
 
 
+def referenced_fact_refs(node: Any) -> set[tuple[str, str]]:
+    """Return file-qualified references for the new semantic-plan AST."""
+
+    value = _require_mapping(node)
+    if value.get("op") == "fact":
+        fact_id = value.get("fact_id")
+        source_file_id = value.get("source_file_id")
+        if not isinstance(fact_id, str) or not isinstance(source_file_id, str):
+            raise NumericAstError("semantic fact nodes require qualified references")
+        return {(fact_id, source_file_id)}
+    references: set[tuple[str, str]] = set()
+    for key in ("args", "left", "right"):
+        child = value.get(key)
+        if isinstance(child, list):
+            for item in child:
+                references.update(referenced_fact_refs(item))
+        elif isinstance(child, dict):
+            references.update(referenced_fact_refs(child))
+    return references
+
+
 def evaluate_ast(node: Any, values: dict[str, Decimal]) -> Decimal | bool:
     validate_ast(node)
     op = node["op"]
@@ -130,7 +186,11 @@ def evaluate_ast(node: Any, values: dict[str, Decimal]) -> Decimal | bool:
         return Decimal(node["value"])
     if op == "fact":
         try:
-            value = values[node["concept_id"]]
+            key: Any = (
+                node["fact_id"],
+                node["source_file_id"],
+            ) if "fact_id" in node else node["concept_id"]
+            value = values[key]
             return value if isinstance(value, Decimal) else Decimal(str(value))
         except KeyError as exc:
             raise NumericAstError("referenced fact is missing") from exc
@@ -169,8 +229,11 @@ def evaluate_ast(node: Any, values: dict[str, Decimal]) -> Decimal | bool:
 
 def evaluate_validation_spec(
     spec: ValidationSpec,
-    facts: list[FactCandidate],
+    facts: list[FactCandidate] | dict[tuple[str, str], FactCandidate],
 ) -> dict[str, Any]:
+    if isinstance(facts, dict):
+        return _evaluate_qualified_spec(spec, facts)
+
     value_candidates: dict[str, set[Decimal]] = {}
     evidence_by_key: dict[str, list[dict[str, Any]]] = {}
     for fact in facts:
@@ -206,6 +269,83 @@ def evaluate_validation_spec(
             "message": "数值规则引用了多个不一致的事实值，需要人工复核。",
             "reason_code": "NUMERIC_RULE_AMBIGUOUS_INPUT",
             "error": f"ambiguous facts: {', '.join(ambiguous)}",
+            "source_evidence": evidence,
+        }
+    try:
+        result = evaluate_ast(spec.expression, values)
+    except NumericAstError as exc:
+        return {
+            "validation_id": spec.validation_id,
+            "rule_name": spec.display_name,
+            "status": "REVIEW_REQUIRED",
+            "message": "数值规则无法在现有事实证据上安全执行，需要人工复核。",
+            "reason_code": "NUMERIC_RULE_UNCERTAIN",
+            "error": str(exc),
+            "source_evidence": evidence,
+        }
+    if not isinstance(result, bool):
+        return {
+            "validation_id": spec.validation_id,
+            "rule_name": spec.display_name,
+            "status": "REVIEW_REQUIRED",
+            "message": "数值规则未返回布尔比较结果，需要人工复核。",
+            "reason_code": "NUMERIC_RULE_UNCERTAIN",
+            "source_evidence": evidence,
+        }
+    return {
+        "validation_id": spec.validation_id,
+        "rule_name": spec.display_name,
+        "status": "PASSED" if result else "FAILED",
+        "message": "声明式数值规则通过。" if result else "声明式数值规则未通过。",
+        "reason_code": "NUMERIC_RULE_FAILED" if not result else None,
+        "source_evidence": evidence,
+    }
+
+
+def _evaluate_qualified_spec(
+    spec: ValidationSpec,
+    fact_index: dict[tuple[str, str], FactCandidate],
+) -> dict[str, Any]:
+    try:
+        referenced = referenced_fact_refs(spec.expression)
+    except NumericAstError as exc:
+        return {
+            "validation_id": spec.validation_id,
+            "rule_name": spec.display_name,
+            "status": "REVIEW_REQUIRED",
+            "message": "数值规则引用格式不安全，需要人工复核。",
+            "reason_code": "NUMERIC_RULE_UNCERTAIN",
+            "error": str(exc),
+            "source_evidence": [],
+        }
+    values: dict[tuple[str, str], Decimal] = {}
+    evidence: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for ref in sorted(referenced):
+        fact = fact_index.get(ref)
+        if fact is None:
+            missing.append(f"{ref[0]}@{ref[1]}")
+            continue
+        try:
+            values[ref] = _decimal_for_fact(fact)
+        except NumericAstError:
+            missing.append(f"{ref[0]}@{ref[1]}")
+            continue
+        evidence.append(
+            {
+                "file_id": fact.source_file_id,
+                "text": fact.evidence_text,
+                "location": fact.location.model_dump(mode="json", exclude_none=True),
+            }
+        )
+    if missing:
+        return {
+            "validation_id": spec.validation_id,
+            "rule_name": spec.display_name,
+            "status": "REVIEW_REQUIRED",
+            "message": "数值规则引用的已评审事实不存在或不可规范化。",
+            "reason_code": "NUMERIC_RULE_UNCERTAIN",
+            "error": f"missing qualified facts: {', '.join(missing)}",
             "source_evidence": evidence,
         }
     try:

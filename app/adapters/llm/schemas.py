@@ -30,10 +30,10 @@ class SemanticConcept(StrictLlmSchema):
     """Model-discovered meaning shared by one or more document facts."""
 
     concept_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
-    display_name: str = Field(min_length=1, max_length=100)
+    display_name: str = Field(min_length=1, max_length=80)
     value_type: ValueType
-    aliases: list[str] = Field(default_factory=list, max_length=20)
-    evidence_locations: list[DocumentLocation] = Field(default_factory=list, max_length=20)
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    evidence_locations: list[DocumentLocation] = Field(default_factory=list, max_length=8)
     confidence: float = Field(ge=0, le=1)
 
 
@@ -41,9 +41,56 @@ class ValidationSpec(StrictLlmSchema):
     """A dynamic validation plan; ``expression`` is checked by the numeric AST validator."""
 
     validation_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
-    display_name: str = Field(min_length=1, max_length=160)
+    display_name: str = Field(min_length=1, max_length=80)
     expression: dict[str, Any]
-    evidence_locations: list[DocumentLocation] = Field(default_factory=list, max_length=20)
+    evidence_locations: list[DocumentLocation] = Field(default_factory=list, max_length=8)
+    confidence: float = Field(ge=0, le=1)
+
+    @field_validator("expression")
+    @classmethod
+    def validate_expression(cls, value: dict[str, Any]) -> dict[str, Any]:
+        from app.draft_review.numeric_rules import NumericAstError, validate_ast
+
+        try:
+            validate_ast(value)
+        except NumericAstError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class SemanticFactRef(StrictLlmSchema):
+    """Internal, unambiguous reference to one verified fact."""
+
+    fact_id: str = Field(pattern=r"^fact_[0-9a-f]{24}$")
+    source_file_id: str = Field(min_length=1, max_length=160)
+
+
+class SemanticEvidenceRef(StrictLlmSchema):
+    """Internal evidence reference that keeps the owning file explicit."""
+
+    source_file_id: str = Field(min_length=1, max_length=160)
+    location: DocumentLocation
+
+
+class SemanticConceptPlan(StrictLlmSchema):
+    """Internal semantic concept plan; never exposed as a public result field."""
+
+    concept_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    value_type: ValueType
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    fact_refs: list[SemanticFactRef] = Field(min_length=1, max_length=32)
+    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=8)
+    confidence: float = Field(ge=0, le=1)
+
+
+class SemanticValidationSpec(StrictLlmSchema):
+    """Internal numeric rule plan with file-qualified fact references."""
+
+    validation_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    expression: dict[str, Any]
+    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=8)
     confidence: float = Field(ge=0, le=1)
 
     @field_validator("expression")
@@ -73,6 +120,48 @@ class DocumentProfile(StrictLlmSchema):
     @classmethod
     def normalize_document_kind(cls, value: str) -> str:
         return value.strip() or "UNKNOWN"
+
+
+class CompactDocumentProfile(StrictLlmSchema):
+    """Small wire representation used by the first extraction phase."""
+
+    file_id: str = Field(min_length=1, max_length=160)
+    document_kind: str = Field(min_length=1, max_length=80)
+    title: str | None = Field(default=None, max_length=160)
+    confidence: float = Field(ge=0, le=1)
+    evidence_locations: list[DocumentLocation] = Field(min_length=1, max_length=4)
+
+    @field_validator("document_kind")
+    @classmethod
+    def normalize_document_kind(cls, value: str) -> str:
+        return value.strip() or "UNKNOWN"
+
+
+class CompactFactCandidate(StrictLlmSchema):
+    """Fact wire shape; evidence is recovered deterministically from ``location``."""
+
+    field_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    concept_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    value_type: ValueType
+    raw_value: str = Field(min_length=1, max_length=256)
+    location: DocumentLocation
+    confidence: float = Field(ge=0, le=1)
+
+
+class CompactDocumentFactExtraction(StrictLlmSchema):
+    """First-phase response without repeated evidence or semantic planning fields."""
+
+    profile: CompactDocumentProfile
+    facts: list[CompactFactCandidate] = Field(default_factory=list, max_length=64)
+
+
+class SemanticPlanResponse(StrictLlmSchema):
+    """Internal second-phase response for concepts and declarative numeric rules."""
+
+    file_id: str = Field(min_length=1, max_length=160)
+    semantic_concepts: list[SemanticConceptPlan] = Field(default_factory=list, max_length=32)
+    validation_specs: list[SemanticValidationSpec] = Field(default_factory=list, max_length=16)
 
 
 class FactCandidate(StrictLlmSchema):
@@ -115,7 +204,7 @@ class FactReviewDecision(StrictLlmSchema):
 
 class FactReview(StrictLlmSchema):
     file_id: str = Field(min_length=1)
-    decisions: list[FactReviewDecision] = Field(default_factory=list)
+    decisions: list[FactReviewDecision] = Field(min_length=1)
     semantic_concepts: list[SemanticConcept] = Field(default_factory=list)
     validation_specs: list[ValidationSpec] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
@@ -182,7 +271,7 @@ class AdviceEvidence(StrictLlmSchema):
 
 class RiskAdvice(StrictLlmSchema):
     risk_id: str = Field(min_length=1, max_length=160)
-    analysis_advice: str = Field(min_length=1, max_length=2000)
+    analysis_advice: str = Field(min_length=1, max_length=240)
 
 
 class AdviceResponse(StrictLlmSchema):

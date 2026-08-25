@@ -5,6 +5,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -13,23 +14,134 @@ from pydantic import BaseModel, ValidationError
 from app.adapters.llm.base import LlmResult
 from app.adapters.llm.schemas import (
     AdviceResponse,
+    CompactDocumentFactExtraction,
     DocumentFactExtraction,
     FactMappingResponse,
     FactMappingReview,
     FactReview,
+    SemanticPlanResponse,
 )
 from app.core.config import Settings
+from app.documents.models import DocumentLocation
+from app.draft_review.facts import EvidenceValidationError, expand_compact_extraction
 
 JsonValidator = Callable[[Any], dict[str, Any]]
 Sleeper = Callable[[float], Awaitable[None]]
 
+EXTRACTION_SYSTEM_PROMPT = (
+    "你是合同事实抽取器。只返回一个 JSON 对象，不要 Markdown。"
+    "开放式识别本次正文中的文档用途、业务字段和事实，不得使用固定字段清单。"
+    "逐块扫描所有事实；优先逐项分类输入中的 numeric_candidates，"
+    "不能遗漏同一字段在不同位置出现的不同原值。"
+    "每个事实只返回 field_key、display_name、value_type、raw_value、location、"
+    "confidence 和可选 concept_id。"
+    "不要返回 evidence_text、source_file_id、normalized_hint、missing_field_keys、"
+    "semantic_concepts 或 validation_specs。"
+    "raw_value 必须逐字来自 location 对应的输入证据块；不得推测、补全、换算、修正或改写原值。"
+    "只返回 profile 和 facts，facts 不得超过 Schema 上限。"
+)
+SEMANTIC_PLAN_SYSTEM_PROMPT = (
+    "你是合同事实语义规划器。只返回一个 JSON 对象，不要 Markdown。"
+    "输入只包含已经通过事实评审的事实和已经通过映射评审的关系，且所有事实都有稳定 fact_id。"
+    "只生成开放式语义概念和必要的声明式数值校验规则，不得发明输入中不存在的事实。"
+    "概念必须通过 fact_refs 引用事实，并通过 evidence_refs 指明 source_file_id 和位置。"
+    "规则 AST 的 fact 节点必须同时使用 fact_id 和 source_file_id，"
+    "禁止使用 field_key 或 concept_id。"
+    "规则 evidence_refs 必须准确标明各来源文件，不得把辅助资料位置当成目标文件位置。"
+    "校验规则只能使用允许的 numeric AST；不要输出代码、自然语言表达式或重复事实证据。"
+    "没有可靠概念或规则时返回空数组。严格遵守 SemanticPlanResponse。"
+)
+REVIEW_SYSTEM_PROMPT = (
+    "你是独立的合同事实评审器。逐项核验主模型给出的候选事实是否确实来自同一文件、"
+    "字段语义是否正确、原值、位置和证据文本是否匹配，并独立检查动态数值规则。"
+    "每条候选应独立判断：只要该条事实的原值、证据和位置真实匹配，就应 ACCEPT；"
+    "不得因为正文其他位置存在不同值而拒绝任一真实事实，也不得选择所谓正确值。"
+    "不得补全输入中不存在的事实。必须为每条输入候选恰好返回一个决策。"
+    "只返回 JSON，符合 FactReview。"
+)
+MAPPING_REVIEW_SYSTEM_PROMPT = (
+    "你是独立的跨文件事实映射评审器。逐项核验目标事实、辅助资料事实、位置证据、"
+    "单位、时间范围和业务口径。映射不可靠时必须 REJECT 或 UNCERTAIN；"
+    "不得补充不存在的映射或自动选择正确来源。"
+)
+ADVICE_SYSTEM_PROMPT = (
+    "你只能根据输入中的既有风险、关联差异、文件名和证据位置生成建议，不得新增事实或结论。"
+    "面向业务人员的建议不得出现 file_id、内部坐标或其他技术标识。"
+    "必须在 risk_advices 中按 risk_id 为每条输入风险给出针对其差异文字、文件和位置的分析建议，"
+    "每条建议只写一个无换行的简洁句子，不得使用列表、重复句或通用空话。"
+    "不得使用同一句通用模板。只返回符合 AdviceResponse 的 JSON 对象。"
+)
+
 
 class LlmClientError(Exception):
-    def __init__(self, code: str, safe_message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        safe_message: str,
+        *,
+        retryable: bool = False,
+        correction_message: str | None = None,
+    ) -> None:
         super().__init__(safe_message)
         self.code = code
         self.safe_message = safe_message
         self.retryable = retryable
+        self.correction_message = correction_message
+
+
+def completion_body(
+    *,
+    model: str,
+    system: str,
+    payload: dict[str, Any],
+    schema: type[BaseModel],
+    max_tokens: int,
+    response_format: str = "prompt_only",
+    correction: bool = False,
+    correction_message: str | None = None,
+    response_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    schema_definition = response_schema or schema.model_json_schema()
+    schema_json = json.dumps(schema_definition, ensure_ascii=False, separators=(",", ":"))
+    messages = [
+        {
+            "role": "system",
+            "content": f"{system} 严格遵守以下 JSON Schema：{schema_json}",
+        },
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        },
+    ]
+    if correction:
+        messages.append(
+            {
+                "role": "system",
+                "content": correction_message
+                or "上一响应未通过 JSON 结构校验。严格按指定结构重新返回。",
+            }
+        )
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if response_format == "json_schema":
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "strict": True,
+                "schema": schema_definition,
+            },
+        }
+    elif response_format == "json_object":
+        body["response_format"] = {"type": "json_object"}
+    elif response_format != "prompt_only":
+        raise ValueError(f"unsupported response format: {response_format}")
+    return body
 
 
 def _endpoint(base_url: str, suffix: str) -> str:
@@ -59,11 +171,137 @@ def _validate_extraction(value: Any) -> dict[str, Any]:
         raise LlmClientError("LLM_SCHEMA_INVALID", "模型事实结果不符合结构约束") from exc
 
 
-def _validate_review(value: Any) -> dict[str, Any]:
+def _validate_compact_extraction(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        return FactReview.model_validate(value).model_dump(mode="json")
+        compact = CompactDocumentFactExtraction.model_validate(value)
+        return expand_compact_extraction(payload, compact).model_dump(mode="json")
+    except (ValidationError, EvidenceValidationError) as exc:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型紧凑事实结果未通过安全证据校验",
+        ) from exc
+
+
+def _validate_semantic_plan(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        plan = SemanticPlanResponse.model_validate(value)
     except ValidationError as exc:
-        raise LlmClientError("LLM_SCHEMA_INVALID", "模型评审结果不符合结构约束") from exc
+        raise LlmClientError("LLM_SCHEMA_INVALID", "模型语义规划结果不符合结构约束") from exc
+    if plan.file_id != payload.get("file_id"):
+        raise LlmClientError("LLM_SEMANTIC_PLAN_INVALID", "模型语义规划文件身份不匹配")
+    concept_ids = [item.concept_id for item in plan.semantic_concepts]
+    validation_ids = [item.validation_id for item in plan.validation_specs]
+    if len(concept_ids) != len(set(concept_ids)) or len(validation_ids) != len(set(validation_ids)):
+        raise LlmClientError("LLM_SEMANTIC_PLAN_INVALID", "模型语义规划包含重复身份")
+    return plan.model_dump(mode="json")
+
+
+def _review_identity(value: dict[str, Any] | Any) -> tuple[object, ...]:
+    if isinstance(value, dict):
+        location = DocumentLocation.model_validate(value.get("location"))
+        field_key = value.get("field_key")
+        source_file_id = value.get("source_file_id")
+    else:
+        location = value.location
+        field_key = value.field_key
+        source_file_id = value.source_file_id
+    return (
+        field_key,
+        source_file_id,
+        location.page,
+        location.paragraph_index,
+        location.table_index,
+        location.row,
+        location.column,
+    )
+
+
+def _identity_payload(identity: tuple[object, ...]) -> dict[str, Any]:
+    field_key, source_file_id, page, paragraph_index, table_index, row, column = identity
+    location = {
+        key: value
+        for key, value in {
+            "page": page,
+            "paragraph_index": paragraph_index,
+            "table_index": table_index,
+            "row": row,
+            "column": column,
+        }.items()
+        if value is not None
+    }
+    return {
+        "field_key": field_key,
+        "source_file_id": source_file_id,
+        "location": location,
+    }
+
+
+def review_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    facts = payload.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise LlmClientError(
+            "LLM_REVIEW_INPUT_INVALID",
+            "事实评审至少需要一个候选事实",
+        )
+    identities = [_review_identity(fact) for fact in facts]
+    if len(identities) != len(set(identities)):
+        raise LlmClientError(
+            "LLM_REVIEW_INPUT_INVALID",
+            "事实评审输入包含重复候选身份",
+        )
+    schema = deepcopy(FactReview.model_json_schema())
+    decisions = schema["properties"]["decisions"]
+    decisions["minItems"] = len(identities)
+    decisions["maxItems"] = len(identities)
+    return schema
+
+
+def review_correction_message(payload: dict[str, Any], value: Any) -> str:
+    expected = {_review_identity(fact) for fact in payload.get("facts", [])}
+    actual: list[tuple[object, ...]] = []
+    if isinstance(value, dict) and isinstance(value.get("decisions"), list):
+        for decision in value["decisions"]:
+            try:
+                actual.append(_review_identity(decision))
+            except (AttributeError, TypeError, ValidationError, ValueError):
+                continue
+    missing = sorted(expected - set(actual), key=repr)
+    duplicates = sorted(
+        {identity for identity in actual if actual.count(identity) > 1},
+        key=repr,
+    )
+    extras = sorted(set(actual) - expected, key=repr)
+    requirements = {
+        "required_decision_count": len(expected),
+        "missing_candidate_identities": [_identity_payload(item) for item in missing],
+        "duplicate_candidate_identities": [_identity_payload(item) for item in duplicates],
+        "unexpected_candidate_identities": [_identity_payload(item) for item in extras],
+    }
+    return (
+        "上一响应未完整覆盖输入候选。必须为每个候选身份恰好返回一个 decisions 项，"
+        "不得遗漏、重复或新增。纠错要求："
+        + json.dumps(requirements, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _validate_review(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        review = FactReview.model_validate(value)
+    except ValidationError as exc:
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型评审结果不符合结构约束",
+            correction_message=review_correction_message(payload, value),
+        ) from exc
+    expected = {_review_identity(fact) for fact in payload.get("facts", [])}
+    actual = [_review_identity(decision) for decision in review.decisions]
+    if len(actual) != len(expected) or len(actual) != len(set(actual)) or set(actual) != expected:
+        raise LlmClientError(
+            "LLM_REVIEW_INCOMPLETE",
+            "模型评审未完整覆盖候选事实",
+            correction_message=review_correction_message(payload, value),
+        )
+    return review.model_dump(mode="json")
 
 
 def _validate_advice(value: Any) -> dict[str, Any]:
@@ -112,6 +350,7 @@ class OpenAIContractLlmClient:
         async with httpx.AsyncClient(
             transport=self.transport,
             timeout=self.settings.LLM_TIMEOUT_SECONDS,
+            trust_env=False,
         ) as client:
             response = await self._request(
                 client,
@@ -124,32 +363,33 @@ class OpenAIContractLlmClient:
         return [item["id"] for item in data if isinstance(item, dict) and item.get("id")]
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
-        system = (
-            "你是合同事实抽取器。只返回一个 JSON 对象，不要 Markdown。"
-            "根据本次正文开放式识别文档用途、字段及有业务含义的金额、比例、利率、期限、"
-            "期数、数量和日期，不受固定字段清单限制。所有事实必须逐字来自输入块并携带原文件位置；"
-            "不得推测、补全或修正原文。逐块抽取时不得因为当前块未出现其他字段而声明缺失。"
-        )
         return await self._structured_completion(
             model=self.settings.LLM_EXTRACTION_MODEL,
-            system=system,
+            system=EXTRACTION_SYSTEM_PROMPT,
             payload=payload,
-            validator=_validate_extraction,
-            schema=DocumentFactExtraction,
+            validator=lambda value: _validate_compact_extraction(value, payload),
+            schema=CompactDocumentFactExtraction,
+        )
+
+    async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_EXTRACTION_MODEL,
+            system=SEMANTIC_PLAN_SYSTEM_PROMPT,
+            payload=payload,
+            validator=lambda value: _validate_semantic_plan(value, payload),
+            schema=SemanticPlanResponse,
         )
 
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult:
-        system = (
-            "你是独立的合同事实评审器。逐项核验主模型给出的候选事实是否确实来自同一文件、"
-            "字段语义是否正确、位置和证据文本是否匹配，并独立检查动态数值规则。"
-            "不得选择冲突来源中的正确值，不得补全输入中不存在的事实。只返回 JSON，符合 FactReview。"
-        )
+        response_schema = review_response_schema(payload)
         return await self._structured_completion(
             model=self.settings.LLM_REVIEW_MODEL,
-            system=system,
+            system=REVIEW_SYSTEM_PROMPT,
             payload=payload,
-            validator=_validate_review,
+            validator=lambda value: _validate_review(value, payload),
             schema=FactReview,
+            response_schema=response_schema,
+            max_structure_retries=1,
         )
 
     async def map_facts(self, payload: dict[str, Any]) -> LlmResult:
@@ -168,32 +408,18 @@ class OpenAIContractLlmClient:
         )
 
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult:
-        system = (
-            "你是独立的跨文件事实映射评审器。逐项核验目标事实、辅助资料事实、位置证据、"
-            "单位、时间范围和业务口径。映射不可靠时必须 REJECT 或 UNCERTAIN；"
-            "不得补充不存在的映射或自动选择正确来源。"
-        )
         return await self._structured_completion(
             model=self.settings.LLM_REVIEW_MODEL,
-            system=system,
+            system=MAPPING_REVIEW_SYSTEM_PROMPT,
             payload=payload,
             validator=_validate_mapping_review,
             schema=FactMappingReview,
         )
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
-        system = (
-            "你只能根据输入中的既有风险、关联差异、文件名和证据位置生成建议，不得新增事实或结论。"
-            "面向业务人员的建议不得出现 file_id、内部坐标或其他技术标识。"
-            "必须在 risk_advices 中按 risk_id 为每条输入风险给出针对其差异文字、"
-            "文件和位置的分析建议，"
-            "不得使用同一句通用模板。"
-            "只返回符合 AdviceResponse 的 JSON 对象。"
-        )
-
         return await self._structured_completion(
             model=self.settings.LLM_ADVICE_MODEL,
-            system=system,
+            system=ADVICE_SYSTEM_PROMPT,
             payload=payload,
             validator=_validate_advice,
             schema=AdviceResponse,
@@ -207,6 +433,8 @@ class OpenAIContractLlmClient:
         payload: dict[str, Any],
         validator: JsonValidator,
         schema: type[BaseModel],
+        response_schema: dict[str, Any] | None = None,
+        max_structure_retries: int | None = None,
     ) -> LlmResult:
         started = time.perf_counter()
         request_attempts = 0
@@ -214,43 +442,31 @@ class OpenAIContractLlmClient:
         async with httpx.AsyncClient(
             transport=self.transport,
             timeout=self.settings.LLM_TIMEOUT_SECONDS,
+            trust_env=False,
         ) as client:
-            for structure_attempt in range(self.settings.LLM_STRUCTURE_RETRY_ATTEMPTS + 1):
-                schema_json = json.dumps(
-                    schema.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+            retry_limit = (
+                self.settings.LLM_STRUCTURE_RETRY_ATTEMPTS
+                if max_structure_retries is None
+                else max_structure_retries
+            )
+            for structure_attempt in range(retry_limit + 1):
+                body = completion_body(
+                    model=model,
+                    system=system,
+                    payload=payload,
+                    schema=schema,
+                    max_tokens=self.settings.LLM_MAX_OUTPUT_TOKENS,
+                    response_format=(
+                        "json_schema"
+                        if self.settings.LLM_NATIVE_STRUCTURED_OUTPUT
+                        else "prompt_only"
+                    ),
+                    correction=bool(structure_attempt),
+                    correction_message=(
+                        last_error.correction_message if last_error is not None else None
+                    ),
+                    response_schema=response_schema,
                 )
-                messages = [
-                    {
-                        "role": "system",
-                        "content": f"{system} 严格遵守以下 JSON Schema：{schema_json}",
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                    },
-                ]
-                if structure_attempt:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": "上一响应未通过 JSON 结构校验。严格按指定结构重新返回。",
-                        }
-                    )
-                body: dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "stream": False,
-                    "max_tokens": self.settings.LLM_MAX_OUTPUT_TOKENS,
-                }
-                if self.settings.LLM_NATIVE_STRUCTURED_OUTPUT:
-                    body["response_format"] = {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": schema.__name__,
-                            "strict": True,
-                            "schema": schema.model_json_schema(),
-                        },
-                    }
                 response, attempts = await self._request_with_count(
                     client,
                     "POST",

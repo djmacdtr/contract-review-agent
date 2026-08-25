@@ -1,24 +1,56 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.adapters.llm.schemas import (
+    CompactDocumentFactExtraction,
     DocumentFactExtraction,
     DocumentProfile,
     FactCandidate,
+    FactReview,
     SemanticConcept,
+    SemanticEvidenceRef,
+    SemanticPlanResponse,
     ValidationSpec,
 )
+from app.comparison.models import DiffItem, DiffSegment, DiffSide
 from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
 from app.documents.normalization import normalize_text
 
 
 class EvidenceValidationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class FactIndexEntry:
+    fact_id: str
+    fact: FactCandidate
+
+    @property
+    def source_file_id(self) -> str:
+        return self.fact.source_file_id
+
+    @property
+    def normalized_value(self) -> str:
+        return normalize_fact(self.fact)
+
+    @property
+    def evidence_ref(self) -> dict[str, Any]:
+        return {
+            "source_file_id": self.fact.source_file_id,
+            "location": self.fact.location.model_dump(mode="json", exclude_none=True),
+        }
+
+
+FactIndex = dict[tuple[str, str], FactIndexEntry]
 
 
 NUMERIC_VALUE_TYPES = {
@@ -29,6 +61,184 @@ NUMERIC_VALUE_TYPES = {
     "NUMBER",
     "QUANTITY",
 }
+
+_NUMBER_TOKEN = r"[-+]?(?:\d{1,3}(?:[,，]\d{3})+|\d+)(?:\.\d+)?"
+_NUMERIC_CANDIDATE_PATTERNS = (
+    (
+        "IDENTIFIER",
+        re.compile(r"(?:编号|代码|证号)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9\-/]{2,})"),
+        0,
+        100,
+    ),
+    (
+        "DATE",
+        re.compile(r"\d{4}[年./-]\d{1,2}[月./-]\d{1,2}日?"),
+        0,
+        90,
+    ),
+    (
+        "PERCENTAGE",
+        re.compile(rf"{_NUMBER_TOKEN}\s*(?:%|％|百分之)"),
+        0,
+        80,
+    ),
+    (
+        "MONEY",
+        re.compile(rf"{_NUMBER_TOKEN}\s*(?:人民币|元|万元|亿元|万|亿|CNY|RMB|￥|¥)"),
+        0,
+        75,
+    ),
+    (
+        "DURATION",
+        re.compile(rf"{_NUMBER_TOKEN}\s*(?:年|个月|月|周|星期|天|日)"),
+        0,
+        70,
+    ),
+    (
+        "QUANTITY",
+        re.compile(rf"{_NUMBER_TOKEN}\s*(?:台|件|个|套|期|BP|基点)"),
+        0,
+        60,
+    ),
+    ("NUMBER", re.compile(_NUMBER_TOKEN), 0, 10),
+)
+_STRUCTURAL_NUMBER_CONTEXT = re.compile(
+    r"(?:第|条|款|项|章节|页码?|编号|序号|目录|no\.?|no：?)\s*$",
+    flags=re.IGNORECASE,
+)
+MAX_COMPACT_FACTS = 64
+MAX_NUMERIC_CANDIDATES_PER_CHUNK = 48
+
+
+def fact_identity_key(fact: FactCandidate) -> tuple[object, ...]:
+    return (
+        fact.field_key,
+        fact.source_file_id,
+        location_key(fact.location),
+        fact.value_type,
+        normalize_text(fact.raw_value),
+    )
+
+
+def stable_fact_id(fact: FactCandidate) -> str:
+    canonical = {
+        "source_file_id": fact.source_file_id,
+        "field_key": fact.field_key,
+        "location": location_key(fact.location),
+        "value_type": fact.value_type,
+        "raw_value": normalize_text(fact.raw_value),
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+    return f"fact_{digest}"
+
+
+def build_fact_index(extractions: dict[str, DocumentFactExtraction]) -> FactIndex:
+    index: FactIndex = {}
+    for file_id, extraction in extractions.items():
+        for fact in extraction.facts:
+            if fact.source_file_id != file_id:
+                raise EvidenceValidationError("fact index source_file_id does not match extraction")
+            fact_id = stable_fact_id(fact)
+            ref = (fact_id, fact.source_file_id)
+            existing = index.get(ref)
+            if existing is None:
+                index[ref] = FactIndexEntry(fact_id=fact_id, fact=fact)
+                continue
+            if fact_identity_key(existing.fact) != fact_identity_key(fact):
+                raise EvidenceValidationError("stable fact_id collision")
+            # Chunked extraction can repeat an identical fact. Keep one stable
+            # identity while retaining the strongest grounded model confidence.
+            if fact.confidence > existing.fact.confidence:
+                index[ref] = FactIndexEntry(fact_id=fact_id, fact=fact)
+    return index
+
+
+def fact_index_payload(
+    index: FactIndex,
+    accepted_refs: set[tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    selected = accepted_refs if accepted_refs is not None else set(index)
+    payload: list[dict[str, Any]] = []
+    for ref in sorted(selected):
+        entry = index.get(ref)
+        if entry is None:
+            continue
+        payload.append(
+            {
+                "fact_id": entry.fact_id,
+                **entry.fact.model_dump(
+                    mode="json", exclude={"evidence_text", "normalized_hint"}
+                ),
+            }
+        )
+    return payload
+
+
+def accepted_fact_refs(
+    extraction: DocumentFactExtraction,
+    review: FactReview | None,
+    min_confidence: float,
+) -> set[tuple[str, str]]:
+    if (
+        review is None
+        or review.file_id != extraction.profile.file_id
+        or not review.evidence_complete
+        or review.confidence < min_confidence
+    ):
+        return set()
+    expected_keys = {
+        (fact.field_key, fact.source_file_id, location_key(fact.location))
+        for fact in extraction.facts
+    }
+    decision_keys = [
+        (decision.field_key, decision.source_file_id, location_key(decision.location))
+        for decision in review.decisions
+    ]
+    if len(decision_keys) != len(set(decision_keys)) or set(decision_keys) != expected_keys:
+        return set()
+    decisions = {
+        (
+            decision.field_key,
+            decision.source_file_id,
+            location_key(decision.location),
+        ): decision
+        for decision in review.decisions
+    }
+    accepted: set[tuple[str, str]] = set()
+    for fact in extraction.facts:
+        key = (fact.field_key, fact.source_file_id, location_key(fact.location))
+        decision = decisions.get(key)
+        if (
+            decision is not None
+            and decision.decision == "ACCEPT"
+            and decision.confidence >= min_confidence
+            and fact.confidence >= min_confidence
+        ):
+            accepted.add((stable_fact_id(fact), fact.source_file_id))
+    return accepted
+
+
+def verified_fact_index(
+    extractions: dict[str, DocumentFactExtraction],
+    reviews: dict[str, FactReview | None],
+    min_confidence: float,
+) -> tuple[FactIndex, set[tuple[str, str]]]:
+    index = build_fact_index(extractions)
+    accepted: set[tuple[str, str]] = set()
+    for file_id, extraction in extractions.items():
+        accepted.update(
+            accepted_fact_refs(extraction, reviews.get(file_id), min_confidence)
+        )
+    return index, accepted
+
+
+def compact_location(location: DocumentLocation) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in location.model_dump(mode="json", exclude_none=True).items()
+        if key in {"page", "paragraph_index", "table_index", "row", "column"}
+    }
 
 
 def target_fact_catalog(extraction: DocumentFactExtraction) -> list[dict[str, Any]]:
@@ -41,18 +251,161 @@ def target_fact_catalog(extraction: DocumentFactExtraction) -> list[dict[str, An
     ]
 
 
-def chunk_document(document: ParsedDocument, max_chars: int) -> list[list[DocumentBlock]]:
+def numeric_candidates(
+    blocks: list[DocumentBlock],
+) -> list[dict[str, Any]]:
+    selected, _metrics = _scan_numeric_candidates(blocks)
+    return selected
+
+
+def _scan_numeric_candidates(
+    blocks: list[DocumentBlock],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw_candidates: list[dict[str, Any]] = []
+    structural_suppressed = 0
+    for block in blocks:
+        text = block.raw_text
+        for kind, pattern, group_index, priority in _NUMERIC_CANDIDATE_PATTERNS:
+            for match in pattern.finditer(text):
+                start, end = match.span(group_index)
+                raw_value = match.group(group_index)
+                prefix = text[max(0, start - 8) : start]
+                structural = bool(_STRUCTURAL_NUMBER_CONTEXT.search(prefix))
+                if structural and kind != "IDENTIFIER":
+                    structural_suppressed += 1
+                    continue
+                raw_candidates.append(
+                {
+                    "raw_value": raw_value,
+                    "candidate_kind": kind,
+                    "location": compact_location(block.location),
+                    "span": {"start": start, "end": end},
+                    "_priority": priority,
+                    "_block_id": block.block_id,
+                }
+            )
+    selected: list[dict[str, Any]] = []
+    duplicate_suppressed = 0
+    for candidate in sorted(
+        raw_candidates,
+        key=lambda item: (
+            item["_block_id"],
+            item["span"]["start"],
+            -item["_priority"],
+            item["span"]["end"],
+        ),
+    ):
+        duplicate = False
+        for existing in selected:
+            if existing["_block_id"] != candidate["_block_id"]:
+                continue
+            existing_span = existing["span"]
+            candidate_span = candidate["span"]
+            overlaps = not (
+                candidate_span["end"] <= existing_span["start"]
+                or candidate_span["start"] >= existing_span["end"]
+            )
+            if overlaps and existing["_priority"] >= candidate["_priority"]:
+                duplicate = True
+                break
+        if duplicate:
+            duplicate_suppressed += 1
+            continue
+        canonical = {
+            "block_id": candidate["_block_id"],
+            "location": candidate["location"],
+            "span": candidate["span"],
+            "kind": candidate["candidate_kind"],
+        }
+        candidate_id = hashlib.sha256(
+            json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        selected.append(
+            {
+                "candidate_id": f"numeric_{candidate_id}",
+                "raw_value": candidate["raw_value"],
+                "candidate_kind": candidate["candidate_kind"],
+                "location": candidate["location"],
+                "span": candidate["span"],
+                "_priority": candidate["_priority"],
+                "_block_id": candidate["_block_id"],
+            }
+        )
+    type_counts: dict[str, int] = {}
+    for candidate in selected:
+        kind = candidate["candidate_kind"]
+        type_counts[kind] = type_counts.get(kind, 0) + 1
+    public_selected = [
+        {
+            key: candidate[key]
+            for key in ("candidate_id", "raw_value", "candidate_kind", "location", "span")
+        }
+        for candidate in selected
+    ]
+    return public_selected, {
+        "candidate_total": len(raw_candidates) + structural_suppressed,
+        "candidate_unique": len(public_selected),
+        "suppressed_count": structural_suppressed + duplicate_suppressed,
+        "structural_suppressed_count": structural_suppressed,
+        "duplicate_suppressed_count": duplicate_suppressed,
+        "type_counts": type_counts,
+    }
+
+
+def numeric_candidate_metrics(blocks: list[DocumentBlock]) -> dict[str, Any]:
+    """Return aggregate candidate metrics without exposing candidate text."""
+
+    _selected, metrics = _scan_numeric_candidates(blocks)
+    metrics["batch_count"] = 1 if blocks else 0
+    return metrics
+
+
+def compact_extraction_payload(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+) -> dict[str, Any]:
+    payload = chunk_payload(document, blocks)
+    payload["blocks"] = [
+        {**item, "location": compact_location(block.location)}
+        for block, item in zip(blocks, payload["blocks"], strict=True)
+    ]
+    payload["evidence_blocks"] = list(payload["blocks"])
+    payload["numeric_candidates"] = numeric_candidates(blocks)
+    payload["numeric_candidate_metrics"] = numeric_candidate_metrics(blocks)
+    payload["extraction_requirements"] = {
+        "open_ended_field_keys": True,
+        "classify_numeric_candidates": True,
+        "facts_max_items": MAX_COMPACT_FACTS,
+        "return_only_profile_and_facts": True,
+    }
+    return payload
+
+
+def chunk_document(
+    document: ParsedDocument,
+    max_chars: int,
+    *,
+    max_numeric_candidates: int | None = None,
+) -> list[list[DocumentBlock]]:
     chunks: list[list[DocumentBlock]] = []
     current: list[DocumentBlock] = []
     current_chars = 0
+    current_numeric_candidates = 0
     for block in document.blocks:
         block_chars = len(block.raw_text)
-        if current and current_chars + block_chars > max_chars:
+        block_numeric_candidates = len(numeric_candidates([block]))
+        over_numeric_limit = (
+            max_numeric_candidates is not None
+            and current_numeric_candidates + block_numeric_candidates > max_numeric_candidates
+        )
+        if current and (current_chars + block_chars > max_chars or over_numeric_limit):
             chunks.append(current)
             current = []
             current_chars = 0
+            current_numeric_candidates = 0
         current.append(block)
         current_chars += block_chars
+        current_numeric_candidates += block_numeric_candidates
     if current:
         chunks.append(current)
     return chunks or [[]]
@@ -72,6 +425,323 @@ def chunk_payload(document: ParsedDocument, blocks: list[DocumentBlock]) -> dict
             for block in blocks
         ],
     }
+
+
+def expand_compact_extraction(
+    payload: dict[str, Any],
+    compact: CompactDocumentFactExtraction,
+) -> DocumentFactExtraction:
+    """Recover full fact evidence from the input payload without model duplication."""
+
+    file_id = payload.get("file_id")
+    if compact.profile.file_id != file_id:
+        raise EvidenceValidationError("compact profile file_id does not match payload")
+    evidence_by_location: dict[tuple[object, ...], list[str]] = defaultdict(list)
+    for item in payload.get("evidence_blocks", payload.get("blocks", [])):
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        try:
+            key = location_key(item["location"])
+        except (TypeError, ValueError):
+            continue
+        evidence_by_location[key].append(item["text"])
+
+    profile_locations = compact.profile.evidence_locations
+    if any(location_key(location) not in evidence_by_location for location in profile_locations):
+        raise EvidenceValidationError("compact profile evidence location does not exist")
+
+    facts: list[FactCandidate] = []
+    seen_facts: set[tuple[object, ...]] = set()
+    for compact_fact in compact.facts:
+        candidates = evidence_by_location.get(location_key(compact_fact.location), [])
+        raw_value = normalize_text(compact_fact.raw_value)
+        evidence_text = next(
+            (
+                candidate
+                for candidate in candidates
+                if raw_value and raw_value in normalize_text(candidate)
+            ),
+            None,
+        )
+        if evidence_text is None:
+            raise EvidenceValidationError("compact fact raw_value is not grounded at its location")
+        identity = (
+            compact_fact.field_key,
+            location_key(compact_fact.location),
+            raw_value,
+        )
+        if identity in seen_facts:
+            raise EvidenceValidationError("compact extraction contains duplicate fact identity")
+        seen_facts.add(identity)
+        facts.append(
+            FactCandidate(
+                field_key=compact_fact.field_key,
+                concept_id=compact_fact.concept_id,
+                display_name=compact_fact.display_name,
+                value_type=compact_fact.value_type,
+                raw_value=compact_fact.raw_value,
+                normalized_hint=normalize_text(compact_fact.raw_value),
+                source_file_id=str(file_id),
+                evidence_text=evidence_text,
+                location=compact_fact.location,
+                confidence=compact_fact.confidence,
+            )
+        )
+    return DocumentFactExtraction(
+        profile=DocumentProfile(
+            file_id=str(file_id),
+            document_kind=compact.profile.document_kind,
+            title=compact.profile.title,
+            confidence=compact.profile.confidence,
+            evidence_locations=profile_locations,
+        ),
+        facts=facts,
+        missing_field_keys=[],
+        semantic_concepts=[],
+        validation_specs=[],
+    )
+
+
+def _parent_block_index(
+    document: ParsedDocument,
+    location: DocumentLocation,
+) -> int:
+    wanted = location_key(location)
+    for index, block in enumerate(document.blocks):
+        if location_key(block.location) == wanted:
+            return index
+    if location.table_index is not None:
+        for index, block in enumerate(document.blocks):
+            if block.location.table_index == location.table_index:
+                return index
+    raise EvidenceValidationError("review evidence location has no parent document block")
+
+
+def _review_unit_blocks(
+    document: ParsedDocument,
+    locations: list[DocumentLocation],
+    context_blocks: int,
+) -> set[int]:
+    selected: set[int] = set()
+    for location in locations:
+        anchor = _parent_block_index(document, location)
+        start = max(0, anchor - context_blocks)
+        end = min(len(document.blocks), anchor + context_blocks + 1)
+        selected.update(range(start, end))
+    return selected
+
+
+def _review_payload(
+    document: ParsedDocument,
+    block_indexes: set[int],
+    facts: list[FactCandidate],
+    concepts: list[SemanticConcept],
+    specs: list[ValidationSpec],
+) -> dict[str, Any]:
+    blocks = [document.blocks[index] for index in sorted(block_indexes)]
+    return {
+        **chunk_payload(document, blocks),
+        "facts": [fact.model_dump(mode="json") for fact in facts],
+        "semantic_concepts": [concept.model_dump(mode="json") for concept in concepts],
+        "validation_specs": [spec.model_dump(mode="json") for spec in specs],
+        "review_requirements": {
+            "required_decision_count": len(facts),
+            "one_decision_per_fact": True,
+            "evaluate_each_fact_independently": True,
+        },
+    }
+
+
+def _payload_chars(payload: dict[str, Any]) -> int:
+    import json
+
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def build_fact_review_batches(
+    document: ParsedDocument,
+    extraction: DocumentFactExtraction,
+    *,
+    max_chars: int,
+    context_blocks: int,
+) -> list[dict[str, Any]]:
+    """Build evidence-local review payloads without truncating source blocks."""
+
+    units: list[
+        tuple[
+            set[int],
+            list[FactCandidate],
+            list[SemanticConcept],
+            list[ValidationSpec],
+        ]
+    ] = []
+    for fact in extraction.facts:
+        units.append(
+            (
+                _review_unit_blocks(document, [fact.location], context_blocks),
+                [fact],
+                [],
+                [],
+            )
+        )
+    for concept in extraction.semantic_concepts:
+        units.append(
+            (
+                _review_unit_blocks(document, concept.evidence_locations, context_blocks),
+                [],
+                [concept],
+                [],
+            )
+        )
+    for spec in extraction.validation_specs:
+        units.append(
+            (
+                _review_unit_blocks(document, spec.evidence_locations, context_blocks),
+                [],
+                [],
+                [spec],
+            )
+        )
+    if not units:
+        return [_review_payload(document, set(), [], [], [])]
+
+    batches: list[dict[str, Any]] = []
+    current_blocks: set[int] = set()
+    current_facts: list[FactCandidate] = []
+    current_concepts: list[SemanticConcept] = []
+    current_specs: list[ValidationSpec] = []
+    for block_indexes, facts, concepts, specs in units:
+        proposed = _review_payload(
+            document,
+            current_blocks | block_indexes,
+            [*current_facts, *facts],
+            [*current_concepts, *concepts],
+            [*current_specs, *specs],
+        )
+        if _payload_chars(proposed) <= max_chars:
+            current_blocks |= block_indexes
+            current_facts.extend(facts)
+            current_concepts.extend(concepts)
+            current_specs.extend(specs)
+            continue
+        if current_facts or current_concepts or current_specs:
+            batches.append(
+                _review_payload(
+                    document,
+                    current_blocks,
+                    current_facts,
+                    current_concepts,
+                    current_specs,
+                )
+            )
+        single = _review_payload(document, block_indexes, facts, concepts, specs)
+        if _payload_chars(single) > max_chars:
+            raise EvidenceValidationError("single review unit exceeds review batch limit")
+        current_blocks = set(block_indexes)
+        current_facts = list(facts)
+        current_concepts = list(concepts)
+        current_specs = list(specs)
+    if current_facts or current_concepts or current_specs:
+        batches.append(
+            _review_payload(
+                document,
+                current_blocks,
+                current_facts,
+                current_concepts,
+                current_specs,
+            )
+        )
+    return batches
+
+
+def merge_fact_review_batches(
+    document: ParsedDocument,
+    extraction: DocumentFactExtraction,
+    reviewed_batches: list[tuple[dict[str, Any], FactReview]],
+) -> FactReview:
+    """Validate exact batch identities and merge accepted review artifacts."""
+
+    expected_facts = {
+        (fact.field_key, fact.source_file_id, location_key(fact.location)): fact
+        for fact in extraction.facts
+    }
+    all_decisions: dict[tuple[object, ...], Any] = {}
+    accepted_concepts: dict[str, SemanticConcept] = {}
+    accepted_specs: dict[str, ValidationSpec] = {}
+    confidences: list[float] = []
+    evidence_complete = True
+    for payload, review in reviewed_batches:
+        if review.file_id != document.file_id:
+            raise EvidenceValidationError("review file_id does not match parsed document")
+        batch_facts = {
+            (
+                fact["field_key"],
+                fact["source_file_id"],
+                location_key(fact["location"]),
+            ): fact
+            for fact in payload["facts"]
+        }
+        batch_decisions: dict[tuple[object, ...], Any] = {}
+        for decision in review.decisions:
+            key = (
+                decision.field_key,
+                decision.source_file_id,
+                location_key(decision.location),
+            )
+            candidate = batch_facts.get(key)
+            if candidate is None or key in batch_decisions or key in all_decisions:
+                raise EvidenceValidationError("review decision is duplicated or outside its batch")
+            if decision.evidence_text and normalize_text(
+                decision.evidence_text
+            ) not in normalize_text(candidate["evidence_text"]):
+                raise EvidenceValidationError("review evidence does not match candidate evidence")
+            batch_decisions[key] = decision
+            all_decisions[key] = decision
+        if set(batch_decisions) != set(batch_facts):
+            raise EvidenceValidationError("review batch did not decide every candidate fact")
+
+        batch_concepts = {
+            item["concept_id"]: SemanticConcept.model_validate(item)
+            for item in payload["semantic_concepts"]
+        }
+        for concept in review.semantic_concepts:
+            candidate = batch_concepts.get(concept.concept_id)
+            if candidate is None or concept.concept_id in accepted_concepts:
+                raise EvidenceValidationError("review concept is duplicated or outside its batch")
+            if concept.model_dump(mode="json", exclude={"confidence"}) != candidate.model_dump(
+                mode="json", exclude={"confidence"}
+            ):
+                raise EvidenceValidationError("review concept does not match candidate concept")
+            accepted_concepts[concept.concept_id] = concept
+
+        batch_specs = {
+            item["validation_id"]: ValidationSpec.model_validate(item)
+            for item in payload["validation_specs"]
+        }
+        for spec in review.validation_specs:
+            candidate = batch_specs.get(spec.validation_id)
+            if candidate is None or spec.validation_id in accepted_specs:
+                raise EvidenceValidationError("review spec is duplicated or outside its batch")
+            if {
+                location_key(location) for location in spec.evidence_locations
+            } != {
+                location_key(location) for location in candidate.evidence_locations
+            }:
+                raise EvidenceValidationError("review spec evidence changed outside its batch")
+            accepted_specs[spec.validation_id] = spec
+        confidences.append(review.confidence)
+        evidence_complete = evidence_complete and review.evidence_complete
+
+    if set(all_decisions) != set(expected_facts):
+        raise EvidenceValidationError("review batches did not cover every candidate fact")
+    return FactReview(
+        file_id=document.file_id,
+        decisions=list(all_decisions.values()),
+        semantic_concepts=list(accepted_concepts.values()),
+        validation_specs=list(accepted_specs.values()),
+        confidence=min(confidences, default=0.0),
+        evidence_complete=bool(reviewed_batches) and evidence_complete,
+    )
 
 
 def location_key(location: DocumentLocation | dict[str, Any]) -> tuple[object, ...]:
@@ -128,6 +798,94 @@ def validate_extraction_evidence(
         for location in spec.evidence_locations:
             if location_key(location) not in evidence:
                 raise EvidenceValidationError("validation evidence location does not exist")
+
+
+def _semantic_evidence_exists(
+    documents_by_file: dict[str, ParsedDocument],
+    evidence_ref: SemanticEvidenceRef,
+) -> bool:
+    document = documents_by_file.get(evidence_ref.source_file_id)
+    return bool(document and evidence_location_exists(document, evidence_ref.location))
+
+
+def _semantic_ast_references(node: Any) -> set[tuple[str, str]]:
+    if not isinstance(node, dict):
+        raise EvidenceValidationError("semantic AST node must be an object")
+    if node.get("op") == "fact":
+        if set(node) != {"op", "fact_id", "source_file_id"}:
+            raise EvidenceValidationError("semantic AST fact nodes require qualified references")
+        return {(str(node["fact_id"]), str(node["source_file_id"]))}
+    references: set[tuple[str, str]] = set()
+    for key in ("args", "left", "right"):
+        child = node.get(key)
+        if isinstance(child, list):
+            for item in child:
+                references.update(_semantic_ast_references(item))
+        elif isinstance(child, dict):
+            references.update(_semantic_ast_references(child))
+    return references
+
+
+def validate_semantic_plan(
+    *,
+    primary_file_id: str,
+    documents_by_file: dict[str, ParsedDocument],
+    plan: SemanticPlanResponse,
+    fact_index: FactIndex,
+    accepted_refs: set[tuple[str, str]],
+) -> None:
+    """Validate file-qualified semantic evidence and references."""
+
+    if plan.file_id != primary_file_id:
+        raise EvidenceValidationError("semantic plan file_id does not match primary document")
+    for concept in plan.semantic_concepts:
+        for fact_ref in concept.fact_refs:
+            ref = (fact_ref.fact_id, fact_ref.source_file_id)
+            if ref not in fact_index or ref not in accepted_refs:
+                raise EvidenceValidationError("semantic concept references an unverified fact")
+        if any(
+            not _semantic_evidence_exists(documents_by_file, evidence_ref)
+            for evidence_ref in concept.evidence_refs
+        ):
+            raise EvidenceValidationError("semantic concept evidence location does not exist")
+    for spec in plan.validation_specs:
+        if any(
+            not _semantic_evidence_exists(documents_by_file, evidence_ref)
+            for evidence_ref in spec.evidence_refs
+        ):
+            raise EvidenceValidationError("validation evidence location does not exist")
+        references = _semantic_ast_references(spec.expression)
+        if not references <= fact_index.keys() or not references <= accepted_refs:
+            raise EvidenceValidationError("validation rule references an unverified fact")
+
+
+def project_semantic_plan(
+    plan: SemanticPlanResponse,
+) -> tuple[list[SemanticConcept], list[ValidationSpec]]:
+    """Project internal plans back to the existing public extraction models."""
+
+    concepts = [
+        SemanticConcept(
+            concept_id=concept.concept_id,
+            display_name=concept.display_name,
+            value_type=concept.value_type,
+            aliases=concept.aliases,
+            evidence_locations=[ref.location for ref in concept.evidence_refs],
+            confidence=concept.confidence,
+        )
+        for concept in plan.semantic_concepts
+    ]
+    specs = [
+        ValidationSpec(
+            validation_id=spec.validation_id,
+            display_name=spec.display_name,
+            expression=spec.expression,
+            evidence_locations=[ref.location for ref in spec.evidence_refs],
+            confidence=spec.confidence,
+        )
+        for spec in plan.validation_specs
+    ]
+    return concepts, specs
 
 
 def _merge_named_models(
@@ -367,6 +1125,75 @@ def compare_facts(target: FactCandidate, reference: FactCandidate) -> bool | Non
     return bool(target_value["value"] == reference_value["value"])
 
 
+def fact_conflict_diff_items(
+    matrix: list[dict[str, Any]],
+    *,
+    target_file_id: str | None = None,
+) -> list[DiffItem]:
+    """Convert confirmed cross-document fact conflicts into two-sided diffs."""
+
+    differences: list[DiffItem] = []
+    seen: set[str] = set()
+    for item in matrix:
+        if item.get("status") != "CONFLICT":
+            continue
+        target_candidate = item.get("target_candidate") or {}
+        if target_file_id and target_candidate.get("source_file_id") != target_file_id:
+            continue
+        for relation in item.get("reference_results", []):
+            if relation.get("status") != "CONFLICT" or not relation.get("candidate"):
+                continue
+            reference_candidate = relation["candidate"]
+            target_fact = FactCandidate.model_validate(
+                {key: value for key, value in target_candidate.items() if key != "normalized_value"}
+            )
+            reference_fact = FactCandidate.model_validate(
+                {
+                    key: value
+                    for key, value in reference_candidate.items()
+                    if key != "normalized_value"
+                }
+            )
+            target_id = stable_fact_id(target_fact)
+            reference_id = stable_fact_id(reference_fact)
+            seed = f"{target_id}:{reference_id}".encode()
+            diff_id = f"fact_diff_{hashlib.sha256(seed).hexdigest()[:20]}"
+            if diff_id in seen:
+                continue
+            seen.add(diff_id)
+            numeric = (
+                target_fact.value_type in NUMERIC_VALUE_TYPES | {"DATE"}
+                or reference_fact.value_type in NUMERIC_VALUE_TYPES | {"DATE"}
+            )
+            differences.append(
+                DiffItem(
+                    diff_id=diff_id,
+                    diff_type="NUMERIC_CHANGED" if numeric else "MODIFIED",
+                    title=f"{item['display_name']}来源值不一致",
+                    baseline=DiffSide(
+                        file_id=reference_fact.source_file_id,
+                        location=reference_fact.location,
+                        locations=[reference_fact.location],
+                        text=reference_fact.evidence_text,
+                    ),
+                    target=DiffSide(
+                        file_id=target_fact.source_file_id,
+                        location=target_fact.location,
+                        locations=[target_fact.location],
+                        text=target_fact.evidence_text,
+                    ),
+                    segments=[
+                        DiffSegment(operation="DELETE", text=reference_fact.evidence_text),
+                        DiffSegment(operation="INSERT", text=target_fact.evidence_text),
+                    ],
+                    confidence=min(target_fact.confidence, reference_fact.confidence),
+                    requires_manual_review=False,
+                    certainty="CONFIRMED",
+                )
+            )
+    return differences
+
+
 def build_fact_matrix(
     extractions: dict[str, DocumentFactExtraction],
     *,
@@ -574,6 +1401,9 @@ def build_fact_matrix(
 
 def fact_matrix_result_items(
     matrix: list[dict[str, Any]],
+    *,
+    include_conflicts: bool = True,
+    include_uncertain: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     risks: list[dict[str, Any]] = []
     reviews: list[dict[str, Any]] = []
@@ -597,7 +1427,7 @@ def fact_matrix_result_items(
                 )
         safe_key = re.sub(r"[^a-z0-9_]+", "_", item["field_key"].casefold())
         item_suffix = f"{safe_key}_{item.get('target_fact_id', 'target')}"
-        if item["status"] == "CONFLICT":
+        if item["status"] == "CONFLICT" and include_conflicts:
             risks.append(
                 {
                     "risk_id": f"risk_fact_{item_suffix}",
@@ -622,7 +1452,7 @@ def fact_matrix_result_items(
             for relation in item.get("reference_results", [])
             if relation["status"] == "MISSING" and relation.get("requires_manual_review")
         ]
-        if item["status"] == "UNCERTAIN" or uncertain_relations:
+        if include_uncertain and (item["status"] == "UNCERTAIN" or uncertain_relations):
             reviews.append(
                 {
                     "review_id": f"review_fact_uncertain_{item_suffix}",
@@ -635,7 +1465,7 @@ def fact_matrix_result_items(
                     "requires_manual_action": True,
                 }
             )
-        if required_missing_relations:
+        if include_uncertain and required_missing_relations:
             risks.append(
                 {
                     "risk_id": f"risk_fact_missing_{item_suffix}",

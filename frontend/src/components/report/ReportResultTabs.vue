@@ -44,14 +44,15 @@ const props = withDefaults(defineProps<{
   files: ResultFile[]
   moduleOrder?: string[]
   leftLabel?: string
-}>(), { moduleOrder: () => [], leftLabel: '基准文件' })
+  showPassedChecks?: boolean
+}>(), { moduleOrder: () => [], leftLabel: '基准文件', showPassedChecks: true })
 
 const active = ref<TabKey>('all')
 const tabs = computed(() => [
   { key: 'all' as const, label: '检出风险', count: props.riskItems.length },
   { key: 'deletion' as const, label: '删除 / 缺失', count: props.riskItems.filter(item => item.risk_type === 'DELETION_OR_MISSING').length },
   { key: 'addition' as const, label: '新增 / 变更', count: props.riskItems.filter(item => item.risk_type === 'ADDITION_OR_CHANGE').length },
-  { key: 'passed' as const, label: '校验通过', count: props.passedChecks.length },
+  ...(props.showPassedChecks ? [{ key: 'passed' as const, label: '校验通过', count: props.passedChecks.length }] : []),
 ])
 const currentRisks = computed(() => {
   if (active.value === 'deletion') return props.riskItems.filter(item => item.risk_type === 'DELETION_OR_MISSING')

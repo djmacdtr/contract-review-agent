@@ -78,6 +78,23 @@ def test_fallback_advice_uses_current_change_file_and_business_location() -> Non
     assert "passed_checks" not in payload
 
 
+def test_advice_payload_excludes_risks_without_customer_diff_evidence() -> None:
+    result = result_fixture()
+    result["risk_items"].append(
+        {
+            "risk_id": "risk_internal_rule",
+            "risk_type": "ADDITION_OR_CHANGE",
+            "title": "内部规则失败",
+            "related_diff_ids": [],
+            "source_evidence": [],
+        }
+    )
+
+    assert [item["risk_id"] for item in advice_payload(result)["risk_items"]] == [
+        "risk_000001"
+    ]
+
+
 def test_model_advice_merges_only_current_unique_risk_ids() -> None:
     result = result_fixture()
     merge_model_advice(
@@ -119,3 +136,53 @@ def test_invalid_or_technical_model_risk_advice_is_rejected(
 ) -> None:
     with pytest.raises(ValueError, match="current task|duplicated|internal identifier"):
         merge_model_advice(result_fixture(), advice_response(*risk_advices))
+
+
+def test_missing_page_advice_and_payload_use_structured_context() -> None:
+    result = result_fixture()
+    result["risk_items"][0].update(
+        {
+            "risk_type": "DELETION_OR_MISSING",
+            "title": "疑似整页或连续大段内容缺失",
+        }
+    )
+    result["diff_items"][0] = {
+        "diff_id": "diff_000001",
+        "diff_type": "PAGE_MISSING",
+        "certainty": "INFERRED",
+        "title": "疑似整页或连续大段内容缺失",
+        "baseline": {
+            "file_id": "fil_base",
+            "text": "设备交付和验收的连续约定",
+            "location": {"paragraph_index": 119},
+        },
+        "target": {
+            "file_id": "fil_target",
+            "text": "",
+            "location": {"page": 18},
+        },
+        "segments": [
+            {"operation": "DELETE", "text": "设备交付和验收的连续约定"}
+        ],
+        "missing_detail": {
+            "boundary": "MIDDLE",
+            "estimated_page_equivalent": 1.1,
+            "target_anchor_before_page": 18,
+            "target_anchor_after_page": 19,
+            "structure_unit_count": 4,
+            "aggregated_diff_count": 4,
+            "content_summary": "设备交付和验收的连续约定",
+        },
+    }
+
+    ensure_fallback_risk_advices(result)
+
+    advice = result["risk_items"][0]["analysis_advice"]
+    assert "当前合同.docx" in advice
+    assert "融资租赁合同.docx" in advice
+    assert "疑似缺少一页" in advice
+    assert "页码连续性" in advice
+    payload_diff = advice_payload(result)["diff_items"][0]
+    assert payload_diff["diff_type"] == "PAGE_MISSING"
+    assert payload_diff["certainty"] == "INFERRED"
+    assert payload_diff["missing_detail"]["estimated_page_equivalent"] == 1.1

@@ -1,6 +1,6 @@
 <template>
   <main class="report-page">
-    <ReportHeader title="合同起草检查报告" stage-label="合同起草阶段 · 签约前" subtitle="模板固定内容、动态事实、数值和基础必填项检查" />
+    <ReportHeader title="合同起草检查报告" stage-label="合同起草阶段 · 签约前" subtitle="模板与来源文件的实际差异及处理建议" />
 
     <section v-if="error" class="report-state panel">
       <el-result icon="error" title="本次检查未完成" :sub-title="error"><template #extra><el-button type="primary" @click="reload">重新加载</el-button></template></el-result>
@@ -12,18 +12,20 @@
       <ConclusionBanner :conclusion="result.conclusion" :description="result.summary.description" />
       <CheckModule title="本次检查文件"><FileSummary :files="result.files" /></CheckModule>
       <ReportResultTabs
-        :risk-items="result.risk_items"
+        :risk-items="customerRiskItems"
         :passed-checks="result.passed_checks"
         :diff-items="result.diff_items"
         :files="result.files"
         :module-order="moduleOrder"
         left-label="合同模板"
+        :show-passed-checks="false"
       />
     </template>
   </main>
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import CheckModule from '../../components/report/CheckModule.vue'
 import ConclusionBanner from '../../components/report/ConclusionBanner.vue'
 import FileSummary from '../../components/report/FileSummary.vue'
@@ -34,4 +36,7 @@ import { displayLabel } from '../../utils/labels'
 
 const { detail, result, error, reload } = useTaskReport('DRAFT_REVIEW')
 const moduleOrder = ['TEMPLATE_INTEGRITY', 'TEMPLATE_COMPLETENESS', 'FACT_CONSISTENCY', 'NUMERIC_CONSISTENCY']
+const customerRiskItems = computed(
+  () => result.value?.risk_items.filter(item => item.related_diff_ids.length > 0) ?? [],
+)
 </script>

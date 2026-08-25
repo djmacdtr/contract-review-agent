@@ -88,6 +88,7 @@ class ConsensusFixtureLlm:
         self.review_rule_mismatch = review_rule_mismatch
         self.invalid_advice_evidence = invalid_advice_evidence
         self.advice_calls = 0
+        self.review_payloads: list[dict] = []
 
     async def probe_models(self) -> list[str]:
         return [self.extraction_model, self.review_model]
@@ -142,6 +143,7 @@ class ConsensusFixtureLlm:
         )
 
     async def review_facts(self, payload: dict) -> LlmResult:
+        self.review_payloads.append(payload)
         if self.review_failure:
             raise LlmClientError("LLM_UPSTREAM_ERROR", "模型评审不可用")
         fact = payload["facts"][0]
@@ -259,15 +261,80 @@ class ConsensusFixtureLlm:
         )
 
 
+class SemanticPlanFixtureLlm(ConsensusFixtureLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.plan_calls = 0
+
+    async def plan_semantics(self, payload: dict) -> LlmResult:
+        self.plan_calls += 1
+        target = next(item for item in payload["documents"] if item["role"] == "TARGET")
+        fact = target["facts"][0]
+        return LlmResult(
+            value={
+                "file_id": payload["file_id"],
+                "semantic_concepts": [
+                    {
+                        "concept_id": "amount",
+                        "display_name": "金额",
+                        "value_type": "MONEY",
+                        "aliases": [],
+                        "fact_refs": [
+                            {
+                                "fact_id": fact["fact_id"],
+                                "source_file_id": fact["source_file_id"],
+                            }
+                        ],
+                        "evidence_refs": [
+                            {
+                                "source_file_id": fact["source_file_id"],
+                                "location": fact["location"],
+                            }
+                        ],
+                        "confidence": 0.95,
+                    }
+                ],
+                "validation_specs": [
+                    {
+                        "validation_id": "amount_positive",
+                        "display_name": "金额为正",
+                        "expression": {
+                            "op": "greater_than",
+                            "left": {
+                                "op": "fact",
+                                "fact_id": fact["fact_id"],
+                                "source_file_id": fact["source_file_id"],
+                            },
+                            "right": {"op": "literal", "value": "0"},
+                        },
+                        "evidence_refs": [
+                            {
+                                "source_file_id": fact["source_file_id"],
+                                "location": fact["location"],
+                            }
+                        ],
+                        "confidence": 0.95,
+                    }
+                ],
+            },
+            configured_model=self.extraction_model,
+            actual_model=self.extraction_model,
+            mock=False,
+        )
+
+
 async def run_consensus_fixture(
     tmp_path: Path,
     llm: ConsensusFixtureLlm,
     *,
     options: dict | None = None,
+    same_model_diagnostic: bool = False,
+    target_body: str = "金额100",
+    template_body: str = "金额100",
 ) -> dict:
     bodies = {
-        "/target.docx": build_docx(tmp_path / "target.docx", "合同", "金额100"),
-        "/template.docx": build_docx(tmp_path / "template.docx", "合同", "金额100"),
+        "/target.docx": build_docx(tmp_path / "target.docx", "合同", target_body),
+        "/template.docx": build_docx(tmp_path / "template.docx", "合同", template_body),
         "/reference.docx": build_docx(tmp_path / "reference.docx", "资料", "金额100"),
     }
 
@@ -285,6 +352,7 @@ async def run_consensus_fixture(
         LLM_ENABLED=True,
         LLM_BASE_URL="https://llm.invalid",
         LLM_API_KEY="unused",
+        LLM_SAME_MODEL_DIAGNOSTIC=same_model_diagnostic,
     )
     executor = DraftReviewWorkflowExecutor(
         settings,
@@ -401,8 +469,8 @@ async def test_draft_review_downloads_and_parses_every_file_without_mocking(
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["schema_version"] == "2.1"
-    assert result["metadata"]["workflow_version"] == "0.6.0"
-    assert result["metadata"]["rules_version"] == "0.5.0"
+    assert result["metadata"]["workflow_version"] == "0.7.0"
+    assert result["metadata"]["rules_version"] == "0.6.0"
     assert result["metadata"]["primary_model"] is None
     assert result["conclusion"] == "PASS"
     assert result["diff_items"] == []
@@ -527,6 +595,100 @@ async def test_invalid_advice_risk_id_falls_back_without_changing_result(
         warning["code"] == "LLM_ADVICE_UNAVAILABLE"
         for warning in result["warnings"]
     )
+
+
+async def test_independent_review_receives_source_blocks(tmp_path: Path) -> None:
+    llm = ConsensusFixtureLlm()
+
+    await run_consensus_fixture(tmp_path, llm)
+
+    assert llm.review_payloads
+    assert all(payload["blocks"] for payload in llm.review_payloads)
+    assert all(
+        "text" in block and "location" in block
+        for payload in llm.review_payloads
+        for block in payload["blocks"]
+    )
+    assert all(
+        payload["review_requirements"]["required_decision_count"]
+        == len(payload["facts"])
+        for payload in llm.review_payloads
+    )
+
+
+async def test_semantic_plan_runs_after_mapping_and_is_programmatically_checked(
+    tmp_path: Path,
+) -> None:
+    llm = SemanticPlanFixtureLlm()
+    result = await run_consensus_fixture(tmp_path, llm)
+
+    assert llm.plan_calls == 1
+    assert result["metadata"]["semantic_concepts"]
+    assert any(
+        spec["validation_id"] == "amount_positive"
+        for spec in result["metadata"]["validation_specs"]
+    )
+    assert any(run["purpose"] == "SEMANTIC_PLAN" for run in result["metadata"]["model_runs"])
+    assert any(check["rule_id"] == "amount_positive" for check in result["rule_checks"])
+
+
+async def test_same_model_diagnostic_never_claims_independent_consensus_or_pass(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        ConsensusFixtureLlm(extraction_model="deepseek", review_model="deepseek"),
+        same_model_diagnostic=True,
+    )
+
+    TaskResultData.model_validate(result)
+    assert result["conclusion"] == "REVIEW_REQUIRED"
+    assert result["metadata"]["execution_mode"] == "HYBRID_DIAGNOSTIC"
+    assert result["metadata"]["independent_review"] is False
+    assert result["metadata"]["review_mode"] == "SAME_MODEL_DIAGNOSTIC"
+    assert result["review_items"]
+    assert not any(
+        item["module_code"] == "FACT_CONSISTENCY" for item in result["passed_checks"]
+    )
+    assert any(
+        warning["code"] == "LLM_SAME_MODEL_DIAGNOSTIC"
+        for warning in result["warnings"]
+    )
+
+
+async def test_same_model_semantic_plan_stays_out_of_public_formal_checks(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        SemanticPlanFixtureLlm(),
+        same_model_diagnostic=True,
+    )
+
+    assert result["metadata"]["semantic_concepts"] == []
+    assert result["metadata"]["validation_specs"] == []
+    assert result["rule_checks"] == []
+    assert not any(
+        item.get("module_code") in {"NUMERIC_CONSISTENCY", "FACT_CONSISTENCY"}
+        for item in result["risk_items"]
+    )
+
+
+async def test_same_model_diagnostic_preserves_deterministic_text_differences(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        ConsensusFixtureLlm(extraction_model="deepseek", review_model="deepseek"),
+        same_model_diagnostic=True,
+        target_body="固定条款乙",
+        template_body="固定条款甲",
+    )
+
+    TaskResultData.model_validate(result)
+    assert result["conclusion"] == "RISK_FOUND"
+    assert result["diff_items"]
+    assert any(item["module_code"] == "TEMPLATE_INTEGRITY" for item in result["risk_items"])
 
 
 async def test_numeric_consistency_false_skips_dynamic_rules(tmp_path: Path) -> None:
