@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
+import structlog
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.adapters.llm.base import ContractLlmClient
-from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
+from app.adapters.llm.openai_client import (
+    LlmClientError,
+    OpenAIContractLlmClient,
+    _safe_validation_summary,
+)
 from app.adapters.llm.schemas import (
     AdviceResponse,
     DocumentFactExtraction,
@@ -60,6 +65,54 @@ from app.workflows.types import WorkflowOutput
 
 DRAFT_REVIEW_WORKFLOW_VERSION = "0.7.0"
 DRAFT_REVIEW_RULES_VERSION = "0.6.0"
+logger = structlog.get_logger(__name__)
+
+
+def _dynamic_failure_code(exc: BaseException) -> str:
+    if isinstance(exc, EvidenceValidationError):
+        return exc.code
+    if isinstance(exc, LlmClientError):
+        if exc.failure_code:
+            return exc.failure_code
+        if exc.code in {
+            "LLM_TIMEOUT",
+            "LLM_NETWORK_ERROR",
+            "LLM_UPSTREAM_ERROR",
+            "LLM_RATE_LIMITED",
+        }:
+            return "LLM_UPSTREAM_FAILED"
+        return "LLM_RESPONSE_SCHEMA_INVALID"
+    if isinstance(exc, ValidationError):
+        return "LLM_RESPONSE_SCHEMA_INVALID"
+    if isinstance(exc, TimeoutError):
+        return "LLM_UPSTREAM_FAILED"
+    return "LLM_UPSTREAM_FAILED"
+
+
+def _safe_validation_items(exc: BaseException) -> list[dict[str, Any]]:
+    if isinstance(exc, LlmClientError):
+        summary: Any = exc.validation_summary
+    elif isinstance(exc, ValidationError):
+        summary = _safe_validation_summary(exc)
+    else:
+        return []
+    if isinstance(summary, dict):
+        summary = summary.get("items")
+    if not isinstance(summary, list):
+        return []
+    return [
+        {
+            "path": item["path"],
+            "error_type": item["error_type"],
+            "count": item["count"],
+        }
+        for item in summary
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("error_type"), str)
+        and isinstance(item.get("count"), int)
+        and not isinstance(item.get("count"), bool)
+    ]
 
 
 class DraftReviewState(TypedDict, total=False):
@@ -157,11 +210,15 @@ class DraftReviewWorkflowExecutor:
                     duration_ms = 0
                     request_attempts = 0
                     structure_retries = 0
-                    for blocks in chunk_document(
+                    current_chunk_index = 0
+                    failure_counts: dict[str, int] = {}
+                    chunks = chunk_document(
                         document,
                         self.settings.LLM_CHUNK_MAX_CHARS,
                         max_numeric_candidates=MAX_NUMERIC_CANDIDATES_PER_CHUNK,
-                    ):
+                    )
+                    for chunk_index, blocks in enumerate(chunks, start=1):
+                        current_chunk_index = chunk_index
                         extraction = await self.llm.extract_facts(
                             compact_extraction_payload(document, blocks)
                         )
@@ -232,6 +289,25 @@ class DraftReviewWorkflowExecutor:
                     ValidationError,
                     TimeoutError,
                 ) as exc:
+                    error_category = _dynamic_failure_code(exc)
+                    failure_counts[error_category] = failure_counts.get(error_category, 0) + 1
+                    log_fields: dict[str, Any] = {
+                        "task_id": state["task_id"],
+                        "stage": "FACT_EXTRACTION",
+                        "document_role": document.role,
+                        "chunk_index": current_chunk_index,
+                        "error_category": error_category,
+                        "affected_count": 1,
+                        "failure_counts": failure_counts,
+                    }
+                    validation_items = _safe_validation_items(exc)
+                    if error_category == "LLM_RESPONSE_SCHEMA_INVALID":
+                        log_fields["validation_summary_status"] = (
+                            "PRESENT" if validation_items else "MISSING"
+                        )
+                        if validation_items:
+                            log_fields["validation_summary"] = validation_items
+                    logger.error("draft_review_dynamic_check_failed", **log_fields)
                     raise WorkflowError(
                         "DYNAMIC_CHECK_INCOMPLETE",
                         f"文件 {document.file_name} 的动态事实检查未能可靠完成",

@@ -26,7 +26,11 @@ from app.documents.normalization import normalize_text
 
 
 class EvidenceValidationError(ValueError):
-    pass
+    def __init__(
+        self, message: str, *, code: str = "LLM_RESPONSE_SCHEMA_INVALID"
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -138,7 +142,10 @@ def build_fact_index(extractions: dict[str, DocumentFactExtraction]) -> FactInde
     for file_id, extraction in extractions.items():
         for fact in extraction.facts:
             if fact.source_file_id != file_id:
-                raise EvidenceValidationError("fact index source_file_id does not match extraction")
+                raise EvidenceValidationError(
+                    "fact index source_file_id does not match extraction",
+                    code="FILE_ID_MISMATCH",
+                )
             fact_id = stable_fact_id(fact)
             ref = (fact_id, fact.source_file_id)
             existing = index.get(ref)
@@ -146,7 +153,9 @@ def build_fact_index(extractions: dict[str, DocumentFactExtraction]) -> FactInde
                 index[ref] = FactIndexEntry(fact_id=fact_id, fact=fact)
                 continue
             if fact_identity_key(existing.fact) != fact_identity_key(fact):
-                raise EvidenceValidationError("stable fact_id collision")
+                raise EvidenceValidationError(
+                    "stable fact_id collision", code="FACT_IDENTITY_DUPLICATED"
+                )
             # Chunked extraction can repeat an identical fact. Keep one stable
             # identity while retaining the strongest grounded model confidence.
             if fact.confidence > existing.fact.confidence:
@@ -369,7 +378,34 @@ def compact_extraction_payload(
         {**item, "location": compact_location(block.location)}
         for block, item in zip(blocks, payload["blocks"], strict=True)
     ]
-    payload["evidence_blocks"] = list(payload["blocks"])
+    evidence_blocks = list(payload["blocks"])
+    for block in blocks:
+        if block.table is None:
+            continue
+        for row in block.table.rows:
+            for column, cell in enumerate(row.cells):
+                location = cell.location.model_copy(
+                    update={
+                        "table_index": block.table.table_index,
+                        "row": row.row,
+                        "column": (
+                            cell.location.column
+                            if cell.location.column is not None
+                            else column
+                        ),
+                    }
+                )
+                evidence_blocks.append(
+                    {
+                        "block_id": (
+                            f"{block.block_id}_r{row.row:04d}_c{location.column or column:04d}"
+                        ),
+                        "type": "TABLE_CELL",
+                        "text": cell.raw_text,
+                        "location": compact_location(location),
+                    }
+                )
+    payload["evidence_blocks"] = evidence_blocks
     payload["numeric_candidates"] = numeric_candidates(blocks)
     payload["numeric_candidate_metrics"] = numeric_candidate_metrics(blocks)
     payload["extraction_requirements"] = {
@@ -435,7 +471,9 @@ def expand_compact_extraction(
 
     file_id = payload.get("file_id")
     if compact.profile.file_id != file_id:
-        raise EvidenceValidationError("compact profile file_id does not match payload")
+        raise EvidenceValidationError(
+            "compact profile file_id does not match payload", code="FILE_ID_MISMATCH"
+        )
     evidence_by_location: dict[tuple[object, ...], list[str]] = defaultdict(list)
     for item in payload.get("evidence_blocks", payload.get("blocks", [])):
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
@@ -448,12 +486,20 @@ def expand_compact_extraction(
 
     profile_locations = compact.profile.evidence_locations
     if any(location_key(location) not in evidence_by_location for location in profile_locations):
-        raise EvidenceValidationError("compact profile evidence location does not exist")
+        raise EvidenceValidationError(
+            "compact profile evidence location does not exist",
+            code="PROFILE_LOCATION_NOT_FOUND",
+        )
 
     facts: list[FactCandidate] = []
     seen_facts: set[tuple[object, ...]] = set()
     for compact_fact in compact.facts:
-        candidates = evidence_by_location.get(location_key(compact_fact.location), [])
+        fact_location = location_key(compact_fact.location)
+        candidates = evidence_by_location.get(fact_location, [])
+        if not candidates:
+            raise EvidenceValidationError(
+                "compact fact location does not exist", code="FACT_LOCATION_NOT_FOUND"
+            )
         raw_value = normalize_text(compact_fact.raw_value)
         evidence_text = next(
             (
@@ -464,14 +510,20 @@ def expand_compact_extraction(
             None,
         )
         if evidence_text is None:
-            raise EvidenceValidationError("compact fact raw_value is not grounded at its location")
+            raise EvidenceValidationError(
+                "compact fact raw_value is not grounded at its location",
+                code="FACT_VALUE_NOT_GROUNDED",
+            )
         identity = (
             compact_fact.field_key,
             location_key(compact_fact.location),
             raw_value,
         )
         if identity in seen_facts:
-            raise EvidenceValidationError("compact extraction contains duplicate fact identity")
+            raise EvidenceValidationError(
+                "compact extraction contains duplicate fact identity",
+                code="FACT_IDENTITY_DUPLICATED",
+            )
         seen_facts.add(identity)
         facts.append(
             FactCandidate(
@@ -776,28 +828,50 @@ def validate_extraction_evidence(
     extraction: DocumentFactExtraction,
 ) -> None:
     if extraction.profile.file_id != document.file_id:
-        raise EvidenceValidationError("profile file_id does not match parsed document")
+        raise EvidenceValidationError(
+            "profile file_id does not match parsed document", code="FILE_ID_MISMATCH"
+        )
     evidence = _evidence_at(document)
     for location in extraction.profile.evidence_locations:
         if location_key(location) not in evidence:
-            raise EvidenceValidationError("profile evidence location does not exist")
+            raise EvidenceValidationError(
+                "profile evidence location does not exist",
+                code="PROFILE_LOCATION_NOT_FOUND",
+            )
     for fact in extraction.facts:
         if fact.source_file_id != document.file_id:
-            raise EvidenceValidationError("fact source_file_id does not match parsed document")
-        candidates = evidence.get(location_key(fact.location), [])
+            raise EvidenceValidationError(
+                "fact source_file_id does not match parsed document",
+                code="FILE_ID_MISMATCH",
+            )
+        fact_location = location_key(fact.location)
+        candidates = evidence.get(fact_location, [])
+        if not candidates:
+            raise EvidenceValidationError(
+                "fact evidence location does not exist", code="FACT_LOCATION_NOT_FOUND"
+            )
         normalized_fact_evidence = normalize_text(fact.evidence_text)
-        if not candidates or not any(
+        if not any(
             normalized_fact_evidence in normalize_text(candidate) for candidate in candidates
         ):
-            raise EvidenceValidationError("fact evidence is not present at the declared location")
+            raise EvidenceValidationError(
+                "fact evidence is not present at the declared location",
+                code="FACT_VALUE_NOT_GROUNDED",
+            )
     for concept in extraction.semantic_concepts:
         for location in concept.evidence_locations:
             if location_key(location) not in evidence:
-                raise EvidenceValidationError("semantic concept evidence location does not exist")
+                raise EvidenceValidationError(
+                    "semantic concept evidence location does not exist",
+                    code="FACT_LOCATION_NOT_FOUND",
+                )
     for spec in extraction.validation_specs:
         for location in spec.evidence_locations:
             if location_key(location) not in evidence:
-                raise EvidenceValidationError("validation evidence location does not exist")
+                raise EvidenceValidationError(
+                    "validation evidence location does not exist",
+                    code="FACT_LOCATION_NOT_FOUND",
+                )
 
 
 def _semantic_evidence_exists(

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from app.adapters.llm.schemas import (
+    CompactDocumentFactExtraction,
     DocumentFactExtraction,
     FactCandidate,
     FactReview,
@@ -25,6 +26,8 @@ from app.draft_review.facts import (
     build_fact_matrix,
     build_fact_review_batches,
     chunk_document,
+    compact_extraction_payload,
+    expand_compact_extraction,
     fact_conflict_diff_items,
     fact_matrix_result_items,
     merge_chunk_extractions,
@@ -113,8 +116,138 @@ def test_evidence_must_exist_at_declared_location() -> None:
     validate_extraction_evidence(document, valid)
 
     invalid = extraction("fil_a", "2000万元")
-    with pytest.raises(EvidenceValidationError):
+    with pytest.raises(EvidenceValidationError) as error:
         validate_extraction_evidence(document, invalid)
+    assert error.value.code == "FACT_VALUE_NOT_GROUNDED"
+
+
+def _table_document(file_id: str = "fil_table") -> ParsedDocument:
+    location = DocumentLocation(table_index=0, row=0, column=0)
+    table = ParsedTable(
+        table_index=0,
+        rows=[
+            TableRow(
+                row=0,
+                cells=[
+                    TableCell(
+                        raw_text="融资金额1000万元",
+                        normalized_text="融资金额1000万元",
+                        location=location,
+                    )
+                ],
+            )
+        ],
+    )
+    return ParsedDocument(
+        file_id=file_id,
+        role="REFERENCE",
+        file_name="table.docx",
+        sha256="a" * 64,
+        page_count=None,
+        parser_name="python-docx",
+        blocks=[
+            DocumentBlock(
+                block_id="table",
+                type="TABLE",
+                order=0,
+                raw_text="融资金额1000万元",
+                normalized_text="融资金额1000万元",
+                location=DocumentLocation(table_index=0),
+                table=table,
+            )
+        ],
+    )
+
+
+def test_compact_payload_includes_table_cells_and_recovers_cell_evidence() -> None:
+    document = _table_document()
+    payload = compact_extraction_payload(document, document.blocks)
+    assert {
+        "table_index": 0,
+        "row": 0,
+        "column": 0,
+    } in [item["location"] for item in payload["evidence_blocks"]]
+    compact = CompactDocumentFactExtraction.model_validate(
+        {
+            "profile": {
+                "file_id": "fil_table",
+                "document_kind": "项目资料",
+                "title": None,
+                "confidence": 0.9,
+                "evidence_locations": [{"table_index": 0}],
+            },
+            "facts": [
+                {
+                    "field_key": "financing_amount",
+                    "display_name": "融资金额",
+                    "value_type": "MONEY",
+                    "raw_value": "1000万元",
+                    "location": {"table_index": 0, "row": 0, "column": 0},
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    expanded = expand_compact_extraction(payload, compact)
+
+    assert expanded.facts[0].evidence_text == "融资金额1000万元"
+    assert expanded.facts[0].source_file_id == "fil_table"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("profile_location", "PROFILE_LOCATION_NOT_FOUND"),
+        ("fact_location", "FACT_LOCATION_NOT_FOUND"),
+        ("fact_value", "FACT_VALUE_NOT_GROUNDED"),
+        ("duplicate_fact", "FACT_IDENTITY_DUPLICATED"),
+        ("file_id", "FILE_ID_MISMATCH"),
+    ],
+)
+def test_compact_extraction_failures_have_explicit_safe_codes(
+    case: str, expected_code: str
+) -> None:
+    payload = {
+        "file_id": "fil_a",
+        "evidence_blocks": [
+            {"text": "融资金额为1000万元", "location": {"paragraph_index": 0}}
+        ],
+    }
+    profile_file_id = "fil_other" if case == "file_id" else "fil_a"
+    profile_location = {"paragraph_index": 9} if case == "profile_location" else {
+        "paragraph_index": 0
+    }
+    fact_location = {"paragraph_index": 9} if case == "fact_location" else {
+        "paragraph_index": 0
+    }
+    raw_value = "2000万元" if case == "fact_value" else "1000万元"
+    fact = {
+        "field_key": "financing_amount",
+        "display_name": "融资金额",
+        "value_type": "MONEY",
+        "raw_value": raw_value,
+        "location": fact_location,
+        "confidence": 0.9,
+    }
+    facts = [fact, {**fact}] if case == "duplicate_fact" else [fact]
+    compact = CompactDocumentFactExtraction.model_validate(
+        {
+            "profile": {
+                "file_id": profile_file_id,
+                "document_kind": "项目资料",
+                "title": None,
+                "confidence": 0.9,
+                "evidence_locations": [profile_location],
+            },
+            "facts": facts,
+        }
+    )
+
+    with pytest.raises(EvidenceValidationError) as error:
+        expand_compact_extraction(payload, compact)
+
+    assert error.value.code == expected_code
 
 
 def _accepted_review(extracted: DocumentFactExtraction, **overrides: object) -> FactReview:

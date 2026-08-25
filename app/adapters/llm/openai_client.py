@@ -37,6 +37,7 @@ EXTRACTION_SYSTEM_PROMPT = (
     "confidence 和可选 concept_id。"
     "不要返回 evidence_text、source_file_id、normalized_hint、missing_field_keys、"
     "semantic_concepts 或 validation_specs。"
+    "表格事实优先使用 table_index、row、column 的单元格位置；表格整体事实可使用 table_index。"
     "raw_value 必须逐字来自 location 对应的输入证据块；不得推测、补全、换算、修正或改写原值。"
     "只返回 profile 和 facts，facts 不得超过 Schema 上限。"
 )
@@ -81,12 +82,16 @@ class LlmClientError(Exception):
         *,
         retryable: bool = False,
         correction_message: str | None = None,
+        failure_code: str | None = None,
+        validation_summary: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.code = code
         self.safe_message = safe_message
         self.retryable = retryable
         self.correction_message = correction_message
+        self.failure_code = failure_code
+        self.validation_summary = validation_summary
 
 
 def completion_body(
@@ -164,6 +169,52 @@ def _json_object(content: str) -> dict[str, Any]:
     return value
 
 
+def _safe_validation_summary(
+    error: ValidationError,
+    *,
+    max_items: int = 8,
+) -> dict[str, Any]:
+    grouped: dict[tuple[str, str], int] = {}
+    errors = error.errors()
+    for item in errors:
+        raw_location = item.get("loc", ())
+        if isinstance(raw_location, (list, tuple)):
+            location = raw_location
+        else:
+            location = (raw_location,)
+        path_parts = [
+            "*" if isinstance(part, int) else part
+            for part in location
+            if isinstance(part, (int, str))
+        ]
+        path = ".".join(path_parts) or "$"
+        error_type = item.get("type")
+        if not isinstance(error_type, str) or not error_type:
+            error_type = "validation_error"
+        key = (path, error_type)
+        grouped[key] = grouped.get(key, 0) + 1
+
+    items = [
+        {"path": path, "error_type": error_type, "count": count}
+        for (path, error_type), count in sorted(grouped.items())
+    ]
+    return {
+        "error_count": len(errors),
+        "items": items[:max_items],
+        "truncated": len(items) > max_items,
+    }
+
+
+def _schema_correction_message(summary: dict[str, Any]) -> str:
+    safe_summary = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "上一响应未通过事实抽取 JSON Schema。仅根据以下安全结构摘要修正，"
+        "并完整返回一个符合 Schema 的 JSON 对象："
+        f"{safe_summary}。不得输出 Markdown、解释或证据正文；"
+        "不得修改、推测、补全或改写事实原值和位置。"
+    )
+
+
 def _validate_extraction(value: Any) -> dict[str, Any]:
     try:
         return DocumentFactExtraction.model_validate(value).model_dump(mode="json")
@@ -175,10 +226,20 @@ def _validate_compact_extraction(value: Any, payload: dict[str, Any]) -> dict[st
     try:
         compact = CompactDocumentFactExtraction.model_validate(value)
         return expand_compact_extraction(payload, compact).model_dump(mode="json")
-    except (ValidationError, EvidenceValidationError) as exc:
+    except EvidenceValidationError as exc:
         raise LlmClientError(
             "LLM_EXTRACTION_EVIDENCE_INVALID",
             "模型紧凑事实结果未通过安全证据校验",
+            failure_code=exc.code,
+        ) from exc
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型事实结果不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=summary,
         ) from exc
 
 

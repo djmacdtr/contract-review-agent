@@ -273,6 +273,131 @@ async def test_probe_models_and_valid_fenced_json() -> None:
     assert result.structure_retries == 0
 
 
+async def test_compact_extraction_preserves_safe_evidence_failure_code() -> None:
+    invalid = json.loads(extraction_content())
+    invalid["facts"][0]["raw_value"] = "2000万元"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices":[{"message": {"content": json.dumps(invalid, ensure_ascii=False)}}],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_STRUCTURE_RETRY_ATTEMPTS=0),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as error:
+        await client.extract_facts(extraction_payload())
+
+    assert error.value.code == "LLM_EXTRACTION_EVIDENCE_INVALID"
+    assert error.value.failure_code == "FACT_VALUE_NOT_GROUNDED"
+
+
+async def test_compact_extraction_schema_failure_has_safe_code() -> None:
+    requests: list[dict[str, Any]] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(_request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices":[{"message": {"content": '{"profile": {}, "facts": []}'}}],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_STRUCTURE_RETRY_ATTEMPTS=0),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as error:
+        await client.extract_facts(extraction_payload())
+
+    assert error.value.failure_code == "LLM_RESPONSE_SCHEMA_INVALID"
+    assert len(requests) == 1
+
+
+async def test_compact_schema_summary_is_safe_and_normalized() -> None:
+    invalid = json.loads(extraction_content())
+    invalid["facts"][0]["value_type"] = "NOT_A_VALUE"
+    invalid["facts"][0]["raw_value"] = "SECRET_FACT_VALUE"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices":[{"message": {"content": json.dumps(invalid)}}],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_STRUCTURE_RETRY_ATTEMPTS=0),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as error:
+        await client.extract_facts(extraction_payload())
+
+    summary = error.value.validation_summary
+    assert summary is not None
+    assert summary["error_count"] >= 1
+    assert {
+        "path": "facts.*.value_type",
+        "error_type": "literal_error",
+        "count": 1,
+    } in summary["items"]
+    safe_text = json.dumps(summary, ensure_ascii=False) + (error.value.correction_message or "")
+    assert "NOT_A_VALUE" not in safe_text
+    assert "SECRET_FACT_VALUE" not in safe_text
+    assert "msg" not in safe_text
+    assert "input" not in safe_text
+    assert "ctx" not in safe_text
+
+
+async def test_compact_schema_summary_drives_one_safe_correction() -> None:
+    invalid = json.loads(extraction_content())
+    invalid["facts"][0]["value_type"] = "NOT_A_VALUE"
+    responses = iter([json.dumps(invalid), extraction_content()])
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices":[{"message": {"content": next(responses)}}],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_STRUCTURE_RETRY_ATTEMPTS=1),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.extract_facts(extraction_payload())
+
+    assert result.structure_retries == 1
+    assert len(requests) == 2
+    correction = requests[1]["messages"][-1]["content"]
+    assert "facts.*.value_type" in correction
+    assert "literal_error" in correction
+    assert '"count":1' in correction
+    assert "NOT_A_VALUE" not in correction
+    assert result.value["facts"][0]["field_key"] == "financing_amount"
+
+
 async def test_invalid_json_and_schema_are_retried_then_succeed() -> None:
     responses = iter(
         [

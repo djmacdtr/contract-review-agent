@@ -11,7 +11,11 @@ from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.schemas.results import TaskResultData
 from app.services.downloader import SafeFileDownloadService
-from app.workflows.draft_review import DraftReviewWorkflowExecutor
+from app.workflows.draft_review import (
+    DraftReviewWorkflowExecutor,
+    _dynamic_failure_code,
+    logger,
+)
 
 
 class EvidencedLlm:
@@ -54,6 +58,51 @@ class EvidencedLlm:
             duration_ms=10,
             request_attempts=1,
         )
+
+
+class ClassifiedFailureLlm(EvidencedLlm):
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型紧凑事实结果未通过安全证据校验",
+            failure_code="FACT_LOCATION_NOT_FOUND",
+        )
+
+
+class SchemaFailureLlm(EvidencedLlm):
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型事实结果不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary={
+                "error_count": 1,
+                "items": [
+                    {
+                        "path": "facts.*.value_type",
+                        "error_type": "literal_error",
+                        "count": 1,
+                    }
+                ],
+                "truncated": False,
+            },
+        )
+
+
+class SchemaFailureWithoutSummaryLlm(EvidencedLlm):
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型事实结果不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+        )
+
+
+class RawSchemaFailureLlm(EvidencedLlm):
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        result = await super().extract_facts(payload)
+        result.value["facts"][0]["value_type"] = "NOT_A_VALUE"
+        return result
 
 
 def build_docx(path: Path, title: str, body: str) -> bytes:
@@ -591,6 +640,116 @@ async def test_draft_review_uses_evidenced_llm_results_without_losing_rule_resul
     assert len(result["metadata"]["model_runs"]) == 2
     assert result["fact_matrix"][0]["status"] == "CONSISTENT"
     assert any(item["module_code"] == "FACT_CONSISTENCY" for item in result["passed_checks"])
+
+
+async def test_dynamic_extraction_failure_logs_safe_category_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def record_error(event: str, **kwargs: object) -> None:
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(logger, "error", record_error)
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, ClassifiedFailureLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert error.value.details is None
+    assert _dynamic_failure_code(
+        LlmClientError("LLM_TIMEOUT", "upstream failed")
+    ) == "LLM_UPSTREAM_FAILED"
+    assert len(events) == 1
+    event, fields = events[0]
+    assert event == "draft_review_dynamic_check_failed"
+    assert fields == {
+        "task_id": "tsk_consensus_fixture",
+        "stage": "FACT_EXTRACTION",
+        "document_role": "TARGET",
+        "chunk_index": 1,
+        "error_category": "FACT_LOCATION_NOT_FOUND",
+        "affected_count": 1,
+        "failure_counts": {"FACT_LOCATION_NOT_FOUND": 1},
+    }
+
+
+async def test_dynamic_schema_failure_logs_safe_validation_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def record_error(event: str, **kwargs: object) -> None:
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(logger, "error", record_error)
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, SchemaFailureLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert error.value.details is None
+    assert len(events) == 1
+    fields = events[0][1]
+    assert fields["error_category"] == "LLM_RESPONSE_SCHEMA_INVALID"
+    assert fields["validation_summary_status"] == "PRESENT"
+    assert fields["validation_summary"] == [
+        {
+            "path": "facts.*.value_type",
+            "error_type": "literal_error",
+            "count": 1,
+        }
+    ]
+
+
+async def test_dynamic_schema_failure_without_summary_logs_missing_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def record_error(event: str, **kwargs: object) -> None:
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(logger, "error", record_error)
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, SchemaFailureWithoutSummaryLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    fields = events[0][1]
+    assert fields["validation_summary_status"] == "MISSING"
+    assert "validation_summary" not in fields
+
+
+async def test_dynamic_raw_validation_error_logs_safe_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, dict]] = []
+
+    def record_error(event: str, **kwargs: object) -> None:
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(logger, "error", record_error)
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, RawSchemaFailureLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert error.value.details is None
+    fields = events[0][1]
+    assert fields["validation_summary_status"] == "PRESENT"
+    assert fields["validation_summary"] == [
+        {
+            "path": "facts.*.value_type",
+            "error_type": "literal_error",
+            "count": 1,
+        }
+    ]
+    safe_text = str(fields["validation_summary"])
+    assert "NOT_A_VALUE" not in safe_text
+    assert "msg" not in safe_text
+    assert "input" not in safe_text
+    assert "ctx" not in safe_text
 
 
 @pytest.mark.parametrize(
