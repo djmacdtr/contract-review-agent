@@ -37,6 +37,7 @@ const labels: Record<string, string> = {
   TABLE_ROW_ADDED: '表格新增行',
   TABLE_ROW_DELETED: '表格删除行',
   TABLE_CELL_CHANGED: '表格单元格变更',
+  TABLE_STRUCTURE_EXPANDED: '表格结构发生变化',
   PAGE_MISSING: '页面内容缺失',
   CONTENT_BLOCK_MISSING: '连续内容缺失',
   DELETION_OR_MISSING: '删除 / 缺失',

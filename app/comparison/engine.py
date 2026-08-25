@@ -63,6 +63,7 @@ def _make_diff(
         "TABLE_ROW_ADDED": "目标表格新增行",
         "TABLE_ROW_DELETED": "目标表格缺少行",
         "TABLE_CELL_CHANGED": "表格单元格发生变化",
+        "TABLE_STRUCTURE_EXPANDED": "模板表格结构发生变化",
     }
     locations = [block.location for block in (baseline, target) if block is not None]
     ocr_locations = [location for location in locations if location.source == "OCR"]

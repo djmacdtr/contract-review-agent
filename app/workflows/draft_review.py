@@ -139,11 +139,6 @@ class DraftReviewWorkflowExecutor:
             )
             if not review.diagnostics.comparison.reliable:
                 raise WorkflowError("COMPARISON_UNRELIABLE", "目标合同与模板的对齐覆盖率不足")
-            if review.diagnostics.expanded_table_count:
-                raise WorkflowError(
-                    "COMPARISON_INCOMPLETE",
-                    "目标合同与模板存在无法可靠完成逐项检查的表格结构变化",
-                )
             return {"template_review": review}
 
         async def extract_facts(state: DraftReviewState) -> dict[str, Any]:
@@ -691,11 +686,6 @@ class DraftReviewWorkflowExecutor:
             raise WorkflowError(
                 "COMPARISON_UNRELIABLE",
                 "目标合同与模板的对齐覆盖率不足，未生成正式报告",
-            )
-        if template_review.diagnostics.expanded_table_count:
-            raise WorkflowError(
-                "UNSUPPORTED_TABLE_EXPANSION",
-                "目标合同包含无法可靠检查的扩展表格，未生成正式报告",
             )
         input_by_id = {item["file_id"]: item for item in input_files}
         files: list[dict[str, Any]] = []

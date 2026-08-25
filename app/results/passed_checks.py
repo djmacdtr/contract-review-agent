@@ -33,7 +33,12 @@ CONTENT_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         ),
     ),
 )
-TABLE_DIFF_TYPES = {"TABLE_ROW_ADDED", "TABLE_ROW_DELETED", "TABLE_CELL_CHANGED"}
+TABLE_DIFF_TYPES = {
+    "TABLE_ROW_ADDED",
+    "TABLE_ROW_DELETED",
+    "TABLE_CELL_CHANGED",
+    "TABLE_STRUCTURE_EXPANDED",
+}
 
 
 def _document_text(document: ParsedDocument) -> str:

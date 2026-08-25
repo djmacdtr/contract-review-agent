@@ -64,6 +64,23 @@ def build_docx(path: Path, title: str, body: str) -> bytes:
     return path.read_bytes()
 
 
+def build_table_docx(path: Path, title: str, body: str, *, expanded: bool) -> bytes:
+    document = Document()
+    document.add_heading(title, level=1)
+    document.add_paragraph(body)
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "字段"
+    table.cell(0, 1).text = "填写值"
+    table.cell(1, 0).text = "融资金额"
+    table.cell(1, 1).text = "100"
+    if expanded:
+        row = table.add_row()
+        row.cells[0].text = "附加字段"
+        row.cells[1].text = "附加内容"
+    document.save(path)
+    return path.read_bytes()
+
+
 class ConsensusFixtureLlm:
     def __init__(
         self,
@@ -331,10 +348,25 @@ async def run_consensus_fixture(
     same_model_diagnostic: bool = False,
     target_body: str = "金额100",
     template_body: str = "金额100",
+    expanded_table: bool = False,
 ) -> dict:
+    target_bytes = (
+        build_table_docx(
+            tmp_path / "target.docx", "合同", target_body, expanded=True
+        )
+        if expanded_table
+        else build_docx(tmp_path / "target.docx", "合同", target_body)
+    )
+    template_bytes = (
+        build_table_docx(
+            tmp_path / "template.docx", "合同", template_body, expanded=False
+        )
+        if expanded_table
+        else build_docx(tmp_path / "template.docx", "合同", template_body)
+    )
     bodies = {
-        "/target.docx": build_docx(tmp_path / "target.docx", "合同", target_body),
-        "/template.docx": build_docx(tmp_path / "template.docx", "合同", template_body),
+        "/target.docx": target_bytes,
+        "/template.docx": template_bytes,
         "/reference.docx": build_docx(tmp_path / "reference.docx", "资料", "金额100"),
     }
 
@@ -630,6 +662,33 @@ async def test_semantic_plan_runs_after_mapping_and_is_programmatically_checked(
     )
     assert any(run["purpose"] == "SEMANTIC_PLAN" for run in result["metadata"]["model_runs"])
     assert any(check["rule_id"] == "amount_positive" for check in result["rule_checks"])
+
+
+async def test_expanded_table_continues_into_facts_and_advice(tmp_path: Path) -> None:
+    llm = ConsensusFixtureLlm()
+    result = await run_consensus_fixture(tmp_path, llm, expanded_table=True)
+
+    TaskResultData.model_validate(result)
+    assert any(
+        item["diff_type"] == "TABLE_STRUCTURE_EXPANDED" for item in result["diff_items"]
+    )
+    assert any(run["purpose"] == "FACT_EXTRACTION" for run in result["metadata"]["model_runs"])
+    assert any(
+        warning["code"] == "TEMPLATE_TABLE_STRUCTURE_EXPANDED"
+        for warning in result["warnings"]
+    )
+    structure_diff_ids = {
+        item["diff_id"]
+        for item in result["diff_items"]
+        if item["diff_type"] == "TABLE_STRUCTURE_EXPANDED"
+    }
+    structure_risks = [
+        risk
+        for risk in result["risk_items"]
+        if structure_diff_ids.intersection(risk["related_diff_ids"])
+    ]
+    assert structure_risks
+    assert all(risk.get("analysis_advice") for risk in structure_risks)
 
 
 async def test_same_model_diagnostic_never_claims_independent_consensus_or_pass(

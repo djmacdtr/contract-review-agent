@@ -41,6 +41,7 @@ class DiffItem(BaseModel):
         "TABLE_ROW_ADDED",
         "TABLE_ROW_DELETED",
         "TABLE_CELL_CHANGED",
+        "TABLE_STRUCTURE_EXPANDED",
         "PAGE_MISSING",
         "CONTENT_BLOCK_MISSING",
     ]

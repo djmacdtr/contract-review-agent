@@ -6,13 +6,19 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.comparison.engine import NUMBER_PATTERN, CompareOptions, compare_documents
-from app.comparison.models import ComparisonDiagnostics, DiffItem, DiffSide
+from app.comparison.models import ComparisonDiagnostics, DiffItem, DiffSegment, DiffSide
 from app.comparison.reliable import (
     build_diff_segments,
     comparison_display_text,
     comparison_normalize,
 )
-from app.documents.models import DocumentLocation, ParsedDocument, ProcessingWarning, TableCell
+from app.documents.models import (
+    DocumentBlock,
+    DocumentLocation,
+    ParsedDocument,
+    ProcessingWarning,
+    TableCell,
+)
 
 SYMBOLIC_PLACEHOLDER = re.compile(
     r"##\{[^{}\r\n]+\}|\{\{[^{}\r\n]+\}\}|\$\{[^{}\r\n]+\}|"
@@ -92,6 +98,8 @@ def _matches_filled_template(template_text: str, target_text: str) -> bool:
 
 
 def _allowed_fill_diff(diff: DiffItem) -> bool:
+    if diff.diff_type == "TABLE_STRUCTURE_EXPANDED":
+        return False
     if not diff.baseline or not diff.target:
         return False
     before, after = diff.baseline.text, diff.target.text
@@ -266,6 +274,73 @@ def _table_cell_diff(
     )
 
 
+def _table_block(document: ParsedDocument, table_index: int) -> DocumentBlock | None:
+    return next(
+        (
+            block
+            for block in document.blocks
+            if block.type == "TABLE"
+            and block.table is not None
+            and block.table.table_index == table_index
+        ),
+        None,
+    )
+
+
+def _table_text(block: DocumentBlock | None) -> str:
+    if block is None or block.table is None:
+        return ""
+    return "\n".join(
+        "\t".join(cell.raw_text for cell in row.cells) for row in block.table.rows
+    )
+
+
+def _table_structure_diff(
+    table_index: int, template: ParsedDocument, target: ParsedDocument
+) -> DiffItem:
+    before_block = _table_block(template, table_index)
+    after_block = _table_block(target, table_index)
+    before_text = comparison_display_text(_table_text(before_block))
+    after_text = comparison_display_text(_table_text(after_block))
+    if before_block and after_block:
+        segments, _, _ = build_diff_segments(before_text, after_text)
+    elif before_block:
+        segments = [DiffSegment(operation="DELETE", text=before_text)] if before_text else []
+    elif after_block:
+        segments = [DiffSegment(operation="INSERT", text=after_text)] if after_text else []
+    else:
+        segments = []
+    return DiffItem(
+        diff_id=f"draft_table_structure_{table_index:06d}",
+        diff_type="TABLE_STRUCTURE_EXPANDED",
+        title="模板表格结构发生变化",
+        baseline=(
+            DiffSide(
+                file_id=template.file_id,
+                location=before_block.location,
+                locations=[before_block.location],
+                text=before_text,
+            )
+            if before_block
+            else None
+        ),
+        target=(
+            DiffSide(
+                file_id=target.file_id,
+                location=after_block.location,
+                locations=[after_block.location],
+                text=after_text,
+            )
+            if after_block
+            else None
+        ),
+        segments=segments,
+        confidence=0.95,
+        requires_manual_review=True,
+        certainty="CONFIRMED",
+    )
+
+
 def _compare_compatible_table_cells(
     template: ParsedDocument, target: ParsedDocument, start_index: int
 ) -> tuple[list[DiffItem], list[int]]:
@@ -306,12 +381,17 @@ def _without_tables(document: ParsedDocument) -> ParsedDocument:
 
 
 def _required_empty_table_rules(
-    template: ParsedDocument, target: ParsedDocument, start_index: int
+    template: ParsedDocument,
+    target: ParsedDocument,
+    start_index: int,
+    skip_table_indexes: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     template_cells = _cell_at(template)
     target_cells = _cell_at(target)
     rules: list[dict[str, Any]] = []
     for (table_index, row, column), template_cell in template_cells.items():
+        if skip_table_indexes and table_index in skip_table_indexes:
+            continue
         if column == 0:
             continue
         target_cell = target_cells.get((table_index, row, column))
@@ -366,8 +446,12 @@ def analyze_template(
     table_differences, expanded_table_indexes = _compare_compatible_table_cells(
         template, target, start_index=len(comparison.diff_items) + 1
     )
+    structure_differences = [
+        _table_structure_diff(table_index, template, target)
+        for table_index in expanded_table_indexes
+    ]
     raw_differences, coalesced_fill_count = _coalesce_positional_fills(
-        [*comparison.diff_items, *table_differences]
+        [*comparison.diff_items, *table_differences, *structure_differences]
     )
     retained: list[DiffItem] = []
     filtered: list[FilteredTemplateDiff] = []
@@ -382,7 +466,12 @@ def analyze_template(
     if check_blank_fields:
         rule_checks = _unresolved_rules(target)
         rule_checks.extend(
-            _required_empty_table_rules(template, target, start_index=len(rule_checks) + 1)
+            _required_empty_table_rules(
+                template,
+                target,
+                start_index=len(rule_checks) + 1,
+                skip_table_indexes=set(expanded_table_indexes),
+            )
         )
     warnings = list(comparison.warnings)
     if expanded_table_indexes:

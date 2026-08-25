@@ -1,8 +1,5 @@
-import pytest
-
 from app.comparison.models import DiffItem, DiffSide
 from app.core.config import Settings
-from app.core.errors import WorkflowError
 from app.documents.models import (
     DocumentBlock,
     DocumentLocation,
@@ -12,6 +9,7 @@ from app.documents.models import (
     TableRow,
 )
 from app.draft_review.template_checks import _coalesce_positional_fills, analyze_template
+from app.schemas.results import TaskResultData
 from app.workflows.draft_review import DraftReviewWorkflowExecutor
 
 
@@ -245,19 +243,43 @@ def test_expanded_template_table_does_not_make_paragraph_alignment_unreliable() 
 
     assert result.diagnostics.comparison.reliable is True
     assert result.diagnostics.expanded_table_count == 1
-    assert result.diff_items == []
+    assert len(result.diff_items) == 1
+    structure_diff = result.diff_items[0]
+    assert structure_diff.diff_type == "TABLE_STRUCTURE_EXPANDED"
+    assert structure_diff.certainty == "CONFIRMED"
+    assert structure_diff.requires_manual_review is True
+    assert structure_diff.baseline is not None
+    assert structure_diff.baseline.file_id == "fil_template"
+    assert structure_diff.baseline.location.table_index == 0
+    assert "融资金额" in structure_diff.baseline.text
+    assert structure_diff.target is not None
+    assert structure_diff.target.file_id == "fil_target"
+    assert structure_diff.target.location.table_index == 0
+    assert "附加字段" in structure_diff.target.text
+    assert not any(
+        item["rule_id"].split(".")[1] == "required_table_cell_empty"
+        for item in result.failed_rule_checks
+    )
     assert [warning.code for warning in result.warnings] == [
         "TEMPLATE_TABLE_STRUCTURE_EXPANDED"
     ]
     executor = DraftReviewWorkflowExecutor(Settings(_env_file=None))
-    with pytest.raises(WorkflowError, match="扩展表格"):
-        executor._build_result(
-            "tsk_expanded_table",
-            [],
-            [template, target],
-            result,
-            {},
-        )
+    output = executor._build_result(
+        "tsk_expanded_table",
+        [
+            {"file_id": "fil_template", "safe_url": "https://fixture/template"},
+            {"file_id": "fil_target", "safe_url": "https://fixture/target"},
+        ],
+        [template, target],
+        result,
+        {},
+    )
+    parsed = TaskResultData.model_validate(output)
+    assert parsed.diff_items[0].diff_type == "TABLE_STRUCTURE_EXPANDED"
+    assert any(
+        structure_diff.diff_id in risk.related_diff_ids for risk in parsed.risk_items
+    )
+    assert not any(check.check_id.endswith("_tables") for check in parsed.passed_checks)
 
 
 def test_positional_added_deleted_placeholder_pair_is_coalesced() -> None:

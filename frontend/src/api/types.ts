@@ -41,7 +41,7 @@ export interface MissingDetail {
 }
 export interface DiffItem {
   diff_id: string
-  diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED' | 'PAGE_MISSING' | 'CONTENT_BLOCK_MISSING'
+  diff_type: 'ADDED' | 'DELETED' | 'MODIFIED' | 'NUMERIC_CHANGED' | 'TABLE_ROW_ADDED' | 'TABLE_ROW_DELETED' | 'TABLE_CELL_CHANGED' | 'TABLE_STRUCTURE_EXPANDED' | 'PAGE_MISSING' | 'CONTENT_BLOCK_MISSING'
   title: string; baseline?: DiffSide; target?: DiffSide; segments: DiffSegment[]; confidence: number; requires_manual_review: boolean
   review_reason?: 'OCR_SINGLE_CHAR_VARIANCE' | 'OCR_PLACEHOLDER_VARIANCE' | 'OCR_READING_ORDER_VARIANCE' | 'OCR_LOW_CONFIDENCE_VARIANCE'
   certainty?: 'CONFIRMED' | 'INFERRED'
