@@ -25,9 +25,13 @@ from app.adapters.llm.schemas import (
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
-from app.documents.models import ParsedDocument, ProcessingWarning
+from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
+from app.draft_review.extraction import (
+    extract_documents_with_map_reduce,
+    extract_documents_with_wave_map_reduce,
+)
 from app.draft_review.facts import (
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
     EvidenceValidationError,
@@ -37,6 +41,7 @@ from app.draft_review.facts import (
     build_fact_review_batches,
     chunk_document,
     compact_extraction_payload,
+    extraction_payload_chars,
     fact_conflict_diff_items,
     fact_index_payload,
     fact_matrix_result_items,
@@ -147,6 +152,7 @@ class DraftReviewWorkflowExecutor:
         parsers: ParserRegistry | None = None,
         document_router: DocumentParsingRouter | None = None,
         llm: ContractLlmClient | None = None,
+        checkpoint_store: Any | None = None,
     ) -> None:
         self.settings = settings
         self.downloader = downloader or SafeFileDownloadService(settings)
@@ -163,6 +169,7 @@ class DraftReviewWorkflowExecutor:
             self.llm = OpenAIContractLlmClient(settings)
         else:
             self.llm = None
+        self.checkpoint_store = checkpoint_store
 
     def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
         graph = StateGraph(DraftReviewState)
@@ -204,6 +211,163 @@ class DraftReviewWorkflowExecutor:
             if self.llm is None:
                 return {"llm_extractions": {}}
             await callback(TaskStage.FACT_EXTRACTION, 75, "正在逐份抽取合同事实并保留证据")
+
+            if all(
+                hasattr(self.llm, method)
+                for method in (
+                    "extract_document_profile",
+                    "extract_numeric_candidates",
+                    "extract_text_facts",
+                )
+            ):
+                try:
+                    extractions, _profile_meta = await extract_documents_with_wave_map_reduce(
+                        settings=self.settings,
+                        documents=state["parsed_documents"],
+                        llm=self.llm,
+                        checkpoint_store=self.checkpoint_store,
+                        task_id=state.get("task_id"),
+                        source_task_id=state.get("options", {}).get("source_task_id"),
+                    )
+                    # The remainder of this node (fact review and its
+                    # deterministic merge) is shared with the compatibility
+                    # path below.
+                    state = {**state, "llm_extractions": extractions}
+                    reviews: dict[str, dict[str, Any]] = {}
+                    review_method = getattr(self.llm, "review_facts", None)
+                    if review_method is not None:
+                        for document in state["parsed_documents"]:
+                            if document.role == "TEMPLATE":
+                                continue
+                            merged = DocumentFactExtraction.model_validate(
+                                extractions[document.file_id]["value"]
+                            )
+                            review_payloads = build_fact_review_batches(
+                                document,
+                                merged,
+                                max_chars=self.settings.LLM_REVIEW_BATCH_MAX_CHARS,
+                                context_blocks=self.settings.LLM_REVIEW_CONTEXT_BLOCKS,
+                            )
+                            reviewed_batches: list[tuple[dict[str, Any], FactReview]] = []
+                            configured_models: set[str] = set()
+                            actual_models: set[str] = set()
+                            review_duration_ms = 0
+                            review_request_attempts = 0
+                            review_structure_retries = 0
+                            for review_payload in review_payloads:
+                                review_result = await review_method(review_payload)
+                                review = FactReview.model_validate(review_result.value)
+                                reviewed_batches.append((review_payload, review))
+                                if review_result.configured_model:
+                                    configured_models.add(review_result.configured_model)
+                                if review_result.actual_model:
+                                    actual_models.add(review_result.actual_model)
+                                review_duration_ms += review_result.duration_ms
+                                review_request_attempts += review_result.request_attempts
+                                review_structure_retries += review_result.structure_retries
+                            if len(configured_models) > 1 or len(actual_models) > 1:
+                                raise EvidenceValidationError(
+                                    "review model identity changed between batches"
+                                )
+                            review = merge_fact_review_batches(
+                                document,
+                                merged,
+                                reviewed_batches,
+                            )
+                            reviews[document.file_id] = {
+                                "value": review.model_dump(mode="json"),
+                                "configured_model": next(iter(configured_models), None),
+                                "actual_model": next(iter(actual_models), None),
+                                "duration_ms": review_duration_ms,
+                                "request_attempts": review_request_attempts,
+                                "structure_retries": review_structure_retries,
+                                "batch_count": len(review_payloads),
+                            }
+                    return {"llm_extractions": extractions, "llm_reviews": reviews}
+                except (WorkflowError, EvidenceValidationError, LlmClientError):
+                    raise
+            elif all(
+                hasattr(self.llm, method)
+                for method in ("extract_document_profile", "extract_fact_batch")
+            ):
+                try:
+                    extractions, _profile_meta = await extract_documents_with_map_reduce(
+                        settings=self.settings,
+                        documents=state["parsed_documents"],
+                        llm=self.llm,
+                    )
+                    reviews: dict[str, dict[str, Any]] = {}
+                    review_method = getattr(self.llm, "review_facts", None)
+                    if review_method is not None:
+                        for document in state["parsed_documents"]:
+                            if document.role == "TEMPLATE":
+                                continue
+                            merged = DocumentFactExtraction.model_validate(
+                                extractions[document.file_id]["value"]
+                            )
+                            review_payloads = build_fact_review_batches(
+                                document,
+                                merged,
+                                max_chars=self.settings.LLM_REVIEW_BATCH_MAX_CHARS,
+                                context_blocks=self.settings.LLM_REVIEW_CONTEXT_BLOCKS,
+                            )
+                            reviewed_batches: list[tuple[dict[str, Any], FactReview]] = []
+                            configured_models: set[str] = set()
+                            actual_models: set[str] = set()
+                            review_duration_ms = 0
+                            review_request_attempts = 0
+                            review_structure_retries = 0
+                            for review_payload in review_payloads:
+                                review_result = await review_method(review_payload)
+                                review = FactReview.model_validate(review_result.value)
+                                reviewed_batches.append((review_payload, review))
+                                if review_result.configured_model:
+                                    configured_models.add(review_result.configured_model)
+                                if review_result.actual_model:
+                                    actual_models.add(review_result.actual_model)
+                                review_duration_ms += review_result.duration_ms
+                                review_request_attempts += review_result.request_attempts
+                                review_structure_retries += review_result.structure_retries
+                            if len(configured_models) > 1 or len(actual_models) > 1:
+                                raise EvidenceValidationError(
+                                    "review model identity changed between batches"
+                                )
+                            review = merge_fact_review_batches(
+                                document,
+                                merged,
+                                reviewed_batches,
+                            )
+                            reviews[document.file_id] = {
+                                "value": review.model_dump(mode="json"),
+                                "configured_model": next(iter(configured_models), None),
+                                "actual_model": next(iter(actual_models), None),
+                                "duration_ms": review_duration_ms,
+                                "request_attempts": review_request_attempts,
+                                "structure_retries": review_structure_retries,
+                                "batch_count": len(review_payloads),
+                            }
+                    return {"llm_extractions": extractions, "llm_reviews": reviews}
+                except (
+                    LlmClientError,
+                    EvidenceValidationError,
+                    ValidationError,
+                    TimeoutError,
+                    WorkflowError,
+                ) as exc:
+                    logger.error(
+                        "draft_review_dynamic_check_failed",
+                        task_id=state["task_id"],
+                        stage="FACT_EXTRACTION",
+                        error_category=_dynamic_failure_code(exc),
+                        error_code=getattr(exc, "code", None),
+                    )
+                    if isinstance(exc, WorkflowError) and exc.code == "DYNAMIC_CHECK_INCOMPLETE":
+                        raise
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        "动态事实抽取未能可靠完成",
+                    ) from exc
+
             extractions: dict[str, dict[str, Any]] = {}
             reviews: dict[str, dict[str, Any]] = {}
             for document in state["parsed_documents"]:
@@ -217,17 +381,65 @@ class DraftReviewWorkflowExecutor:
                     request_attempts = 0
                     structure_retries = 0
                     current_chunk_index = 0
+                    split_count = 0
+                    max_split_depth = 0
+                    max_payload_chars = 0
+                    numeric_candidate_total = 0
+                    current_split_depth = 0
                     failure_counts: dict[str, int] = {}
                     chunks = chunk_document(
                         document,
                         self.settings.LLM_CHUNK_MAX_CHARS,
                         max_numeric_candidates=MAX_NUMERIC_CANDIDATES_PER_CHUNK,
+                        max_payload_chars=self.settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
                     )
-                    for chunk_index, blocks in enumerate(chunks, start=1):
-                        current_chunk_index = chunk_index
-                        extraction = await self.llm.extract_facts(
-                            compact_extraction_payload(document, blocks)
+                    pending: list[tuple[list[DocumentBlock], int, int]] = [
+                        (blocks, 0, chunk_index)
+                        for chunk_index, blocks in enumerate(chunks, start=1)
+                    ]
+                    next_batch_index = len(pending) + 1
+                    while pending:
+                        blocks, split_depth, batch_index = pending.pop(0)
+                        current_chunk_index = batch_index
+                        current_split_depth = split_depth
+                        payload = compact_extraction_payload(document, blocks)
+                        payload_chars = extraction_payload_chars(payload)
+                        max_payload_chars = max(max_payload_chars, payload_chars)
+                        numeric_candidate_total += payload["numeric_candidate_metrics"].get(
+                            "candidate_unique", 0
                         )
+                        if (
+                            request_attempts + 2
+                            > self.settings.LLM_EXTRACTION_MAX_REQUESTS_PER_DOCUMENT
+                        ):
+                            raise LlmClientError(
+                                "LLM_REQUEST_REJECTED",
+                                "事实抽取调用预算已用尽",
+                            )
+                        try:
+                            extraction = await self.llm.extract_facts(payload)
+                        except LlmClientError as exc:
+                            request_attempts += max(getattr(exc, "request_attempts", 0), 1)
+                            structure_retries += getattr(exc, "structure_retries", 0)
+                            if (
+                                exc.code == "LLM_INVALID_JSON"
+                                and len(blocks) > 1
+                                and split_depth < self.settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
+                                and request_attempts + 4
+                                <= self.settings.LLM_EXTRACTION_MAX_REQUESTS_PER_DOCUMENT
+                            ):
+                                midpoint = len(blocks) // 2
+                                left = blocks[:midpoint]
+                                right = blocks[midpoint:]
+                                pending[0:0] = [
+                                    (left, split_depth + 1, next_batch_index),
+                                    (right, split_depth + 1, next_batch_index + 1),
+                                ]
+                                next_batch_index += 2
+                                split_count += 1
+                                max_split_depth = max(max_split_depth, split_depth + 1)
+                                continue
+                            raise
                         chunk_results.append(
                             DocumentFactExtraction.model_validate(extraction.value)
                         )
@@ -245,6 +457,10 @@ class DraftReviewWorkflowExecutor:
                         "request_attempts": request_attempts,
                         "structure_retries": structure_retries,
                         "chunk_count": len(chunk_results),
+                        "split_count": split_count,
+                        "max_split_depth": max_split_depth,
+                        "max_payload_chars": max_payload_chars,
+                        "numeric_candidate_total": numeric_candidate_total,
                     }
                     review_method = getattr(self.llm, "review_facts", None)
                     if review_method is not None:
@@ -302,9 +518,15 @@ class DraftReviewWorkflowExecutor:
                         "stage": "FACT_EXTRACTION",
                         "document_role": document.role,
                         "chunk_index": current_chunk_index,
+                        "split_depth": current_split_depth,
                         "error_category": error_category,
                         "affected_count": 1,
                         "failure_counts": failure_counts,
+                        "request_attempts": request_attempts,
+                        "structure_retries": structure_retries,
+                        "split_count": split_count,
+                        "max_payload_chars": max_payload_chars,
+                        "numeric_candidate_total": numeric_candidate_total,
                     }
                     if isinstance(exc, LlmClientError):
                         log_fields["error_code"] = exc.code

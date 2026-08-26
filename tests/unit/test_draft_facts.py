@@ -20,20 +20,29 @@ from app.documents.models import (
     TableRow,
 )
 from app.draft_review.facts import (
+    MAX_NUMERIC_CANDIDATES_PER_CHUNK,
     EvidenceValidationError,
     accepted_fact_refs,
+    build_document_overview_payload,
+    build_fact_batch_payload,
     build_fact_index,
     build_fact_matrix,
     build_fact_review_batches,
     chunk_document,
     compact_extraction_payload,
+    estimate_extraction_output_tokens,
     expand_compact_extraction,
+    expand_fact_batch,
+    extraction_payload_chars,
+    extraction_units,
     fact_conflict_diff_items,
     fact_matrix_result_items,
     merge_chunk_extractions,
     merge_fact_review_batches,
     normalize_fact,
+    plan_document_batches,
     stable_fact_id,
+    stable_unit_id,
     validate_extraction_evidence,
     validate_semantic_plan,
 )
@@ -192,6 +201,246 @@ def test_compact_payload_includes_table_cells_and_recovers_cell_evidence() -> No
     expanded = expand_compact_extraction(payload, compact)
 
     assert expanded.facts[0].evidence_text == "融资金额1000万元"
+
+
+def _large_table_document(row_count: int = 80) -> ParsedDocument:
+    rows = [
+        TableRow(
+            row=row_index,
+            cells=[
+                TableCell(
+                    raw_text=f"字段{row_index}",
+                    normalized_text=f"字段{row_index}",
+                    location=DocumentLocation(
+                        table_index=0, row=row_index, column=0
+                    ),
+                ),
+                TableCell(
+                    raw_text=f"融资金额{1000 + row_index}万元",
+                    normalized_text=f"融资金额{1000 + row_index}万元",
+                    location=DocumentLocation(
+                        table_index=0, row=row_index, column=1
+                    ),
+                ),
+                TableCell(
+                    raw_text=f"期限{12 + row_index % 12}个月",
+                    normalized_text=f"期限{12 + row_index % 12}个月",
+                    location=DocumentLocation(
+                        table_index=0, row=row_index, column=2
+                    ),
+                ),
+            ],
+        )
+        for row_index in range(row_count)
+    ]
+    table_text = "\n".join("\t".join(cell.raw_text for cell in row.cells) for row in rows)
+    table = ParsedTable(table_index=0, rows=rows)
+    return ParsedDocument(
+        file_id="fil_large_table",
+        role="REFERENCE",
+        file_name="large-table.docx",
+        sha256="b" * 64,
+        page_count=None,
+        parser_name="python-docx",
+        blocks=[
+            DocumentBlock(
+                block_id="large_table",
+                type="TABLE",
+                order=0,
+                raw_text=table_text,
+                normalized_text=table_text,
+                location=DocumentLocation(table_index=0),
+                table=table,
+            )
+        ],
+    )
+
+
+def test_large_table_batches_use_payload_limit_and_row_units() -> None:
+    document = _large_table_document()
+    chunks = chunk_document(
+        document,
+        max_chars=12000,
+        max_numeric_candidates=MAX_NUMERIC_CANDIDATES_PER_CHUNK,
+        max_payload_chars=24000,
+    )
+
+    seen_rows: list[int] = []
+    assert len(chunks) > 1
+    for chunk in chunks:
+        payload = compact_extraction_payload(document, chunk)
+        assert extraction_payload_chars(payload) <= 24000
+        assert (
+            payload["numeric_candidate_metrics"]["candidate_unique"]
+            <= MAX_NUMERIC_CANDIDATES_PER_CHUNK
+        )
+        assert payload["extraction_requirements"]["table_location_mode"] == "ROW_ONLY"
+        assert all(item["location"].get("row") is not None for item in payload["blocks"])
+        seen_rows.extend(item["location"]["row"] for item in payload["blocks"])
+        assert not any(
+            item["location"].get("row") is None
+            for item in payload["evidence_blocks"]
+        )
+
+    assert seen_rows == list(range(80))
+
+
+def test_new_fact_batches_are_compact_and_budgeted() -> None:
+    document = _large_table_document(row_count=8)
+    units = extraction_units(document)
+    plan = plan_document_batches(
+        document,
+        max_payload_chars=12000,
+        max_numeric_candidates=48,
+        max_facts=24,
+        max_output_tokens=6144,
+        estimated_output_token_limit=4800,
+    )
+
+    assert plan
+    assert len({item["batch_id"] for item in plan}) == len(plan)
+    assert all(
+        extraction_payload_chars(item["payload"]) <= 12000
+        and item["numeric_candidate_count"] <= 48
+        and item["estimated_output_tokens"] <= 4800
+        for item in plan
+    )
+    assert {stable_unit_id(unit) for unit in units} == {
+        unit_id for item in plan for unit_id in item["unit_ids"]
+    }
+    assert all("profile" not in item["payload"] for item in plan)
+    assert estimate_extraction_output_tokens(24, 48) <= 4800
+
+
+def test_wide_table_row_is_split_into_column_groups_without_losing_positions() -> None:
+    table = ParsedTable(
+        table_index=2,
+        rows=[
+            TableRow(
+                row=3,
+                cells=[
+                    TableCell(
+                        raw_text=f"列{column}-" + "x" * 900,
+                        normalized_text=f"列{column}-" + "x" * 900,
+                        location=DocumentLocation(table_index=2, row=3, column=column),
+                    )
+                    for column in range(5)
+                ],
+            )
+        ],
+    )
+    document = ParsedDocument(
+        file_id="fil_wide",
+        role="REFERENCE",
+        file_name="wide.docx",
+        sha256="c" * 64,
+        page_count=None,
+        parser_name="python-docx",
+        blocks=[
+            DocumentBlock(
+                block_id="wide_table",
+                type="TABLE",
+                order=0,
+                raw_text="\t".join(cell.raw_text for cell in table.rows[0].cells),
+                normalized_text="",
+                location=DocumentLocation(table_index=2),
+                table=table,
+            )
+        ],
+    )
+
+    units = extraction_units(document, max_unit_chars=1500)
+
+    assert len(units) > 1
+    assert {cell.location.column for unit in units for cell in unit.table.rows[0].cells} == {
+        0,
+        1,
+        2,
+        3,
+        4,
+    }
+    assert all(unit.location.table_index == 2 and unit.location.row == 3 for unit in units)
+    assert all(unit.location.column is not None for unit in units)
+
+
+def test_fact_batch_rehydrates_evidence_and_requires_every_numeric_disposition() -> None:
+    document = parsed("fil_a", "融资金额为1000万元")
+    unit = extraction_units(document)[0]
+    payload = build_fact_batch_payload(
+        document,
+        [unit],
+        batch_id="batch_synthetic",
+        max_facts=24,
+        estimated_output_tokens=4800,
+    )
+    compact = {
+        "facts": [
+            {
+                "field_key": "financing_amount",
+                "display_name": "融资金额",
+                "value_type": "MONEY",
+                "raw_value": "1000万元",
+                "location": {"paragraph_index": 0},
+                "confidence": 0.9,
+                "candidate_indices": [1],
+            }
+        ],
+        "numeric_candidate_decisions": [
+            {"candidate_index": 1, "decision": "FACT", "reason_code": "EXTRACTED"}
+        ],
+    }
+
+    expanded = expand_fact_batch(payload, compact)
+
+    assert expanded.facts[0].source_file_id == "fil_a"
+    assert expanded.facts[0].evidence_text == "融资金额为1000万元"
+
+    with pytest.raises(EvidenceValidationError, match="numeric candidate"):
+        expand_fact_batch(
+            payload,
+            {"facts": compact["facts"], "numeric_candidate_decisions": []},
+        )
+
+
+def test_document_overview_payload_is_bounded_and_identity_is_program_owned() -> None:
+    document = parsed("fil_a", "文档标题\n融资金额为1000万元")
+
+    payload = build_document_overview_payload(document)
+
+    assert payload["file_id"] == "fil_a"
+    assert payload["overview_blocks"]
+    assert "file_id" not in payload["extraction_requirements"]
+
+
+def test_table_row_unit_round_trips_profile_and_fact_evidence() -> None:
+    document = _table_document()
+    row_unit = extraction_units(document)[0]
+    payload = compact_extraction_payload(document, [row_unit])
+    compact = CompactDocumentFactExtraction.model_validate(
+        {
+            "profile": {
+                "file_id": "fil_table",
+                "document_kind": "项目资料",
+                "confidence": 0.9,
+                "evidence_locations": [{"table_index": 0, "row": 0}],
+            },
+            "facts": [
+                {
+                    "field_key": "financing_amount",
+                    "display_name": "融资金额",
+                    "value_type": "MONEY",
+                    "raw_value": "1000万元",
+                    "location": {"table_index": 0, "row": 0},
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    expanded = expand_compact_extraction(payload, compact)
+    validate_extraction_evidence(document, expanded)
+    assert expanded.profile.evidence_locations[0].row == 0
+    assert expanded.facts[0].evidence_text == "融资金额1000万元"
     assert expanded.facts[0].source_file_id == "fil_table"
 
 
@@ -285,6 +534,23 @@ def test_fact_id_is_stable_and_duplicate_chunks_merge() -> None:
     assert stable_fact_id(first.facts[0].model_copy(update={"raw_value": "2000万元"})) != fact_id
     assert list(index) == [(fact_id, "fil_a")]
     assert index[(fact_id, "fil_a")].fact.confidence == 0.99
+
+
+def test_chunk_merge_rejects_conflicting_identity_at_one_location() -> None:
+    document = parsed("fil_a", "融资金额为1000万元，融资金额为2000万元")
+    first = extraction("fil_a", "1000万元")
+    conflicting = first.facts[0].model_copy(
+        update={
+            "raw_value": "2000万元",
+            "evidence_text": "融资金额为2000万元",
+        }
+    )
+    second = first.model_copy(update={"facts": [conflicting]})
+
+    with pytest.raises(EvidenceValidationError, match="conflicting duplicate") as error:
+        merge_chunk_extractions(document, [first, second])
+
+    assert error.value.code == "FACT_IDENTITY_CONFLICT"
 
 
 @pytest.mark.parametrize(

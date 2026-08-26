@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -146,6 +147,10 @@ def test_compact_extraction_expands_dynamic_facts_and_numeric_candidates() -> No
     candidates = numeric_candidates([block])
     candidate_values = {item["raw_value"] for item in candidates}
     assert {"1200万元", "24个月", "2026年8月20日", "4.25%", "8台"} <= candidate_values
+    assert all(
+        set(candidate) == {"raw_value", "candidate_kind", "location"}
+        for candidate in candidates
+    )
 
 
 def test_numeric_candidates_prioritize_typed_spans_and_suppress_structural_numbers() -> None:
@@ -182,7 +187,9 @@ def eval_settings() -> Settings:
     )
 
 
-async def test_send_attempt_records_safe_first_byte_and_strict_schema() -> None:
+async def test_send_attempt_records_safe_first_byte_and_strict_schema(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["temperature"] == 0
@@ -225,6 +232,66 @@ async def test_send_attempt_records_safe_first_byte_and_strict_schema() -> None:
     assert "1200万元" not in json.dumps(attempt.safe_dict(), ensure_ascii=False)
     assert "secret" not in json.dumps(attempt.safe_dict())
     assert "facts" not in attempt.safe_dict()
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["event"] == "attempt"
+
+
+class HangingResponseStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b"{"
+        await asyncio.sleep(1)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_send_attempt_times_out_closes_response_and_flushes_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream = HangingResponseStream()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    attempt = await send_attempt(
+        Settings(
+            _env_file=None,
+            LLM_ENABLED=True,
+            LLM_BASE_URL="https://llm.example.com/v1",
+            LLM_API_KEY="secret",
+            LLM_TIMEOUT_SECONDS=0.01,
+        ),
+        CallBudget(1),
+        model="model-a",
+        role="extraction",
+        response_mode="prompt_only",
+        system="return JSON",
+        payload=extraction_fixture(),
+        schema=CompactDocumentFactExtraction,
+        correction=0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert attempt.error_code == "TIMEOUT"
+    assert calls == 1
+    assert stream.closed is True
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert len(lines) == 1
+    safe_output = json.loads(lines[0])
+    assert safe_output["event"] == "attempt"
+    assert "secret" not in lines[0]
 
 
 async def test_fenced_output_is_classified_without_relaxed_json_acceptance() -> None:

@@ -1,4 +1,8 @@
-from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
+"""LLM adapter exports with lazy client imports.
+
+Fact planning imports wire schemas while the OpenAI client imports evidence
+validators. Lazy client exports keep that dependency direction acyclic.
+"""
 from app.adapters.llm.schemas import (
     AdviceResponse,
     CompactDocumentFactExtraction,
@@ -36,3 +40,14 @@ __all__ = [
     "LlmClientError",
     "OpenAIContractLlmClient",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"LlmClientError", "OpenAIContractLlmClient"}:
+        from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
+
+        return {
+            "LlmClientError": LlmClientError,
+            "OpenAIContractLlmClient": OpenAIContractLlmClient,
+        }[name]
+    raise AttributeError(name)

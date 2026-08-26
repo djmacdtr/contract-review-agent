@@ -60,6 +60,59 @@ class EvidencedLlm:
         )
 
 
+class MapReduceFixtureLlm:
+    """Small new-interface fixture that exercises the Send-based extractor."""
+
+    def __init__(self) -> None:
+        self.profile_calls = 0
+        self.batch_payloads: list[dict] = []
+
+    async def probe_models(self) -> list[str]:
+        return ["map-reduce-fixture"]
+
+    async def extract_document_profile(self, payload: dict) -> LlmResult:
+        self.profile_calls += 1
+        first = payload["overview_blocks"][0]
+        return LlmResult(
+            value={
+                "document_kind": "合成资料",
+                "title": None,
+                "confidence": 0.9,
+                "evidence_locations": [first["location"]],
+            },
+            configured_model="map-reduce-fixture",
+            actual_model="map-reduce-fixture",
+            mock=False,
+        )
+
+    async def extract_fact_batch(self, payload: dict) -> LlmResult:
+        self.batch_payloads.append(payload)
+        return LlmResult(
+            value={
+                "facts": [],
+                "numeric_candidate_decisions": [
+                    {
+                        "candidate_index": candidate["candidate_index"],
+                        "decision": "IGNORE",
+                        "reason_code": "FIXTURE_IGNORE",
+                    }
+                    for candidate in payload["numeric_candidates"]
+                ],
+            },
+            configured_model="map-reduce-fixture",
+            actual_model="map-reduce-fixture",
+            mock=False,
+        )
+
+
+class SplittingMapReduceFixtureLlm(MapReduceFixtureLlm):
+    async def extract_fact_batch(self, payload: dict) -> LlmResult:
+        if len(payload["units"]) > 1:
+            self.batch_payloads.append(payload)
+            raise LlmClientError("LLM_INVALID_JSON", "模型未返回有效 JSON")
+        return await super().extract_fact_batch(payload)
+
+
 class ClassifiedFailureLlm(EvidencedLlm):
     async def extract_facts(self, payload: dict) -> LlmResult:
         raise LlmClientError(
@@ -103,6 +156,37 @@ class RawSchemaFailureLlm(EvidencedLlm):
         result = await super().extract_facts(payload)
         result.value["facts"][0]["value_type"] = "NOT_A_VALUE"
         return result
+
+
+class SplitAfterJsonFailureLlm(EvidencedLlm):
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+        self.failed = False
+
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        self.payloads.append(payload)
+        if len(payload["blocks"]) > 1 and not self.failed:
+            self.failed = True
+            raise LlmClientError("LLM_INVALID_JSON", "模型未返回有效 JSON")
+        return await super().extract_facts(payload)
+
+
+class AlwaysJsonFailureLlm(EvidencedLlm):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        self.calls += 1
+        raise LlmClientError("LLM_INVALID_JSON", "模型未返回有效 JSON")
+
+
+class EnvelopeFailureLlm(EvidencedLlm):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract_facts(self, payload: dict) -> LlmResult:
+        self.calls += 1
+        raise LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
 
 
 def build_docx(path: Path, title: str, body: str) -> bytes:
@@ -398,6 +482,7 @@ async def run_consensus_fixture(
     target_body: str = "金额100",
     template_body: str = "金额100",
     expanded_table: bool = False,
+    settings_overrides: dict | None = None,
 ) -> dict:
     target_bytes = (
         build_table_docx(
@@ -434,6 +519,7 @@ async def run_consensus_fixture(
         LLM_BASE_URL="https://llm.invalid",
         LLM_API_KEY="unused",
         LLM_SAME_MODEL_DIAGNOSTIC=same_model_diagnostic,
+        **(settings_overrides or {}),
     )
     executor = DraftReviewWorkflowExecutor(
         settings,
@@ -476,6 +562,36 @@ async def run_consensus_fixture(
 
 async def resolver(host: str, port: int) -> list[str]:
     return ["127.0.0.1"]
+
+
+async def test_new_send_map_reduce_path_extracts_profile_once_and_reduces_batches(
+    tmp_path: Path,
+) -> None:
+    llm = MapReduceFixtureLlm()
+
+    result = await run_consensus_fixture(tmp_path, llm)  # type: ignore[arg-type]
+
+    TaskResultData.model_validate(result)
+    assert llm.profile_calls == 3
+    assert llm.batch_payloads
+    assert all("profile" not in payload for payload in llm.batch_payloads)
+    assert all(
+        "source_file_id" not in unit
+        for payload in llm.batch_payloads
+        for unit in payload["units"]
+    )
+    assert result["metadata"]["execution_mode"] == "HYBRID"
+
+
+async def test_new_send_map_reduce_splits_only_the_failed_batch_and_reduces_recovery(
+    tmp_path: Path,
+) -> None:
+    llm = SplittingMapReduceFixtureLlm()
+
+    result = await run_consensus_fixture(tmp_path, llm)  # type: ignore[arg-type]
+
+    TaskResultData.model_validate(result)
+    assert len(llm.batch_payloads) >= 4
 
 
 async def test_draft_review_downloads_and_parses_every_file_without_mocking(
@@ -569,6 +685,68 @@ async def test_draft_review_downloads_and_parses_every_file_without_mocking(
     assert any(stage == TaskStage.TEMPLATE_COMPARE for stage, _value in updates)
     assert not any((tmp_path / "workspaces").iterdir())
     assert len(output.file_metadata) == 3
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_splits_only_the_failed_extraction_batch(
+    tmp_path: Path,
+) -> None:
+    llm = SplitAfterJsonFailureLlm()
+    result = await run_consensus_fixture(tmp_path, llm)
+
+    assert result["metadata"]["execution_mode"] == "HYBRID"
+    assert [len(payload["blocks"]) for payload in llm.payloads[:3]] == [2, 1, 1]
+    assert len(llm.payloads) == 4
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_stops_at_singleton_without_infinite_splitting(
+    tmp_path: Path,
+) -> None:
+    llm = AlwaysJsonFailureLlm()
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, llm)
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert llm.calls == 2
+
+
+@pytest.mark.parametrize(
+    "settings_overrides",
+    [
+        {"LLM_EXTRACTION_MAX_REQUESTS_PER_DOCUMENT": 2},
+        {"LLM_EXTRACTION_MAX_SPLIT_DEPTH": 0},
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_json_respects_extraction_budget_and_depth(
+    tmp_path: Path, settings_overrides: dict
+) -> None:
+    llm = AlwaysJsonFailureLlm()
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(
+            tmp_path,
+            llm,
+            settings_overrides=settings_overrides,
+        )
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_non_json_response_error_does_not_trigger_batch_split(
+    tmp_path: Path,
+) -> None:
+    llm = EnvelopeFailureLlm()
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(tmp_path, llm)
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert llm.calls == 1
 
 
 async def test_draft_review_uses_evidenced_llm_results_without_losing_rule_results(
@@ -672,6 +850,12 @@ async def test_dynamic_extraction_failure_logs_safe_category_only(
         "error_code": "LLM_EXTRACTION_EVIDENCE_INVALID",
         "affected_count": 1,
         "failure_counts": {"FACT_LOCATION_NOT_FOUND": 1},
+        "split_depth": 0,
+        "request_attempts": 1,
+        "structure_retries": 0,
+        "split_count": 0,
+        "max_payload_chars": 757,
+        "numeric_candidate_total": 1,
     }
 
 

@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,10 +54,32 @@ class Settings(BaseSettings):
     LLM_ADVICE_MODEL: str = "GLM-5.2"
     LLM_EMBEDDING_MODEL: str = "embedding"
     LLM_RERANK_MODEL: str = "rerank"
-    LLM_TIMEOUT_SECONDS: float = 300.0
+    LLM_TIMEOUT_SECONDS: float = 180.0
     LLM_MAX_CONCURRENCY: int = 1
     LLM_MAX_OUTPUT_TOKENS: int = 4096
+    LLM_RESPONSE_FORMAT: Literal["prompt_only", "json_object", "json_schema"] = "prompt_only"
     LLM_CHUNK_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
+    LLM_EXTRACTION_PAYLOAD_MAX_CHARS: int = Field(default=12000, ge=4000, le=200000)
+    LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES: int = Field(default=24, ge=1, le=128)
+    LLM_EXTRACTION_MAX_FACTS: int = Field(default=24, ge=1, le=64)
+    # Compatibility planner setting; the v2 paired protocol uses the explicit
+    # simplified limit below.
+    LLM_EXTRACTION_ESTIMATED_OUTPUT_TOKENS: int = Field(default=4800, ge=256, le=6144)
+    LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS: int = Field(
+        default=2000, ge=256, le=4096
+    )
+    LLM_EXTRACTION_MAX_TEXT_FACTS: int = Field(default=12, ge=1, le=12)
+    LLM_EXTRACTION_WAVE_SIZE: int = Field(default=6, ge=1, le=8)
+    LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET: int = Field(default=40, ge=1, le=128)
+    LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=50, ge=1, le=256)
+    LLM_EXTRACTION_TASK_CONCURRENCY: int = Field(default=2, ge=1, le=8)
+    LLM_EXTRACTION_MAX_SPLIT_DEPTH: int = Field(default=8, ge=0, le=12)
+    LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT: int = Field(
+        default=128, ge=1, le=512
+    )
+    # Deprecated compatibility knob for the legacy fixture adapter; production
+    # extraction uses the N + recovery budget above.
+    LLM_EXTRACTION_MAX_REQUESTS_PER_DOCUMENT: int = Field(default=16, ge=1, le=128)
     LLM_REVIEW_BATCH_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
     LLM_REVIEW_CONTEXT_BLOCKS: int = Field(default=1, ge=0, le=10)
     LLM_STRUCTURE_RETRY_ATTEMPTS: int = 2

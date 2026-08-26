@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
@@ -15,15 +14,26 @@ from app.adapters.llm.base import LlmResult
 from app.adapters.llm.schemas import (
     AdviceResponse,
     CompactDocumentFactExtraction,
+    CompactDocumentOverview,
+    CompactFactBatchExtraction,
     DocumentFactExtraction,
     FactMappingResponse,
     FactMappingReview,
     FactReview,
+    NumericCandidateExtraction,
     SemanticPlanResponse,
+    TextFactExtraction,
 )
 from app.core.config import Settings
 from app.documents.models import DocumentLocation
-from app.draft_review.facts import EvidenceValidationError, expand_compact_extraction
+from app.draft_review.facts import (
+    EvidenceValidationError,
+    expand_compact_extraction,
+    expand_document_overview,
+    expand_fact_batch,
+    expand_numeric_candidate_response,
+    expand_text_fact_response,
+)
 
 JsonValidator = Callable[[Any], dict[str, Any]]
 Sleeper = Callable[[float], Awaitable[None]]
@@ -37,9 +47,43 @@ EXTRACTION_SYSTEM_PROMPT = (
     "confidence 和可选 concept_id。"
     "不要返回 evidence_text、source_file_id、normalized_hint、missing_field_keys、"
     "semantic_concepts 或 validation_specs。"
-    "表格事实优先使用 table_index、row、column 的单元格位置；表格整体事实可使用 table_index。"
+    "表格按行提供时，事实必须使用 table_index、row 或 table_index、row、column 位置；"
+    "如果 table_location_mode 为 ROW_ONLY，只能使用 table_index、row 位置；"
+    "不得返回当前输入中不存在的整表位置。"
     "raw_value 必须逐字来自 location 对应的输入证据块；不得推测、补全、换算、修正或改写原值。"
     "只返回 profile 和 facts，facts 不得超过 Schema 上限。"
+)
+PROFILE_SYSTEM_PROMPT = (
+    "你是合同文档概况识别器。只返回 JSON 对象，不要 Markdown。"
+    "根据输入的大纲开放式识别文档用途和标题；不得假设固定合同类型或资料类型。"
+    "只能引用输入中存在的概况位置，不要返回文件 ID、事实、证据原文或其他字段。"
+    "严格遵守 CompactDocumentOverview。"
+)
+FACT_BATCH_SYSTEM_PROMPT = (
+    "你是合同事实抽取器。只返回 JSON 对象，不要 Markdown。"
+    "当前输入是独立事实分片，不包含完整文档概况。逐块扫描开放式事实，"
+    "不得使用固定字段清单，不得推测、补全、换算、修正或改写原值。"
+    "每个事实只返回 field_key、display_name、value_type、raw_value、location、"
+    "confidence 和可选 candidate_indices；不得返回 evidence_text、source_file_id、"
+    "normalized_hint 或稳定事实 ID。必须逐项处理 numeric_candidates，"
+    "每个候选恰好返回 FACT 或 IGNORE 决策；事实的 candidate_indices 必须准确对应。"
+    "不得返回输入中不存在的位置。严格遵守 CompactFactBatchExtraction。"
+)
+NUMERIC_CANDIDATE_SYSTEM_PROMPT = (
+    "你是开放式合同数值候选分类器。只返回 JSON 对象，不要 Markdown。"
+    "逐项处理输入 numeric_candidates，每个 candidate_index 必须恰好返回一次。"
+    "只返回 semantic_key、display_name、value_type、decision、reason_code、confidence。"
+    "不得返回原值、证据、位置、文件身份或任何未要求字段。"
+    "不得使用固定合同类型或字段清单；无法可靠识别业务价值时返回 IGNORE。"
+    "严格遵守 NumericCandidateExtraction。"
+)
+TEXT_FACT_SYSTEM_PROMPT = (
+    "你是开放式合同非数值事实抽取器。只返回 JSON 对象，不要 Markdown。"
+    "逐个扫描输入 units，事实只能引用输入中的 unit_id。quote 必须是该 unit 原文的精确子串。"
+    "只返回 unit_id、semantic_key、display_name、value_type、quote、confidence。"
+    "不得返回文件身份、位置、证据副本、稳定事实 ID 或原文外的推测。"
+    "一次最多返回 12 项；如果可能还有更多事实，不要遗漏，程序会继续拆分。"
+    "严格遵守 TextFactExtraction。"
 )
 SEMANTIC_PLAN_SYSTEM_PROMPT = (
     "你是合同事实语义规划器。只返回一个 JSON 对象，不要 Markdown。"
@@ -84,6 +128,9 @@ class LlmClientError(Exception):
         correction_message: str | None = None,
         failure_code: str | None = None,
         validation_summary: dict[str, Any] | None = None,
+        request_attempts: int = 0,
+        structure_retries: int = 0,
+        finish_reason: str | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.code = code
@@ -92,6 +139,9 @@ class LlmClientError(Exception):
         self.correction_message = correction_message
         self.failure_code = failure_code
         self.validation_summary = validation_summary
+        self.request_attempts = request_attempts
+        self.structure_retries = structure_retries
+        self.finish_reason = finish_reason
 
 
 def completion_body(
@@ -157,9 +207,6 @@ def _endpoint(base_url: str, suffix: str) -> str:
 
 def _json_object(content: str) -> dict[str, Any]:
     stripped = content.strip()
-    fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, flags=re.DOTALL | re.I)
-    if fence:
-        stripped = fence.group(1).strip()
     try:
         value = json.loads(stripped)
     except json.JSONDecodeError as exc:
@@ -241,6 +288,113 @@ def _validate_compact_extraction(value: Any, payload: dict[str, Any]) -> dict[st
             failure_code="LLM_RESPONSE_SCHEMA_INVALID",
             validation_summary=summary,
         ) from exc
+
+
+def _validate_document_overview(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        overview = CompactDocumentOverview.model_validate(value)
+        expand_document_overview(payload, overview.model_dump(mode="json"))
+        return overview.model_dump(mode="json")
+    except EvidenceValidationError as exc:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型文档概况位置未通过安全校验",
+            correction_message=(
+                "上一响应引用了不存在的概况位置。只返回输入大纲中的位置，"
+                "不得输出文件 ID 或解释。"
+            ),
+            failure_code=exc.code,
+        ) from exc
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型文档概况不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=summary,
+        ) from exc
+
+
+def _validate_fact_batch(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        compact = CompactFactBatchExtraction.model_validate(value)
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型事实分片结果不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=summary,
+        ) from exc
+    try:
+        expand_fact_batch(payload, compact)
+    except EvidenceValidationError as exc:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型事实分片未通过安全证据校验",
+            correction_message=(
+                "上一响应的事实位置或数值候选分类无效。只使用输入位置，"
+                "逐项返回每个候选的 FACT 或 IGNORE，不得改写事实原值。"
+            ),
+            failure_code=exc.code,
+        ) from exc
+    return compact.model_dump(
+        mode="json", exclude_none=True
+    )
+
+
+def _validate_numeric_candidates(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        response = NumericCandidateExtraction.model_validate(value)
+        expand_numeric_candidate_response(payload, response)
+    except EvidenceValidationError as exc:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型数值候选分类未通过安全校验",
+            correction_message=(
+                "上一响应的 candidate_index 未完整覆盖输入。只返回每个输入索引恰好一次，"
+                "不要输出原值、位置或证据。"
+            ),
+            failure_code=exc.code,
+        ) from exc
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型数值候选结果不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=summary,
+        ) from exc
+    return response.model_dump(mode="json")
+
+
+def _validate_text_facts(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        response = TextFactExtraction.model_validate(value)
+        expand_text_fact_response(payload, response)
+    except EvidenceValidationError as exc:
+        raise LlmClientError(
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+            "模型非数值事实未通过安全证据校验",
+            correction_message=(
+                "上一响应的 unit_id 或 quote 未通过校验。只引用输入 unit_id，"
+                "quote 必须是对应 unit 原文的精确子串。"
+            ),
+            failure_code=exc.code,
+        ) from exc
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型非数值事实结果不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=summary,
+        ) from exc
+    return response.model_dump(mode="json")
 
 
 def _validate_semantic_plan(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -423,6 +577,52 @@ class OpenAIContractLlmClient:
             raise LlmClientError("LLM_RESPONSE_INVALID", "模型列表响应格式无效")
         return [item["id"] for item in data if isinstance(item, dict) and item.get("id")]
 
+    async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_EXTRACTION_MODEL,
+            system=PROFILE_SYSTEM_PROMPT,
+            payload=payload,
+            validator=lambda value: _validate_document_overview(value, payload),
+            schema=CompactDocumentOverview,
+            max_structure_retries=1,
+        )
+
+    async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_EXTRACTION_MODEL,
+            system=FACT_BATCH_SYSTEM_PROMPT,
+            payload=payload,
+            validator=lambda value: _validate_fact_batch(value, payload),
+            schema=CompactFactBatchExtraction,
+            max_structure_retries=1,
+        )
+
+    async def extract_numeric_candidates(
+        self, payload: dict[str, Any], *, allow_structure_correction: bool = True
+    ) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_EXTRACTION_MODEL,
+            system=NUMERIC_CANDIDATE_SYSTEM_PROMPT,
+            payload=payload,
+            validator=lambda value: _validate_numeric_candidates(value, payload),
+            schema=NumericCandidateExtraction,
+            max_structure_retries=1 if allow_structure_correction else 0,
+            invalid_json_structure_correction=False,
+        )
+
+    async def extract_text_facts(
+        self, payload: dict[str, Any], *, allow_structure_correction: bool = True
+    ) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_EXTRACTION_MODEL,
+            system=TEXT_FACT_SYSTEM_PROMPT,
+            payload=payload,
+            validator=lambda value: _validate_text_facts(value, payload),
+            schema=TextFactExtraction,
+            max_structure_retries=1 if allow_structure_correction else 0,
+            invalid_json_structure_correction=False,
+        )
+
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
         return await self._structured_completion(
             model=self.settings.LLM_EXTRACTION_MODEL,
@@ -430,6 +630,7 @@ class OpenAIContractLlmClient:
             payload=payload,
             validator=lambda value: _validate_compact_extraction(value, payload),
             schema=CompactDocumentFactExtraction,
+            max_structure_retries=min(self.settings.LLM_STRUCTURE_RETRY_ATTEMPTS, 1),
         )
 
     async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult:
@@ -496,6 +697,8 @@ class OpenAIContractLlmClient:
         schema: type[BaseModel],
         response_schema: dict[str, Any] | None = None,
         max_structure_retries: int | None = None,
+        allow_structure_correction: bool = True,
+        invalid_json_structure_correction: bool = True,
     ) -> LlmResult:
         started = time.perf_counter()
         request_attempts = 0
@@ -510,34 +713,45 @@ class OpenAIContractLlmClient:
                 if max_structure_retries is None
                 else max_structure_retries
             )
+            if not allow_structure_correction:
+                retry_limit = 0
             for structure_attempt in range(retry_limit + 1):
+                response_format = self._response_format()
                 body = completion_body(
                     model=model,
                     system=system,
                     payload=payload,
                     schema=schema,
                     max_tokens=self.settings.LLM_MAX_OUTPUT_TOKENS,
-                    response_format=(
-                        "json_schema"
-                        if self.settings.LLM_NATIVE_STRUCTURED_OUTPUT
-                        else "prompt_only"
-                    ),
+                    response_format=response_format,
                     correction=bool(structure_attempt),
                     correction_message=(
                         last_error.correction_message if last_error is not None else None
                     ),
                     response_schema=response_schema,
                 )
-                response, attempts = await self._request_with_count(
-                    client,
-                    "POST",
-                    _endpoint(self.settings.LLM_BASE_URL, "chat/completions"),
-                    json=body,
-                )
+                try:
+                    response, attempts = await self._request_with_count(
+                        client,
+                        "POST",
+                        _endpoint(self.settings.LLM_BASE_URL, "chat/completions"),
+                        json=body,
+                    )
+                except LlmClientError as exc:
+                    exc.request_attempts = request_attempts + exc.request_attempts
+                    exc.structure_retries = structure_attempt
+                    raise
                 request_attempts += attempts
                 try:
                     response_body = response.json()
                     choice = response_body["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason == "length":
+                        raise LlmClientError(
+                            "LLM_OUTPUT_TRUNCATED",
+                            "模型输出达到长度上限",
+                            finish_reason="length",
+                        )
                     content = choice["message"]["content"]
                     if not isinstance(content, str):
                         raise LlmClientError("LLM_RESPONSE_INVALID", "模型响应缺少文本内容")
@@ -550,13 +764,60 @@ class OpenAIContractLlmClient:
                         duration_ms=round((time.perf_counter() - started) * 1000),
                         request_attempts=request_attempts,
                         structure_retries=structure_attempt,
+                        finish_reason=finish_reason,
+                        response_format=response_format,
                     )
                 except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                     last_error = LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
                     last_error.__cause__ = exc
                 except LlmClientError as exc:
                     last_error = exc
-        raise last_error or LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
+                    exc.request_attempts = request_attempts
+                    exc.structure_retries = structure_attempt
+                    if isinstance(exc, LlmClientError) and exc.code == "LLM_OUTPUT_TRUNCATED":
+                        exc.finish_reason = "length"
+                        exc.request_attempts = request_attempts
+                        raise exc
+                    if not self._can_structure_correct(
+                        exc,
+                        finish_reason=finish_reason,
+                        structure_attempt=structure_attempt,
+                        retry_limit=retry_limit,
+                        invalid_json_structure_correction=invalid_json_structure_correction,
+                    ):
+                        raise exc
+                    continue
+        if last_error is not None:
+            last_error.request_attempts = request_attempts
+            last_error.structure_retries = retry_limit
+            raise last_error
+        raise LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
+
+    def _response_format(self) -> str:
+        if self.settings.LLM_NATIVE_STRUCTURED_OUTPUT:
+            return "json_schema"
+        return getattr(self.settings, "LLM_RESPONSE_FORMAT", "prompt_only")
+
+    @staticmethod
+    def _can_structure_correct(
+        error: LlmClientError,
+        *,
+        finish_reason: str | None,
+        structure_attempt: int,
+        retry_limit: int,
+        invalid_json_structure_correction: bool = True,
+    ) -> bool:
+        if structure_attempt >= retry_limit:
+            return False
+        if error.code == "LLM_INVALID_JSON":
+            return invalid_json_structure_correction and finish_reason in {None, "stop"}
+        if error.failure_code == "FACT_BATCH_SATURATED":
+            return False
+        return error.code in {
+            "LLM_SCHEMA_INVALID",
+            "LLM_REVIEW_INCOMPLETE",
+            "LLM_EXTRACTION_EVIDENCE_INVALID",
+        } and bool(error.correction_message)
 
     async def _request(
         self,
@@ -575,7 +836,7 @@ class OpenAIContractLlmClient:
         url: str,
         **kwargs: Any,
     ) -> tuple[httpx.Response, int]:
-        max_attempts = 3
+        max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             try:
                 response = await client.request(
@@ -588,21 +849,31 @@ class OpenAIContractLlmClient:
                 if attempt < max_attempts:
                     await self.sleeper(0.5 * attempt)
                     continue
-                raise LlmClientError("LLM_TIMEOUT", "模型服务请求超时", retryable=True) from exc
-            except httpx.RequestError as exc:
-                if attempt < max_attempts:
-                    await self.sleeper(0.5 * attempt)
-                    continue
                 raise LlmClientError(
-                    "LLM_NETWORK_ERROR", "模型服务网络请求失败", retryable=True
+                    "LLM_TIMEOUT",
+                    "模型服务请求超时",
+                    retryable=True,
+                    request_attempts=attempt,
+                ) from exc
+            except httpx.RequestError as exc:
+                raise LlmClientError(
+                    "LLM_NETWORK_ERROR",
+                    "模型服务网络请求失败",
+                    retryable=False,
+                    request_attempts=attempt,
                 ) from exc
             if response.status_code < 400:
                 return response, attempt
             code, message, retryable = self._http_error(response.status_code)
-            if retryable and attempt < max_attempts:
+            if response.status_code in {502, 503} and attempt < max_attempts:
                 await self.sleeper(0.5 * attempt)
                 continue
-            raise LlmClientError(code, message, retryable=retryable)
+            raise LlmClientError(
+                code,
+                message,
+                retryable=retryable,
+                request_attempts=attempt,
+            )
         raise AssertionError("unreachable")
 
     @staticmethod

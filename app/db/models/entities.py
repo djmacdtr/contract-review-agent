@@ -13,6 +13,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -180,3 +181,31 @@ class TaskEvent(Base):
     )
 
     task: Mapped[CheckTask] = relationship(back_populates="events")
+
+
+class ExtractionCheckpoint(Base):
+    """Internal, content-addressed extraction checkpoint; not a task result."""
+
+    __tablename__ = "extraction_checkpoint"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "file_sha256",
+            "batch_id",
+            "extraction_version",
+            name="uq_extraction_checkpoint_identity",
+        ),
+        Index("ix_extraction_checkpoint_source", "task_id", "file_sha256", "status"),
+    )
+
+    task_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    file_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    extraction_version: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )

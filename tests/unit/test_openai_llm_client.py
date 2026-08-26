@@ -259,7 +259,7 @@ async def test_probe_models_and_valid_fenced_json() -> None:
             200,
             json={
                 "model": "GLM-5.2-actual",
-                "choices": [{"message": {"content": f"```json\n{extraction_content()}\n```"}}],
+                "choices": [{"message": {"content": extraction_content()}}],
             },
         )
 
@@ -398,11 +398,10 @@ async def test_compact_schema_summary_drives_one_safe_correction() -> None:
     assert result.value["facts"][0]["field_key"] == "financing_amount"
 
 
-async def test_invalid_json_and_schema_are_retried_then_succeed() -> None:
+async def test_invalid_json_gets_one_structure_retry_then_succeeds() -> None:
     responses = iter(
         [
             "not-json",
-            json.dumps({"profile": {}, "facts": []}),
             extraction_content(),
         ]
     )
@@ -419,8 +418,37 @@ async def test_invalid_json_and_schema_are_retried_then_succeed() -> None:
         sleeper=no_sleep,
     )
     result = await client.extract_facts(extraction_payload())
-    assert result.structure_retries == 2
-    assert result.request_attempts == 3
+    assert result.structure_retries == 1
+    assert result.request_attempts == 2
+
+
+async def test_compact_extraction_does_not_retry_json_more_than_once() -> None:
+    responses = iter(["not-json", "still-not-json", extraction_content()])
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [{"message": {"content": next(responses)}}],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_STRUCTURE_RETRY_ATTEMPTS=5),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as error:
+        await client.extract_facts(extraction_payload())
+
+    assert error.value.code == "LLM_INVALID_JSON"
+    assert error.value.request_attempts == 2
+    assert error.value.structure_retries == 1
+    assert len(requests) == 2
 
 
 async def test_plan_semantics_uses_bounded_internal_schema() -> None:
@@ -510,8 +538,8 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
         (401, "LLM_AUTH_FAILED", 1),
         (403, "LLM_AUTH_FAILED", 1),
         (404, "LLM_ENDPOINT_NOT_FOUND", 1),
-        (429, "LLM_RATE_LIMITED", 3),
-        (502, "LLM_UPSTREAM_ERROR", 3),
+        (429, "LLM_RATE_LIMITED", 1),
+        (502, "LLM_UPSTREAM_ERROR", 2),
     ],
 )
 async def test_safe_http_error_mapping(status: int, code: str, calls: int) -> None:
@@ -546,4 +574,181 @@ async def test_timeout_is_retried_and_safely_mapped() -> None:
     with pytest.raises(LlmClientError) as caught:
         await client.extract_facts({})
     assert caught.value.code == "LLM_TIMEOUT"
-    assert calls == 3
+    assert calls == 2
+
+
+async def test_fact_batch_uses_compact_schema_without_program_owned_identity() -> None:
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic",
+        "units": [
+            {
+                "unit_id": "unit_1",
+                "type": "PARAGRAPH",
+                "text": "融资金额为100万元",
+                "location": {"paragraph_index": 0},
+            }
+        ],
+        "numeric_candidates": [
+            {
+                "candidate_index": 1,
+                "raw_value": "100万元",
+                "candidate_kind": "MONEY",
+                "location": {"paragraph_index": 0},
+            }
+        ],
+    }
+    response = {
+        "facts": [
+            {
+                "field_key": "amount",
+                "display_name": "金额",
+                "value_type": "MONEY",
+                "raw_value": "100万元",
+                "location": {"paragraph_index": 0},
+                "confidence": 0.95,
+                "candidate_indices": [1],
+            }
+        ],
+        "numeric_candidate_decisions": [
+            {"candidate_index": 1, "decision": "FACT", "reason_code": "EXTRACTED"}
+        ],
+    }
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(response, ensure_ascii=False)},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.extract_fact_batch(payload)
+
+    assert result.value == response
+    body = requests[0]
+    assert body["response_format"]["type"] == "json_schema"
+    assert "evidence_text" not in json.dumps(result.value)
+    assert "source_file_id" not in json.dumps(result.value)
+
+
+async def test_length_finish_reason_is_not_structure_corrected() -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {"finish_reason": "length", "message": {"content": "{"}}
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_object"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as caught:
+        await client.extract_fact_batch({"file_id": "fil_synthetic", "units": []})
+
+    assert caught.value.code == "LLM_OUTPUT_TRUNCATED"
+    assert caught.value.finish_reason == "length"
+    assert calls == 1
+
+
+async def test_fact_batch_evidence_error_is_corrected_once_without_json_repair() -> None:
+    calls = 0
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic",
+        "units": [
+            {
+                "unit_id": "unit_1",
+                "type": "PARAGRAPH",
+                "text": "融资金额为100万元",
+                "location": {"paragraph_index": 0},
+            }
+        ],
+        "numeric_candidates": [],
+    }
+    response = {
+        "facts": [
+            {
+                "field_key": "amount",
+                "display_name": "金额",
+                "value_type": "MONEY",
+                "raw_value": "100万元",
+                "location": {"paragraph_index": 99},
+                "confidence": 0.95,
+            }
+        ],
+        "numeric_candidate_decisions": [],
+    }
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(response)},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_object"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as caught:
+        await client.extract_fact_batch(payload)
+
+    assert caught.value.code == "LLM_EXTRACTION_EVIDENCE_INVALID"
+    assert calls == 2
+
+
+async def test_upstream_502_is_retried_only_once() -> None:
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(502, text="sensitive gateway body")
+
+    client = OpenAIContractLlmClient(
+        settings(), transport=httpx.MockTransport(handler), sleeper=no_sleep
+    )
+
+    with pytest.raises(LlmClientError) as caught:
+        await client.extract_fact_batch({"file_id": "fil_synthetic", "units": []})
+
+    assert caught.value.code == "LLM_UPSTREAM_ERROR"
+    assert caught.value.request_attempts == 2
+    assert calls == 2

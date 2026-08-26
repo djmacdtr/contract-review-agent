@@ -7,21 +7,32 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from math import ceil
 from typing import Any
 
 from app.adapters.llm.schemas import (
     CompactDocumentFactExtraction,
+    CompactDocumentOverview,
+    CompactFactBatchExtraction,
     DocumentFactExtraction,
     DocumentProfile,
     FactCandidate,
     FactReview,
+    NumericCandidateExtraction,
     SemanticConcept,
     SemanticEvidenceRef,
     SemanticPlanResponse,
+    TextFactExtraction,
     ValidationSpec,
 )
 from app.comparison.models import DiffItem, DiffSegment, DiffSide
-from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
+from app.documents.models import (
+    DocumentBlock,
+    DocumentLocation,
+    ParsedDocument,
+    ParsedTable,
+    TableRow,
+)
 from app.documents.normalization import normalize_text
 
 
@@ -110,8 +121,14 @@ _STRUCTURAL_NUMBER_CONTEXT = re.compile(
     r"(?:第|条|款|项|章节|页码?|编号|序号|目录|no\.?|no：?)\s*$",
     flags=re.IGNORECASE,
 )
-MAX_COMPACT_FACTS = 64
+_BARE_NUMBER_CONTEXT = re.compile(
+    r"(?:金额|数额|数量|期限|利率|费率|租金|租赁|融资|价款|比例|份数|期数|"
+    r"余额|本金|利息)",
+    flags=re.IGNORECASE,
+)
+MAX_COMPACT_FACTS = 24
 MAX_NUMERIC_CANDIDATES_PER_CHUNK = 48
+DEFAULT_ESTIMATED_OUTPUT_TOKEN_LIMIT = 4800
 
 
 def fact_identity_key(fact: FactCandidate) -> tuple[object, ...]:
@@ -264,7 +281,13 @@ def numeric_candidates(
     blocks: list[DocumentBlock],
 ) -> list[dict[str, Any]]:
     selected, _metrics = _scan_numeric_candidates(blocks)
-    return selected
+    return [
+        {
+            key: candidate[key]
+            for key in ("raw_value", "candidate_kind", "location")
+        }
+        for candidate in selected
+    ]
 
 
 def _scan_numeric_candidates(
@@ -280,7 +303,11 @@ def _scan_numeric_candidates(
                 raw_value = match.group(group_index)
                 prefix = text[max(0, start - 8) : start]
                 structural = bool(_STRUCTURAL_NUMBER_CONTEXT.search(prefix))
-                if structural and kind != "IDENTIFIER":
+                context = text[max(0, start - 16) : min(len(text), end + 16)]
+                bare_number_without_context = kind == "NUMBER" and not _BARE_NUMBER_CONTEXT.search(
+                    context
+                )
+                if (structural and kind != "IDENTIFIER") or bare_number_without_context:
                     structural_suppressed += 1
                     continue
                 raw_candidates.append(
@@ -378,11 +405,23 @@ def compact_extraction_payload(
         {**item, "location": compact_location(block.location)}
         for block, item in zip(blocks, payload["blocks"], strict=True)
     ]
-    evidence_blocks = list(payload["blocks"])
+    evidence_blocks: list[dict[str, Any]] = []
+    row_only = any(block.location.row is not None for block in blocks)
     for block in blocks:
         if block.table is None:
             continue
         for row in block.table.rows:
+            if block.location.row is not None:
+                evidence_blocks.append(
+                    {
+                        "block_id": f"{block.block_id}_row_{row.row:04d}",
+                        "type": "TABLE_ROW",
+                        "text": "\t".join(cell.raw_text for cell in row.cells),
+                        "location": compact_location(
+                            DocumentLocation(table_index=block.table.table_index, row=row.row)
+                        ),
+                    }
+                )
             for column, cell in enumerate(row.cells):
                 location = cell.location.model_copy(
                     update={
@@ -413,8 +452,710 @@ def compact_extraction_payload(
         "classify_numeric_candidates": True,
         "facts_max_items": MAX_COMPACT_FACTS,
         "return_only_profile_and_facts": True,
+        "table_location_mode": "ROW_ONLY" if row_only and not any(
+            block.location.column is not None for block in blocks
+        ) else "ROW_OR_CELL",
     }
     return payload
+
+
+def stable_unit_id(block: DocumentBlock) -> str:
+    canonical = {
+        "block_id": block.block_id,
+        "location": location_key(block.location),
+        "text": normalize_text(block.raw_text),
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), default=str).encode()
+    ).hexdigest()[:20]
+    return f"unit_{digest}"
+
+
+EXTRACTION_VERSION = "structured-map-reduce-v2"
+
+
+def stable_batch_id(
+    file_sha256: str,
+    blocks: list[DocumentBlock],
+    extraction_version: str = EXTRACTION_VERSION,
+) -> str:
+    """Derive a retry/idempotency key from content, not task-local file IDs."""
+
+    unit_ids = sorted(stable_unit_id(block) for block in blocks)
+    digest = hashlib.sha256(
+        json.dumps(
+            [file_sha256, unit_ids, extraction_version],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:24]
+    return f"batch_{digest}"
+
+
+def estimate_extraction_output_tokens(max_facts: int, numeric_candidate_count: int) -> int:
+    """Estimate compact JSON output using a conservative fixed upper bound."""
+
+    estimated_chars = 256 + max_facts * 220 + numeric_candidate_count * 48
+    return ceil(estimated_chars / 2)
+
+
+def estimate_simplified_output_tokens(
+    *, numeric_candidate_count: int, max_text_facts: int
+) -> int:
+    """Fixed conservative bound for the two compact response protocols."""
+
+    # This intentionally counts JSON punctuation and key names.  It is a
+    # planning guard, not a truncation mechanism.
+    # 160 characters covers the bounded key/value fields of one numeric item
+    # (including JSON punctuation and the 64-character semantic key).
+    numeric_chars = 64 + numeric_candidate_count * 160
+    text_chars = 32 + max_text_facts * 170
+    # Numeric and text responses are separate requests.  Their output budgets
+    # must be bounded independently; summing them would halve useful batch
+    # capacity while overstating any single response.
+    return max(ceil(numeric_chars / 2), ceil(text_chars / 2))
+
+
+def _simplified_units(blocks: list[DocumentBlock]) -> list[dict[str, Any]]:
+    return [
+        {
+            "unit_id": stable_unit_id(block),
+            "type": block.type,
+            "text": block.raw_text,
+            "location": compact_location(block.location),
+            "table": (
+                {
+                    "table_index": block.location.table_index,
+                    "row": block.location.row,
+                    "column": block.location.column,
+                }
+                if block.location.table_index is not None
+                else None
+            ),
+        }
+        for block in blocks
+    ]
+
+
+def build_numeric_candidate_payload(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+    *,
+    batch_id: str,
+) -> dict[str, Any]:
+    candidates = [
+        {"candidate_index": index, **candidate}
+        for index, candidate in enumerate(numeric_candidates(blocks), start=1)
+    ]
+    return {
+        "file_id": document.file_id,
+        "role": document.role,
+        "batch_id": batch_id,
+        "units": _simplified_units(blocks),
+        "numeric_candidates": candidates,
+        "requirements": {
+            "max_items": 24,
+            "each_candidate_exactly_once": True,
+            "identity_and_evidence_are_program_owned": True,
+        },
+    }
+
+
+def build_text_fact_payload(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+    *,
+    batch_id: str,
+) -> dict[str, Any]:
+    return {
+        "file_id": document.file_id,
+        "role": document.role,
+        "batch_id": batch_id,
+        "units": _simplified_units(blocks),
+        "requirements": {
+            "max_items": 12,
+            "quote_must_be_exact_substring": True,
+            "identity_and_location_are_program_owned": True,
+        },
+    }
+
+
+def expand_numeric_candidate_response(
+    payload: dict[str, Any], value: Any
+) -> tuple[list[FactCandidate], set[int]]:
+    response = NumericCandidateExtraction.model_validate(value)
+    candidates = payload.get("numeric_candidates", [])
+    expected = set(range(1, len(candidates) + 1))
+    actual = [item.candidate_index for item in response.items]
+    if len(actual) != len(set(actual)) or set(actual) != expected:
+        raise EvidenceValidationError(
+            "numeric candidates must be classified exactly once",
+            code="NUMERIC_CANDIDATE_UNCLASSIFIED",
+        )
+    facts: list[FactCandidate] = []
+    by_index = {item["candidate_index"]: item for item in candidates}
+    evidence_by_location = {
+        location_key(item["location"]): item.get("text", "")
+        for item in payload.get("units", [])
+        if isinstance(item, dict) and isinstance(item.get("location"), dict)
+    }
+    for item in response.items:
+        if item.decision != "FACT":
+            continue
+        candidate = by_index[item.candidate_index]
+        location = DocumentLocation.model_validate(candidate["location"])
+        raw_value = str(candidate["raw_value"])
+        facts.append(
+            FactCandidate(
+                field_key=item.semantic_key,
+                display_name=item.display_name,
+                value_type=item.value_type,
+                raw_value=raw_value,
+                normalized_hint=normalize_text(raw_value),
+                source_file_id=str(payload.get("file_id", "")),
+                evidence_text=evidence_by_location.get(location_key(location), raw_value),
+                location=location,
+                confidence=item.confidence,
+            )
+        )
+    return facts, expected
+
+
+def expand_text_fact_response(
+    payload: dict[str, Any], value: Any
+) -> list[FactCandidate]:
+    response = TextFactExtraction.model_validate(value)
+    if len(response.items) >= 12:
+        raise EvidenceValidationError(
+            "text fact batch reached its saturation limit",
+            code="FACT_BATCH_SATURATED",
+        )
+    units = {
+        item["unit_id"]: item for item in payload.get("units", []) if isinstance(item, dict)
+    }
+    facts: list[FactCandidate] = []
+    identities: set[tuple[str, str, str]] = set()
+    for item in response.items:
+        unit = units.get(item.unit_id)
+        if unit is None:
+            raise EvidenceValidationError(
+                "text fact references an unknown unit", code="FACT_UNIT_NOT_FOUND"
+            )
+        text = unit.get("text", "")
+        if not isinstance(text, str) or item.quote not in text:
+            raise EvidenceValidationError(
+                "text fact quote is not an exact substring",
+                code="FACT_QUOTE_NOT_GROUNDED",
+            )
+        location = DocumentLocation.model_validate(unit["location"])
+        identity = (item.semantic_key, item.unit_id, item.quote)
+        if identity in identities:
+            raise EvidenceValidationError(
+                "text fact identity is duplicated", code="FACT_IDENTITY_DUPLICATED"
+            )
+        identities.add(identity)
+        facts.append(
+            FactCandidate(
+                field_key=item.semantic_key,
+                display_name=item.display_name,
+                value_type=item.value_type,
+                raw_value=item.quote,
+                normalized_hint=normalize_text(item.quote),
+                source_file_id=str(payload.get("file_id", "")),
+                evidence_text=text,
+                location=location,
+                confidence=item.confidence,
+            )
+        )
+    return facts
+
+
+def build_document_overview_payload(document: ParsedDocument) -> dict[str, Any]:
+    """Build a bounded outline for the one-time document profile call."""
+
+    if not document.blocks:
+        raise EvidenceValidationError("document has no structural units")
+    selected: list[DocumentBlock] = []
+    seen: set[str] = set()
+    candidates = [
+        block
+        for block in document.blocks
+        if block.location.section or block.type in {"TABLE", "HEADER"}
+    ]
+    candidates.extend(document.blocks[:4])
+    candidates.extend(document.blocks[-4:])
+    for block in candidates:
+        if block.block_id in seen:
+            continue
+        seen.add(block.block_id)
+        selected.append(block)
+    overview_blocks: list[dict[str, Any]] = []
+    remaining = 6000
+    for block in selected:
+        text = block.raw_text[: max(1, min(len(block.raw_text), remaining))]
+        if not text:
+            continue
+        overview_blocks.append(
+            {
+                "unit_id": stable_unit_id(block),
+                "type": block.type,
+                "text": text,
+                "location": compact_location(block.location),
+            }
+        )
+        remaining -= len(text)
+        if remaining <= 0:
+            break
+    return {
+        "file_id": document.file_id,
+        "role": document.role,
+        "overview_blocks": overview_blocks,
+        "extraction_requirements": {
+            "return_only_document_overview": True,
+            "document_kind_is_open_ended": True,
+            "identity_is_program_owned": True,
+        },
+    }
+
+
+def _fact_batch_units(
+    document: ParsedDocument, blocks: list[DocumentBlock]
+) -> list[dict[str, Any]]:
+    units: list[dict[str, Any]] = []
+    for block in blocks:
+        units.append(
+            {
+                "unit_id": stable_unit_id(block),
+                "block_id": block.block_id,
+                "type": block.type,
+                "text": block.raw_text,
+                "location": compact_location(block.location),
+            }
+        )
+    return units
+
+
+def build_fact_batch_payload(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+    *,
+    batch_id: str,
+    max_facts: int = MAX_COMPACT_FACTS,
+    estimated_output_tokens: int = DEFAULT_ESTIMATED_OUTPUT_TOKEN_LIMIT,
+) -> dict[str, Any]:
+    candidates = numeric_candidates(blocks)
+    indexed_candidates = [
+        {"candidate_index": index, **candidate}
+        for index, candidate in enumerate(candidates, start=1)
+    ]
+    evidence_blocks: list[dict[str, Any]] = []
+    for block in blocks:
+        if block.table is None:
+            continue
+        for row in block.table.rows:
+            evidence_blocks.append(
+                {
+                    "block_id": f"{block.block_id}_row_{row.row:04d}",
+                    "type": "TABLE_ROW",
+                    "text": "\t".join(cell.raw_text for cell in row.cells),
+                    "location": compact_location(
+                        DocumentLocation(table_index=block.table.table_index, row=row.row)
+                    ),
+                }
+            )
+            for column, cell in enumerate(row.cells):
+                location = cell.location.model_copy(
+                    update={
+                        "table_index": block.table.table_index,
+                        "row": row.row,
+                        "column": (
+                            cell.location.column
+                            if cell.location.column is not None
+                            else column
+                        ),
+                    }
+                )
+                evidence_blocks.append(
+                    {
+                        "block_id": f"{block.block_id}_r{row.row:04d}_c{column:04d}",
+                        "type": "TABLE_CELL",
+                        "text": cell.raw_text,
+                        "location": compact_location(location),
+                    }
+                )
+    return {
+        "file_id": document.file_id,
+        "role": document.role,
+        "batch_id": batch_id,
+        "units": _fact_batch_units(document, blocks),
+        "evidence_blocks": evidence_blocks,
+        "numeric_candidates": indexed_candidates,
+        "numeric_candidate_metrics": numeric_candidate_metrics(blocks),
+        "extraction_requirements": {
+            "return_only_facts_and_numeric_candidate_decisions": True,
+            "facts_max_items": max_facts,
+            "estimated_output_tokens": estimated_output_tokens,
+            "identity_is_program_owned": True,
+            "evidence_is_program_owned": True,
+            "table_positions_must_be_from_input": True,
+        },
+    }
+
+
+def plan_document_batches(
+    document: ParsedDocument,
+    *,
+    max_payload_chars: int,
+    max_numeric_candidates: int,
+    max_facts: int = MAX_COMPACT_FACTS,
+    max_output_tokens: int = 6144,
+    estimated_output_token_limit: int = DEFAULT_ESTIMATED_OUTPUT_TOKEN_LIMIT,
+) -> list[dict[str, Any]]:
+    """Plan leaf batches without truncating structural units or candidates."""
+
+    max_unit_chars = max(1000, max_payload_chars - 1500)
+    units = extraction_units(document, max_unit_chars=max_unit_chars)
+    planned: list[dict[str, Any]] = []
+    current: list[DocumentBlock] = []
+
+    def describe(blocks: list[DocumentBlock]) -> dict[str, Any]:
+        batch_id = stable_batch_id(document.sha256, blocks)
+        candidates = numeric_candidates(blocks)
+        estimated = estimate_extraction_output_tokens(max_facts, len(candidates))
+        payload = build_fact_batch_payload(
+            document,
+            blocks,
+            batch_id=batch_id,
+            max_facts=max_facts,
+            estimated_output_tokens=estimated,
+        )
+        return {
+            "batch_id": batch_id,
+            "document_id": document.file_id,
+            "blocks": blocks,
+            "unit_ids": [stable_unit_id(block) for block in blocks],
+            "payload": payload,
+            "numeric_candidate_count": len(candidates),
+            "estimated_output_tokens": estimated,
+            "depth": 0,
+            "parent_batch_id": None,
+        }
+
+    for unit in units:
+        candidate = [*current, unit]
+        candidate_payload = describe(candidate)
+        over = (
+            extraction_payload_chars(candidate_payload["payload"]) > max_payload_chars
+            or candidate_payload["numeric_candidate_count"] > max_numeric_candidates
+            or candidate_payload["estimated_output_tokens"]
+            > min(estimated_output_token_limit, max_output_tokens)
+        )
+        if current and over:
+            planned.append(describe(current))
+            current = []
+            candidate = [unit]
+            candidate_payload = describe(candidate)
+        if (
+            extraction_payload_chars(candidate_payload["payload"]) > max_payload_chars
+            or candidate_payload["numeric_candidate_count"] > max_numeric_candidates
+            or candidate_payload["estimated_output_tokens"]
+            > min(estimated_output_token_limit, max_output_tokens)
+        ):
+            raise EvidenceValidationError("single extraction unit exceeds batch limits")
+        current.append(unit)
+    if current:
+        planned.append(describe(current))
+    return planned
+
+
+def plan_simplified_document_batches(
+    document: ParsedDocument,
+    *,
+    max_payload_chars: int,
+    max_numeric_candidates: int = 24,
+    estimated_output_token_limit: int = 2000,
+    extraction_version: str = EXTRACTION_VERSION,
+) -> list[dict[str, Any]]:
+    """Plan one paired numeric/text batch per content slice.
+
+    The two model chains share the same immutable units and stable batch ID.
+    Planning measures each actual request payload, so reducing the protocol
+    does not rely on an optimistic character estimate.
+    """
+
+    units = extraction_units(
+        document,
+        max_unit_chars=max(1000, max_payload_chars - 1800),
+    )
+    planned: list[dict[str, Any]] = []
+
+    def describe(blocks: list[DocumentBlock]) -> dict[str, Any]:
+        batch_id = stable_batch_id(document.sha256, blocks, extraction_version)
+        numeric_payload = build_numeric_candidate_payload(
+            document, blocks, batch_id=batch_id
+        )
+        text_payload = build_text_fact_payload(document, blocks, batch_id=batch_id)
+        count = len(numeric_payload["numeric_candidates"])
+        estimate = estimate_simplified_output_tokens(
+            numeric_candidate_count=count, max_text_facts=min(12, len(blocks))
+        )
+        return {
+            "batch_id": batch_id,
+            "document_id": document.file_id,
+            "file_sha256": document.sha256,
+            "blocks": blocks,
+            "unit_ids": [stable_unit_id(block) for block in blocks],
+            "numeric_payload": numeric_payload,
+            "text_payload": text_payload,
+            "payload": numeric_payload,
+            "numeric_candidate_count": count,
+            "estimated_output_tokens": estimate,
+            "depth": 0,
+            "parent_batch_id": None,
+            "extraction_version": extraction_version,
+        }
+
+    current: list[DocumentBlock] = []
+    for unit in units:
+        candidate = [*current, unit]
+        description = describe(candidate)
+        over = (
+            extraction_payload_chars(description["numeric_payload"]) > max_payload_chars
+            or extraction_payload_chars(description["text_payload"]) > max_payload_chars
+            or description["numeric_candidate_count"] > max_numeric_candidates
+            or description["estimated_output_tokens"] > estimated_output_token_limit
+        )
+        if current and over:
+            planned.append(describe(current))
+            current = []
+            description = describe([unit])
+        if (
+            extraction_payload_chars(description["numeric_payload"]) > max_payload_chars
+            or extraction_payload_chars(description["text_payload"]) > max_payload_chars
+            or description["numeric_candidate_count"] > max_numeric_candidates
+            or description["estimated_output_tokens"] > estimated_output_token_limit
+        ):
+            raise EvidenceValidationError("single extraction unit exceeds simplified batch limits")
+        current.append(unit)
+    if current:
+        planned.append(describe(current))
+    return planned
+
+
+def expand_document_overview(
+    payload: dict[str, Any],
+    value: Any,
+) -> DocumentFactExtraction:
+    overview = CompactDocumentOverview.model_validate(value)
+    allowed = {
+        location_key(item["location"])
+        for item in payload.get("overview_blocks", [])
+        if isinstance(item, dict) and isinstance(item.get("location"), dict)
+    }
+    locations = [
+        location
+        for location in overview.evidence_locations
+        if location_key(location) in allowed
+    ]
+    if len(locations) != len(overview.evidence_locations) or not locations:
+        raise EvidenceValidationError(
+            "document overview evidence location is not in outline",
+            code="PROFILE_LOCATION_NOT_FOUND",
+        )
+    return DocumentFactExtraction(
+        profile=DocumentProfile(
+            file_id=str(payload["file_id"]),
+            document_kind=overview.document_kind,
+            title=overview.title,
+            confidence=overview.confidence,
+            evidence_locations=locations,
+        ),
+        facts=[],
+        missing_field_keys=[],
+    )
+
+
+def expand_fact_batch(
+    payload: dict[str, Any],
+    value: Any,
+) -> DocumentFactExtraction:
+    compact = CompactFactBatchExtraction.model_validate(value)
+    candidates = payload.get("numeric_candidates", [])
+    expected_indices = set(range(1, len(candidates) + 1))
+    decisions = compact.numeric_candidate_decisions
+    actual_indices = [item.candidate_index for item in decisions]
+    if set(actual_indices) != expected_indices or len(actual_indices) != len(set(actual_indices)):
+        raise EvidenceValidationError(
+            "numeric candidate classification is incomplete",
+            code="NUMERIC_CANDIDATE_UNCLASSIFIED",
+        )
+    fact_indices: list[int] = [index for fact in compact.facts for index in fact.candidate_indices]
+    if len(fact_indices) != len(set(fact_indices)) or not set(fact_indices) <= expected_indices:
+        raise EvidenceValidationError(
+            "numeric candidate fact references are invalid",
+            code="NUMERIC_CANDIDATE_INVALID",
+        )
+    decision_by_index = {item.candidate_index: item.decision for item in decisions}
+    for index in expected_indices:
+        if (decision_by_index[index] == "FACT") != (index in fact_indices):
+            raise EvidenceValidationError(
+                "numeric candidate disposition does not match facts",
+                code="NUMERIC_CANDIDATE_INVALID",
+            )
+
+    evidence_by_location: dict[tuple[object, ...], list[str]] = defaultdict(list)
+    allowed_locations: set[tuple[object, ...]] = set()
+    for item in [*payload.get("units", []), *payload.get("evidence_blocks", [])]:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        location = item.get("location")
+        if not isinstance(location, dict):
+            continue
+        key = location_key(location)
+        allowed_locations.add(key)
+        evidence_by_location[key].append(item["text"])
+    facts: list[FactCandidate] = []
+    for fact in compact.facts:
+        fact_location = location_key(fact.location)
+        if fact_location not in allowed_locations:
+            raise EvidenceValidationError(
+                "fact evidence location does not exist",
+                code="FACT_LOCATION_NOT_FOUND",
+            )
+        evidence_text = next(
+            (
+                text
+                for text in evidence_by_location[fact_location]
+                if normalize_text(fact.raw_value) in normalize_text(text)
+            ),
+            None,
+        )
+        if evidence_text is None:
+            raise EvidenceValidationError(
+                "fact value is not grounded", code="FACT_VALUE_NOT_GROUNDED"
+            )
+        facts.append(
+            FactCandidate(
+                **fact.model_dump(mode="python", exclude={"candidate_indices"}),
+                source_file_id=str(payload["file_id"]),
+                evidence_text=evidence_text,
+                normalized_hint=None,
+            )
+        )
+    first_location = next(iter(allowed_locations), (None, 0, None, None, None))
+    return DocumentFactExtraction(
+        profile=DocumentProfile(
+            file_id=str(payload["file_id"]),
+            document_kind="UNKNOWN",
+            title=None,
+            confidence=0.0,
+            evidence_locations=[DocumentLocation(
+                page=first_location[0],
+                paragraph_index=first_location[1],
+                table_index=first_location[2],
+                row=first_location[3],
+                column=first_location[4],
+            )],
+        ),
+        facts=facts,
+        missing_field_keys=[],
+    )
+
+
+def _table_row_unit(
+    block: DocumentBlock,
+    row: TableRow,
+    *,
+    cells: list[Any] | None = None,
+    group_index: int | None = None,
+) -> DocumentBlock:
+    """Represent one table row or a deterministic column group."""
+
+    table_index = block.table.table_index if block.table is not None else None
+    if table_index is None:
+        raise EvidenceValidationError("table row is missing table_index")
+    selected_cells = cells or row.cells
+    row_text = "\t".join(cell.raw_text for cell in selected_cells)
+    row_location = DocumentLocation(
+        table_index=table_index,
+        row=row.row,
+        column=(selected_cells[0].location.column if cells else None),
+    )
+    if block.table is None:
+        raise EvidenceValidationError("table row has no parent table")
+    row_table = ParsedTable(
+        table_index=table_index,
+        rows=[TableRow(row=row.row, cells=selected_cells)],
+    )
+    suffix = f"_g{group_index:04d}" if group_index is not None else ""
+    return DocumentBlock(
+        block_id=f"{block.block_id}_r{row.row:06d}{suffix}",
+        type="TABLE",
+        order=block.order,
+        raw_text=row_text,
+        normalized_text=normalize_text(row_text),
+        location=row_location,
+        table=row_table,
+    )
+
+
+def extraction_units(
+    document: ParsedDocument,
+    *,
+    max_unit_chars: int | None = None,
+) -> list[DocumentBlock]:
+    """Return paragraphs and independently addressable table rows/column groups."""
+
+    units: list[DocumentBlock] = []
+    for block in document.blocks:
+        if block.table is None:
+            units.append(block)
+            continue
+        for row in block.table.rows:
+            if max_unit_chars is None or len(
+                "\t".join(cell.raw_text for cell in row.cells)
+            ) <= max_unit_chars:
+                units.append(_table_row_unit(block, row))
+                continue
+            group: list[Any] = []
+            group_chars = 0
+            group_index = 0
+            for cell in row.cells:
+                cell_chars = len(cell.raw_text) + (1 if group else 0)
+                if group and group_chars + cell_chars > max_unit_chars:
+                    units.append(
+                        _table_row_unit(
+                            block,
+                            row,
+                            cells=group,
+                            group_index=group_index,
+                        )
+                    )
+                    group = []
+                    group_chars = 0
+                    group_index += 1
+                if len(cell.raw_text) > max_unit_chars:
+                    raise EvidenceValidationError(
+                        "single table cell exceeds extraction unit limit"
+                    )
+                group.append(cell)
+                group_chars += cell_chars
+            if group:
+                units.append(
+                    _table_row_unit(
+                        block,
+                        row,
+                        cells=group,
+                        group_index=group_index,
+                    )
+                )
+    return units
+
+
+def extraction_payload_chars(payload: dict[str, Any]) -> int:
+    """Count the exact compact JSON payload sent as the model user message."""
+
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def chunk_document(
@@ -422,23 +1163,50 @@ def chunk_document(
     max_chars: int,
     *,
     max_numeric_candidates: int | None = None,
+    max_payload_chars: int | None = None,
 ) -> list[list[DocumentBlock]]:
     chunks: list[list[DocumentBlock]] = []
     current: list[DocumentBlock] = []
     current_chars = 0
     current_numeric_candidates = 0
-    for block in document.blocks:
+    for block in extraction_units(document):
         block_chars = len(block.raw_text)
         block_numeric_candidates = len(numeric_candidates([block]))
         over_numeric_limit = (
             max_numeric_candidates is not None
             and current_numeric_candidates + block_numeric_candidates > max_numeric_candidates
         )
-        if current and (current_chars + block_chars > max_chars or over_numeric_limit):
+        proposed = [*current, block]
+        over_payload_limit = (
+            max_payload_chars is not None
+            and extraction_payload_chars(compact_extraction_payload(document, proposed))
+            > max_payload_chars
+        )
+        if current and (
+            current_chars + block_chars > max_chars
+            or over_numeric_limit
+            or over_payload_limit
+        ):
             chunks.append(current)
             current = []
             current_chars = 0
             current_numeric_candidates = 0
+            proposed = [block]
+        if max_payload_chars is not None:
+            single_payload_chars = extraction_payload_chars(
+                compact_extraction_payload(document, [block])
+            )
+            if single_payload_chars > max_payload_chars:
+                raise EvidenceValidationError(
+                    "single extraction unit exceeds payload limit"
+                )
+        if (
+            max_numeric_candidates is not None
+            and block_numeric_candidates > max_numeric_candidates
+        ):
+            raise EvidenceValidationError(
+                "single extraction unit exceeds numeric candidate limit"
+            )
         current.append(block)
         current_chars += block_chars
         current_numeric_candidates += block_numeric_candidates
@@ -475,7 +1243,11 @@ def expand_compact_extraction(
             "compact profile file_id does not match payload", code="FILE_ID_MISMATCH"
         )
     evidence_by_location: dict[tuple[object, ...], list[str]] = defaultdict(list)
-    for item in payload.get("evidence_blocks", payload.get("blocks", [])):
+    evidence_items = [
+        *payload.get("blocks", []),
+        *payload.get("evidence_blocks", []),
+    ]
+    for item in evidence_items:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
             continue
         try:
@@ -814,6 +1586,13 @@ def _evidence_at(document: ParsedDocument) -> dict[tuple[object, ...], list[str]
         evidence[location_key(block.location)].append(block.raw_text)
         if block.table:
             for row in block.table.rows:
+                row_location = DocumentLocation(
+                    table_index=block.table.table_index,
+                    row=row.row,
+                )
+                evidence[location_key(row_location)].append(
+                    "\t".join(cell.raw_text for cell in row.cells)
+                )
                 for cell in row.cells:
                     evidence[location_key(cell.location)].append(cell.raw_text)
     return evidence
@@ -1048,6 +1827,7 @@ def merge_chunk_extractions(
                 profile_locations.append(location)
     facts: list[FactCandidate] = []
     seen_facts: set[tuple[object, ...]] = set()
+    fact_values_by_identity: dict[tuple[object, ...], str] = {}
     for extraction in extractions:
         for fact in extraction.facts:
             key = (
@@ -1055,6 +1835,20 @@ def merge_chunk_extractions(
                 normalize_text(fact.raw_value),
                 location_key(fact.location),
             )
+            identity = (
+                fact.field_key,
+                fact.source_file_id,
+                fact.value_type,
+                location_key(fact.location),
+            )
+            normalized_value = normalize_text(fact.raw_value)
+            previous_value = fact_values_by_identity.get(identity)
+            if previous_value is not None and previous_value != normalized_value:
+                raise EvidenceValidationError(
+                    "conflicting duplicate fact identity",
+                    code="FACT_IDENTITY_CONFLICT",
+                )
+            fact_values_by_identity[identity] = normalized_value
             if key not in seen_facts:
                 seen_facts.add(key)
                 facts.append(fact)

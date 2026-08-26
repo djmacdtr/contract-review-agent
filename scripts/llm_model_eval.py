@@ -298,6 +298,8 @@ async def send_attempt(
             json.dumps(schema_value, ensure_ascii=False, separators=(",", ":"))
         )
     started = time.perf_counter()
+    content = bytearray()
+    response: httpx.Response | None = None
     try:
         async with httpx.AsyncClient(
             transport=transport,
@@ -313,75 +315,89 @@ async def send_attempt(
                 },
                 json=body,
             )
-            response = await client.send(request, stream=True)
-            attempt.http_status = response.status_code
-            content = bytearray()
-            async for chunk in response.aiter_bytes():
-                if chunk and attempt.first_byte_ms is None:
-                    attempt.first_byte_ms = round((time.perf_counter() - started) * 1000)
-                content.extend(chunk)
-            await response.aclose()
+            async with asyncio.timeout(settings.LLM_TIMEOUT_SECONDS):
+                response = await client.send(request, stream=True)
+                attempt.http_status = response.status_code
+                try:
+                    async for chunk in response.aiter_bytes():
+                        if chunk and attempt.first_byte_ms is None:
+                            attempt.first_byte_ms = round(
+                                (time.perf_counter() - started) * 1000
+                            )
+                        content.extend(chunk)
+                finally:
+                    response_to_close = response
+                    response = None
+                    await response_to_close.aclose()
+    except asyncio.CancelledError:
+        attempt.error_code = "CANCELLED"
+        raise
+    except TimeoutError:
+        attempt.error_code = "TIMEOUT"
     except httpx.TimeoutException:
         attempt.error_code = "TIMEOUT"
-        attempt.total_ms = round((time.perf_counter() - started) * 1000)
-        print(
-            json.dumps({"event": "attempt", **attempt.safe_dict()}, ensure_ascii=False), flush=True
-        )
-        return attempt
     except httpx.RequestError:
         attempt.error_code = "NETWORK_ERROR"
+    except Exception:
+        attempt.error_code = "COLLECTOR_ERROR"
+    else:
         attempt.total_ms = round((time.perf_counter() - started) * 1000)
+        attempt.content_length = len(content)
+        if attempt.http_status is None or attempt.http_status >= 400:
+            attempt.error_code = f"HTTP_{attempt.http_status}"
+        else:
+            try:
+                outer = json.loads(content)
+                attempt.actual_model = outer.get("model")
+                usage = outer.get("usage")
+                if isinstance(usage, dict):
+                    for key, attribute in (
+                        ("prompt_tokens", "prompt_tokens"),
+                        ("completion_tokens", "completion_tokens"),
+                        ("total_tokens", "total_tokens"),
+                    ):
+                        value = usage.get(key)
+                        if isinstance(value, int):
+                            setattr(attempt, attribute, value)
+                choice = outer["choices"][0]
+                attempt.finish_reason = choice.get("finish_reason")
+                attempt.truncated = attempt.finish_reason == "length"
+                model_content = choice["message"]["content"]
+                if not isinstance(model_content, str):
+                    raise TypeError("model content is not text")
+                stripped = model_content.strip()
+                attempt.fenced = bool(
+                    re.fullmatch(r"```(?:json)?\s*.*?\s*```", stripped, re.I | re.S)
+                )
+                attempt.explanatory_prefix = not stripped.startswith("{")
+                parsed = json.loads(stripped)
+                attempt.raw_value = parsed
+                attempt.strict_json = isinstance(parsed, dict)
+                if attempt.strict_json:
+                    if role == "extraction":
+                        compact = CompactDocumentFactExtraction.model_validate(parsed)
+                        attempt.value = expand_compact_extraction(payload, compact)
+                    else:
+                        attempt.value = schema.model_validate(parsed)
+                    attempt.schema_valid = True
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+                attempt.error_code = "INVALID_JSON_OR_RESPONSE"
+            except (ValidationError, ValueError):
+                attempt.error_code = "SCHEMA_INVALID"
+        if attempt.schema_valid and attempt.value is not None:
+            attempt.output_metrics = safe_value_metrics(attempt.value.model_dump(mode="json"))
+    finally:
+        attempt.total_ms = round((time.perf_counter() - started) * 1000)
+        if response is not None:
+            try:
+                await response.aclose()
+            except Exception:
+                if attempt.error_code is None:
+                    attempt.error_code = "RESPONSE_CLOSE_ERROR"
         print(
-            json.dumps({"event": "attempt", **attempt.safe_dict()}, ensure_ascii=False), flush=True
+            json.dumps({"event": "attempt", **attempt.safe_dict()}, ensure_ascii=False),
+            flush=True,
         )
-        return attempt
-    attempt.total_ms = round((time.perf_counter() - started) * 1000)
-    attempt.content_length = len(content)
-    if attempt.http_status is None or attempt.http_status >= 400:
-        attempt.error_code = f"HTTP_{attempt.http_status}"
-        print(
-            json.dumps({"event": "attempt", **attempt.safe_dict()}, ensure_ascii=False), flush=True
-        )
-        return attempt
-    try:
-        outer = json.loads(content)
-        attempt.actual_model = outer.get("model")
-        usage = outer.get("usage")
-        if isinstance(usage, dict):
-            for key, attribute in (
-                ("prompt_tokens", "prompt_tokens"),
-                ("completion_tokens", "completion_tokens"),
-                ("total_tokens", "total_tokens"),
-            ):
-                value = usage.get(key)
-                if isinstance(value, int):
-                    setattr(attempt, attribute, value)
-        choice = outer["choices"][0]
-        attempt.finish_reason = choice.get("finish_reason")
-        attempt.truncated = attempt.finish_reason == "length"
-        model_content = choice["message"]["content"]
-        if not isinstance(model_content, str):
-            raise TypeError("model content is not text")
-        stripped = model_content.strip()
-        attempt.fenced = bool(re.fullmatch(r"```(?:json)?\s*.*?\s*```", stripped, re.I | re.S))
-        attempt.explanatory_prefix = not stripped.startswith("{")
-        parsed = json.loads(stripped)
-        attempt.raw_value = parsed
-        attempt.strict_json = isinstance(parsed, dict)
-        if attempt.strict_json:
-            if role == "extraction":
-                compact = CompactDocumentFactExtraction.model_validate(parsed)
-                attempt.value = expand_compact_extraction(payload, compact)
-            else:
-                attempt.value = schema.model_validate(parsed)
-            attempt.schema_valid = True
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
-        attempt.error_code = "INVALID_JSON_OR_RESPONSE"
-    except (ValidationError, ValueError):
-        attempt.error_code = "SCHEMA_INVALID"
-    if attempt.schema_valid and attempt.value is not None:
-        attempt.output_metrics = safe_value_metrics(attempt.value.model_dump(mode="json"))
-    print(json.dumps({"event": "attempt", **attempt.safe_dict()}, ensure_ascii=False), flush=True)
     return attempt
 
 

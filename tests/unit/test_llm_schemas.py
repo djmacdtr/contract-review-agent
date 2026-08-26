@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from app.adapters.llm.schemas import DocumentFactExtraction
+from app.adapters.llm.schemas import (
+    CompactDocumentOverview,
+    CompactFactBatchExtraction,
+    DocumentFactExtraction,
+)
 
 
 def valid_payload() -> dict:
@@ -52,6 +56,38 @@ def test_llm_schema_rejects_extra_fields_and_duplicate_missing_keys() -> None:
 
     with pytest.raises(ValidationError):
         DocumentFactExtraction.model_validate(payload)
+
+
+def test_fact_batch_schema_is_compact_and_bounded() -> None:
+    overview = CompactDocumentOverview.model_validate(
+        {
+            "document_kind": "合成资料",
+            "title": "合成标题",
+            "confidence": 0.9,
+            "evidence_locations": [{"paragraph_index": 0}],
+        }
+    )
+    batch = CompactFactBatchExtraction.model_validate(
+        {
+            "facts": [
+                {
+                    "field_key": "amount",
+                    "display_name": "金额",
+                    "value_type": "MONEY",
+                    "raw_value": "100万元",
+                    "location": {"paragraph_index": 1},
+                    "confidence": 0.9,
+                    "candidate_indices": [1],
+                }
+            ],
+            "numeric_candidate_decisions": [
+                {"candidate_index": 1, "decision": "FACT", "reason_code": "EXTRACTED"}
+            ],
+        }
+    )
+
+    assert overview.document_kind == "合成资料"
+    assert batch.facts[0].candidate_indices == [1]
 
     payload = valid_payload()
     payload["missing_field_keys"] = ["interest_rate", "interest_rate"]

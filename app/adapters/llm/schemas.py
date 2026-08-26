@@ -137,6 +137,74 @@ class CompactDocumentProfile(StrictLlmSchema):
         return value.strip() or "UNKNOWN"
 
 
+class CompactDocumentOverview(StrictLlmSchema):
+    """One-time document overview response without program-owned identity."""
+
+    document_kind: str = Field(min_length=1, max_length=80)
+    title: str | None = Field(default=None, max_length=160)
+    confidence: float = Field(ge=0, le=1)
+    evidence_locations: list[DocumentLocation] = Field(min_length=1, max_length=8)
+
+    @field_validator("document_kind")
+    @classmethod
+    def normalize_document_kind(cls, value: str) -> str:
+        return value.strip() or "UNKNOWN"
+
+
+class NumericCandidateDecision(StrictLlmSchema):
+    """Explicit disposition for one numeric candidate in a fact batch."""
+
+    candidate_index: int = Field(ge=1, le=128)
+    decision: Literal["FACT", "IGNORE"]
+    reason_code: str = Field(min_length=1, max_length=40)
+
+
+class NumericCandidateItem(StrictLlmSchema):
+    """The model-owned part of one numeric candidate decision.
+
+    Candidate text, evidence and location deliberately do not cross the model
+    boundary.  The extractor only returns the index and its interpretation;
+    the program rehydrates the candidate from the input payload.
+    """
+
+    candidate_index: int = Field(ge=1, le=24)
+    semantic_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    value_type: ValueType
+    decision: Literal["FACT", "IGNORE"]
+    reason_code: str = Field(min_length=1, max_length=40)
+    confidence: float = Field(ge=0, le=1)
+
+
+class NumericCandidateExtraction(StrictLlmSchema):
+    """Strict numeric-candidate chain response."""
+
+    items: list[NumericCandidateItem] = Field(..., max_length=24)
+
+
+class TextFactItem(StrictLlmSchema):
+    """A compact non-numeric fact grounded to one input structure unit."""
+
+    unit_id: str = Field(pattern=r"^unit_[0-9a-f]{8,64}$")
+    semantic_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    value_type: ValueType
+    quote: str = Field(min_length=1, max_length=4000)
+    confidence: float = Field(ge=0, le=1)
+
+
+class TextFactExtraction(StrictLlmSchema):
+    """Strict non-numeric fact chain response."""
+
+    items: list[TextFactItem] = Field(..., max_length=12)
+
+
+# Descriptive aliases used by the extraction controller and tests.  Keeping
+# one canonical model avoids divergent public/internal schemas.
+NumericCandidateDecisionResponse = NumericCandidateExtraction
+NonNumericFactExtraction = TextFactExtraction
+
+
 class CompactFactCandidate(StrictLlmSchema):
     """Fact wire shape; evidence is recovered deterministically from ``location``."""
 
@@ -147,6 +215,16 @@ class CompactFactCandidate(StrictLlmSchema):
     raw_value: str = Field(min_length=1, max_length=256)
     location: DocumentLocation
     confidence: float = Field(ge=0, le=1)
+    candidate_indices: list[int] = Field(default_factory=list, max_length=8)
+
+
+class CompactFactBatchExtraction(StrictLlmSchema):
+    """Fact-only wire response; evidence and identity are restored by the program."""
+
+    facts: list[CompactFactCandidate] = Field(default_factory=list, max_length=24)
+    numeric_candidate_decisions: list[NumericCandidateDecision] = Field(
+        default_factory=list, max_length=48
+    )
 
 
 class CompactDocumentFactExtraction(StrictLlmSchema):

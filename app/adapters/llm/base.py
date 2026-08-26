@@ -11,9 +11,16 @@ class LlmResult:
     duration_ms: int = 0
     request_attempts: int = 0
     structure_retries: int = 0
+    finish_reason: str | None = None
+    response_format: str = "prompt_only"
 
 
 class ContractLlmClient(Protocol):
+    async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def extract_numeric_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult: ...
+
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult: ...
     async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult: ...
@@ -29,6 +36,66 @@ class MockContractLlmClient:
 
     def __init__(self, model: str = "GLM-5.2") -> None:
         self.model = model
+
+    async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult:
+        first = payload.get("overview_blocks", [{}])[0]
+        return LlmResult(
+            value={
+                "document_kind": "UNKNOWN",
+                "title": None,
+                "confidence": 0.0,
+                "evidence_locations": [first.get("location", {"paragraph_index": 0})],
+            },
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
+
+    async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult:
+        return LlmResult(
+            value={"facts": [], "numeric_candidate_decisions": [
+                {
+                    "candidate_index": index,
+                    "decision": "IGNORE",
+                    "reason_code": "NO_FACT",
+                }
+                for index, _candidate in enumerate(payload.get("numeric_candidates", []), start=1)
+            ]},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
+
+    async def extract_numeric_candidates(self, payload: dict[str, Any]) -> LlmResult:
+        return LlmResult(
+            value={
+                "items": [
+                    {
+                        "candidate_index": index,
+                        "semantic_key": "numeric_candidate",
+                        "display_name": "数值候选",
+                        "value_type": "UNKNOWN",
+                        "decision": "IGNORE",
+                        "reason_code": "MOCK_IGNORE",
+                        "confidence": 0.0,
+                    }
+                    for index, _candidate in enumerate(
+                        payload.get("numeric_candidates", []), start=1
+                    )
+                ]
+            },
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
+
+    async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult:
+        return LlmResult(
+            value={"items": []},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
         return LlmResult(
