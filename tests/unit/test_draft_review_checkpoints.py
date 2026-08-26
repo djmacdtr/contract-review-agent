@@ -36,6 +36,51 @@ async def test_checkpoint_write_is_idempotent_and_recovery_read_is_stable() -> N
         )
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_recovery_prefers_current_task_and_matches_payload() -> None:
+    store = InMemoryExtractionCheckpointStore()
+    source = ExtractionCheckpoint(
+        task_id="source_task",
+        batch_id="batch_shared",
+        file_sha256="f" * 64,
+        extraction_version="text-v4",
+        payload_digest="source_digest",
+        status="SUCCEEDED",
+        value={"owner": "source"},
+    )
+    current = ExtractionCheckpoint(
+        task_id="current_task",
+        batch_id="batch_shared",
+        file_sha256="f" * 64,
+        extraction_version="text-v4",
+        payload_digest="current_digest",
+        status="SUCCEEDED",
+        value={"owner": "current"},
+    )
+    await store.save(source)
+    await store.save(current)
+
+    recovered = await store.load(
+        "batch_shared",
+        task_id="current_task",
+        source_task_id="source_task",
+        file_sha256="f" * 64,
+        extraction_version="text-v4",
+        payload_digest="current_digest",
+    )
+    assert recovered == current
+
+    source_recovered = await store.load(
+        "batch_shared",
+        task_id="current_task",
+        source_task_id="source_task",
+        file_sha256="f" * 64,
+        extraction_version="text-v4",
+        payload_digest="source_digest",
+    )
+    assert source_recovered == source
+
+
 class CheckpointFixtureLlm:
     def __init__(self, *, fail_batch: bool = False) -> None:
         self.fail_batch = fail_batch

@@ -68,21 +68,20 @@ class InMemoryExtractionCheckpointStore:
     ) -> ExtractionCheckpoint | None:
         async with self._lock:
             version = extraction_version or "structured-map-reduce-v2"
-            candidates = [
-                item
-                for key, item in self._records.items()
-                if key[2] == batch_id
-                and (file_sha256 is None or key[1] == file_sha256)
-                and key[3] == version
-                and (
-                    task_id is None
-                    or key[0] == task_id
-                    or (source_task_id is not None and key[0] == source_task_id)
-                )
-            ]
-            for item in candidates:
-                if payload_digest is None or item.payload_digest == payload_digest:
-                    return item
+            owners = list(
+                dict.fromkeys(item for item in (task_id, source_task_id) if item)
+            ) or [None]
+            for owner in owners:
+                for key, item in self._records.items():
+                    if (
+                        (owner is None or key[0] == owner)
+                        and key[2] == batch_id
+                        and (file_sha256 is None or key[1] == file_sha256)
+                        and key[3] == version
+                        and item.status == "SUCCEEDED"
+                        and (payload_digest is None or item.payload_digest == payload_digest)
+                    ):
+                        return item
             return None
 
     async def save(self, checkpoint: ExtractionCheckpoint) -> None:
@@ -120,32 +119,41 @@ class SqlAlchemyExtractionCheckpointStore:
         from app.db.models import ExtractionCheckpoint as ExtractionCheckpointRow
 
         version = extraction_version or "structured-map-reduce-v2"
-        allowed_tasks = [item for item in (task_id, source_task_id) if item]
+        allowed_tasks = list(
+            dict.fromkeys(item for item in (task_id, source_task_id) if item)
+        ) or [None]
         async with self.session_factory() as session:
-            statement = select(ExtractionCheckpointRow).where(
-                ExtractionCheckpointRow.batch_id == batch_id,
-                ExtractionCheckpointRow.file_sha256 == file_sha256,
-                ExtractionCheckpointRow.extraction_version == version,
-                ExtractionCheckpointRow.status == "SUCCEEDED",
-            )
-            if allowed_tasks:
-                statement = statement.where(ExtractionCheckpointRow.task_id.in_(allowed_tasks))
-            else:
-                return None
-            row = (await session.execute(statement)).scalar_one_or_none()
-            if row is None or (payload_digest and row.payload_digest != payload_digest):
-                return None
-            return ExtractionCheckpoint(
-                task_id=row.task_id,
-                batch_id=row.batch_id,
-                file_sha256=row.file_sha256,
-                extraction_version=row.extraction_version,
-                payload_digest=row.payload_digest,
-                value=row.value,
-                status="SUCCEEDED",
-                model_name=row.model_name,
-                updated_at=row.updated_at,
-            )
+            for owner in allowed_tasks:
+                filters = [
+                    ExtractionCheckpointRow.batch_id == batch_id,
+                    ExtractionCheckpointRow.file_sha256 == file_sha256,
+                    ExtractionCheckpointRow.extraction_version == version,
+                    ExtractionCheckpointRow.status == "SUCCEEDED",
+                ]
+                if owner is not None:
+                    filters.append(ExtractionCheckpointRow.task_id == owner)
+                if payload_digest is not None:
+                    filters.append(ExtractionCheckpointRow.payload_digest == payload_digest)
+                statement = (
+                    select(ExtractionCheckpointRow)
+                    .where(*filters)
+                    .order_by(ExtractionCheckpointRow.updated_at.desc())
+                    .limit(1)
+                )
+                row = (await session.execute(statement)).scalars().first()
+                if row is not None:
+                    return ExtractionCheckpoint(
+                        task_id=row.task_id,
+                        batch_id=row.batch_id,
+                        file_sha256=row.file_sha256,
+                        extraction_version=row.extraction_version,
+                        payload_digest=row.payload_digest,
+                        value=row.value,
+                        status="SUCCEEDED",
+                        model_name=row.model_name,
+                        updated_at=row.updated_at,
+                    )
+            return None
 
     async def save(self, checkpoint: ExtractionCheckpoint) -> None:
         if checkpoint.status != "SUCCEEDED":

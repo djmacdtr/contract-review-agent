@@ -964,6 +964,18 @@ async def extract_documents_with_independent_map_reduce(
             and checkpoint.task_id
             and checkpoint.task_id != task_id
         ):
+            existing = await checkpoint_store.load(
+                checkpoint.batch_id,
+                task_id=task_id,
+                file_sha256=checkpoint.file_sha256,
+                extraction_version=checkpoint.extraction_version,
+            )
+            if existing is not None:
+                # A failed attempt may have left a success under the same
+                # primary key but with a different payload revision.  Keep
+                # that record intact and continue using the validated source
+                # checkpoint for this invocation.
+                return
             await checkpoint_store.save(
                 ExtractionCheckpoint(
                     task_id=task_id,

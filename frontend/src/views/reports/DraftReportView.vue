@@ -18,7 +18,7 @@
         :files="result.files"
         :module-order="moduleOrder"
         left-label="合同模板"
-        :show-passed-checks="false"
+        :show-passed-checks="true"
       />
     </template>
   </main>
