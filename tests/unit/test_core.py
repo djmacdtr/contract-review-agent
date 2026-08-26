@@ -33,6 +33,8 @@ def test_llm_configuration_defaults() -> None:
     assert settings.LLM_ENABLE_RERANK is False
     assert settings.LLM_REVIEW_BATCH_MAX_CHARS == 8000
     assert settings.LLM_REVIEW_CONTEXT_BLOCKS == 1
+    assert settings.LLM_FACT_REVIEW_ENABLED is False
+    assert settings.LLM_MAPPING_REVIEW_ENABLED is False
     assert settings.LLM_SEMANTIC_PLAN_ENABLED is False
     assert settings.LLM_SAME_MODEL_DIAGNOSTIC is False
     assert settings.PAGE_MISSING_MIN_EQUIVALENT == 0.8
@@ -55,8 +57,13 @@ def test_same_model_diagnostic_is_explicit_and_non_production_only() -> None:
             APP_ENV="production",
             LLM_SAME_MODEL_DIAGNOSTIC=True,
         )
+    Settings(_env_file=None, LLM_REQUIRE_INDEPENDENT_MODEL=False)
     with pytest.raises(ValueError, match="must remain true"):
-        Settings(_env_file=None, LLM_REQUIRE_INDEPENDENT_MODEL=False)
+        Settings(
+            _env_file=None,
+            LLM_REQUIRE_INDEPENDENT_MODEL=False,
+            LLM_FACT_REVIEW_ENABLED=True,
+        )
 
 
 def test_llm_configuration_requires_enablement_base_url_and_key() -> None:

@@ -7,6 +7,8 @@ from app.adapters.llm.schemas import (
     CompactDocumentFactExtraction,
     DocumentFactExtraction,
     FactCandidate,
+    FactMappingResponse,
+    FactMappingReview,
     FactReview,
     SemanticConcept,
     SemanticPlanResponse,
@@ -44,9 +46,11 @@ from app.draft_review.facts import (
     normalize_fact,
     normalized_fact_components,
     plan_document_batches,
+    qualified_fact_refs,
     stable_fact_id,
     stable_unit_id,
     validate_extraction_evidence,
+    validate_mapping_review_coverage,
     validate_semantic_plan,
 )
 
@@ -585,6 +589,122 @@ def test_only_fully_verified_accept_facts_enter_semantic_plan(
         value.decisions[0].source_file_id = "fil_other"
     refs = accepted_fact_refs(extracted, value, 0.8)
     assert bool(refs) is expected
+
+
+def test_qualified_fact_refs_requires_independent_models_and_grounded_evidence() -> None:
+    extracted = extraction("fil_a", "1000万元")
+    review = _accepted_review(extracted)
+    document = parsed("fil_a", "融资金额为1000万元")
+
+    assert qualified_fact_refs(
+        extracted,
+        review,
+        0.8,
+        extraction_model="extractor-v1",
+        review_model="reviewer-v1",
+        document=document,
+    ) == {(stable_fact_id(extracted.facts[0]), "fil_a")}
+    assert qualified_fact_refs(
+        extracted,
+        review,
+        0.8,
+        extraction_model="same-model",
+        review_model="same-model",
+        document=document,
+    ) == set()
+
+    ungrounded = extracted.model_copy(
+        update={"facts": [extracted.facts[0].model_copy(update={"evidence_text": "改写内容"})]}
+    )
+    assert qualified_fact_refs(
+        ungrounded,
+        _accepted_review(ungrounded),
+        0.8,
+        extraction_model="extractor-v1",
+        review_model="reviewer-v1",
+        document=document,
+    ) == set()
+
+
+def test_qualified_fact_refs_supports_program_checked_single_model_delivery() -> None:
+    extracted = extraction("fil_a", "1000万元")
+    document = parsed("fil_a", "融资金额为1000万元")
+
+    assert qualified_fact_refs(
+        extracted,
+        None,
+        0.8,
+        extraction_model="same-model",
+        review_model="same-model",
+        document=document,
+        require_review=False,
+    ) == {(stable_fact_id(extracted.facts[0]), "fil_a")}
+
+    low_confidence = extracted.model_copy(
+        update={"facts": [extracted.facts[0].model_copy(update={"confidence": 0.5})]}
+    )
+    assert qualified_fact_refs(
+        low_confidence,
+        None,
+        0.8,
+        document=document,
+        require_review=False,
+    ) == set()
+
+    ungrounded = extracted.model_copy(
+        update={"facts": [extracted.facts[0].model_copy(update={"evidence_text": "改写内容"})]}
+    )
+    assert qualified_fact_refs(
+        ungrounded,
+        None,
+        0.8,
+        document=document,
+        require_review=False,
+    ) == set()
+
+def test_mapping_review_coverage_is_exact_and_one_to_one() -> None:
+    mapping = FactMappingResponse.model_validate(
+        {
+            "reference_file_id": "fil_reference",
+            "mappings": [
+                {
+                    "target_fact_id": "target_fact_000001",
+                    "reference_field_key": "approved_amount",
+                    "source_file_id": "fil_reference",
+                    "reference_location": {"paragraph_index": 0},
+                    "decision": "MATCH",
+                    "confidence": 0.95,
+                    "reason_code": "SAME_FACT",
+                }
+            ],
+            "missing_requirements": [],
+        }
+    )
+    review = FactMappingReview.model_validate(
+        {
+            "reference_file_id": "fil_reference",
+            "decisions": [
+                {
+                    "target_fact_id": "target_fact_000001",
+                    "reference_field_key": "approved_amount",
+                    "source_file_id": "fil_reference",
+                    "reference_location": {"paragraph_index": 0},
+                    "decision": "ACCEPT",
+                    "confidence": 0.95,
+                    "reason_code": "VERIFIED",
+                }
+            ],
+            "missing_requirement_decisions": [],
+            "confidence": 0.95,
+            "evidence_complete": True,
+        }
+    )
+    validate_mapping_review_coverage(mapping, review, "fil_reference")
+
+    review.decisions = []
+    with pytest.raises(EvidenceValidationError) as error:
+        validate_mapping_review_coverage(mapping, review, "fil_reference")
+    assert error.value.code == "MAPPING_REVIEW_INCOMPLETE"
 
 
 def test_cross_document_conflict_diff_keeps_both_source_locations() -> None:

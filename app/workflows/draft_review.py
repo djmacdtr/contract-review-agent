@@ -40,7 +40,6 @@ from app.draft_review.facts import (
     FACT_REVIEW_CHECKPOINT_VERSION,
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
     EvidenceValidationError,
-    accepted_fact_refs,
     build_fact_index,
     build_fact_matrix,
     build_fact_review_batches,
@@ -52,13 +51,16 @@ from app.draft_review.facts import (
     fact_index_payload,
     fact_matrix_result_items,
     location_key,
+    mapping_proposal_key,
     merge_chunk_extractions,
     merge_fact_review_batches,
     project_semantic_plan,
+    qualified_fact_refs,
     review_payload_digest,
     stable_fact_id,
     stable_review_batch_id,
     target_fact_catalog,
+    validate_mapping_review_coverage,
     validate_semantic_plan,
 )
 from app.draft_review.numeric_rules import evaluate_validation_spec, referenced_fact_refs
@@ -94,6 +96,27 @@ def _compact_semantic_fact(fact: dict[str, Any]) -> dict[str, Any]:
             "display_name",
             "value_type",
             "raw_value",
+            "location",
+            "confidence",
+        )
+        if key in fact
+    }
+
+
+def _compact_mapping_fact(fact: dict[str, Any]) -> dict[str, Any]:
+    """Keep mapping context to accepted identity/value fields only."""
+
+    return {
+        key: fact[key]
+        for key in (
+            "target_fact_id",
+            "source_file_id",
+            "field_key",
+            "concept_id",
+            "display_name",
+            "value_type",
+            "raw_value",
+            "normalized_hint",
             "location",
             "confidence",
         )
@@ -469,7 +492,11 @@ class DraftReviewWorkflowExecutor:
                     # path below.
                     state = {**state, "llm_extractions": extractions}
                     reviews: dict[str, dict[str, Any]] = {}
-                    review_method = getattr(self.llm, "review_facts", None)
+                    review_method = (
+                        getattr(self.llm, "review_facts", None)
+                        if self.settings.LLM_FACT_REVIEW_ENABLED
+                        else None
+                    )
                     if review_method is not None:
                         source_task_id = state.get("options", {}).get("source_task_id")
                         task_id = state.get("task_id")
@@ -625,7 +652,11 @@ class DraftReviewWorkflowExecutor:
                         llm=self.llm,
                     )
                     reviews: dict[str, dict[str, Any]] = {}
-                    review_method = getattr(self.llm, "review_facts", None)
+                    review_method = (
+                        getattr(self.llm, "review_facts", None)
+                        if self.settings.LLM_FACT_REVIEW_ENABLED
+                        else None
+                    )
                     if review_method is not None:
                         for document in state["parsed_documents"]:
                             if document.role == "TEMPLATE":
@@ -790,7 +821,11 @@ class DraftReviewWorkflowExecutor:
                         "max_payload_chars": max_payload_chars,
                         "numeric_candidate_total": numeric_candidate_total,
                     }
-                    review_method = getattr(self.llm, "review_facts", None)
+                    review_method = (
+                        getattr(self.llm, "review_facts", None)
+                        if self.settings.LLM_FACT_REVIEW_ENABLED
+                        else None
+                    )
                     if review_method is not None:
                         review_payloads = build_fact_review_batches(
                             document,
@@ -877,6 +912,10 @@ class DraftReviewWorkflowExecutor:
             mapping_reviews: dict[str, dict[str, Any]] = {}
             if self.llm is None or not hasattr(self.llm, "map_facts"):
                 return {"llm_mappings": mappings, "llm_mapping_reviews": mapping_reviews}
+            mapping_review_enabled = bool(
+                self.settings.LLM_MAPPING_REVIEW_ENABLED
+                and hasattr(self.llm, "review_mappings")
+            )
             target_document = next(
                 (document for document in state["parsed_documents"] if document.role == "TARGET"),
                 None,
@@ -889,7 +928,33 @@ class DraftReviewWorkflowExecutor:
             if not target_value:
                 return {"llm_mappings": mappings, "llm_mapping_reviews": mapping_reviews}
             target_extraction = DocumentFactExtraction.model_validate(target_value)
-            catalog = target_fact_catalog(target_extraction)
+            target_review_value = state.get("llm_reviews", {}).get(
+                target_document.file_id, {}
+            ).get("value")
+            target_review = (
+                FactReview.model_validate(target_review_value) if target_review_value else None
+            )
+            target_meta = state.get("llm_extractions", {}).get(target_document.file_id, {})
+            target_review_meta = state.get("llm_reviews", {}).get(target_document.file_id, {})
+            target_accepted_refs = qualified_fact_refs(
+                target_extraction,
+                target_review,
+                self.settings.LLM_CONSENSUS_MIN_CONFIDENCE,
+                extraction_model=target_meta.get("actual_model")
+                or target_meta.get("configured_model"),
+                review_model=target_review_meta.get("actual_model")
+                or target_review_meta.get("configured_model"),
+                document=target_document,
+                require_independent_model=self.settings.LLM_REQUIRE_INDEPENDENT_MODEL,
+                require_review=self.settings.LLM_FACT_REVIEW_ENABLED,
+            )
+            all_target_catalog = target_fact_catalog(target_extraction)
+            catalog = [
+                item
+                for fact, item in zip(target_extraction.facts, all_target_catalog, strict=True)
+                if (stable_fact_id(fact), fact.source_file_id) in target_accepted_refs
+            ]
+            catalog = [_compact_mapping_fact(item) for item in catalog]
             target_ids = {item["target_fact_id"] for item in catalog}
             await callback(TaskStage.FACT_EXTRACTION, 80, "正在逐份映射目标合同与辅助资料事实")
             for document in state["parsed_documents"]:
@@ -901,19 +966,70 @@ class DraftReviewWorkflowExecutor:
                 if not reference_value:
                     continue
                 reference_extraction = DocumentFactExtraction.model_validate(reference_value)
-                reference_index = {
-                    (fact.field_key, location_key(fact.location)): fact
+                reference_review_value = state.get("llm_reviews", {}).get(
+                    document.file_id, {}
+                ).get("value")
+                reference_review = (
+                    FactReview.model_validate(reference_review_value)
+                    if reference_review_value
+                    else None
+                )
+                reference_meta = state.get("llm_extractions", {}).get(document.file_id, {})
+                reference_review_meta = state.get("llm_reviews", {}).get(document.file_id, {})
+                reference_accepted_refs = qualified_fact_refs(
+                    reference_extraction,
+                    reference_review,
+                    self.settings.LLM_CONSENSUS_MIN_CONFIDENCE,
+                    extraction_model=reference_meta.get("actual_model")
+                    or reference_meta.get("configured_model"),
+                    review_model=reference_review_meta.get("actual_model")
+                    or reference_review_meta.get("configured_model"),
+                    document=document,
+                    require_independent_model=self.settings.LLM_REQUIRE_INDEPENDENT_MODEL,
+                    require_review=self.settings.LLM_FACT_REVIEW_ENABLED,
+                )
+                accepted_reference_facts = [
+                    fact
                     for fact in reference_extraction.facts
+                    if (stable_fact_id(fact), fact.source_file_id) in reference_accepted_refs
+                ]
+                reference_index = {
+                    (fact.field_key, fact.source_file_id, location_key(fact.location)): fact
+                    for fact in accepted_reference_facts
                 }
                 payload = {
                     "reference_file_id": document.file_id,
                     "reference_profile": reference_extraction.profile.model_dump(mode="json"),
                     "target_facts": catalog,
                     "reference_facts": [
-                        fact.model_dump(mode="json") for fact in reference_extraction.facts
+                        _compact_mapping_fact(fact.model_dump(mode="json"))
+                        for fact in accepted_reference_facts
                     ],
                 }
                 try:
+                    if not catalog or not accepted_reference_facts:
+                        empty_mapping = FactMappingResponse(
+                            reference_file_id=document.file_id,
+                            mappings=[],
+                            missing_requirements=[],
+                        )
+                        mappings[document.file_id] = {
+                            "value": empty_mapping.model_dump(mode="json"),
+                            "status": "SKIPPED_NO_QUALIFIED_FACTS",
+                        }
+                        if mapping_review_enabled:
+                            empty_review = FactMappingReview(
+                                reference_file_id=document.file_id,
+                                decisions=[],
+                                missing_requirement_decisions=[],
+                                confidence=0.0,
+                                evidence_complete=True,
+                            )
+                            mapping_reviews[document.file_id] = {
+                                "value": empty_review.model_dump(mode="json"),
+                                "status": "SKIPPED_NO_QUALIFIED_FACTS",
+                            }
+                        continue
                     mapping_result = await self.llm.map_facts(payload)
                     mapping = FactMappingResponse.model_validate(mapping_result.value)
                     if mapping.reference_file_id != document.file_id:
@@ -932,11 +1048,15 @@ class DraftReviewWorkflowExecutor:
                             raise EvidenceValidationError("mapping source file does not match")
                         if (
                             proposal.reference_field_key,
+                            proposal.source_file_id,
                             location_key(proposal.reference_location),
                         ) not in reference_index:
                             raise EvidenceValidationError("mapping reference fact does not exist")
                         if key in proposed_keys:
-                            raise EvidenceValidationError("mapping contains duplicate proposal")
+                            raise EvidenceValidationError(
+                                "mapping contains duplicate proposal",
+                                code="FACT_IDENTITY_DUPLICATED",
+                            )
                         proposed_keys.add(key)
                     requirement_ids = {
                         requirement.target_fact_id for requirement in mapping.missing_requirements
@@ -951,32 +1071,66 @@ class DraftReviewWorkflowExecutor:
                         "request_attempts": mapping_result.request_attempts,
                         "structure_retries": mapping_result.structure_retries,
                     }
-                    if not hasattr(self.llm, "review_mappings"):
+                    if not mapping_review_enabled:
                         continue
-                    review_result = await self.llm.review_mappings(
-                        {**payload, "proposed_mapping": mapping.model_dump(mode="json")}
+                    catalog_by_id = {
+                        item["target_fact_id"]: item for item in catalog
+                    }
+                    review_target_ids = {
+                        proposal.target_fact_id for proposal in mapping.mappings
+                    }
+                    review_target_ids.update(
+                        requirement.target_fact_id
+                        for requirement in mapping.missing_requirements
                     )
+                    review_reference_keys = {
+                        (
+                            proposal.reference_field_key,
+                            proposal.source_file_id,
+                            location_key(proposal.reference_location),
+                        )
+                        for proposal in mapping.mappings
+                    }
+                    review_payload = {
+                        "reference_file_id": document.file_id,
+                        "reference_profile": payload["reference_profile"],
+                        "target_facts": [
+                            catalog_by_id[target_fact_id]
+                            for target_fact_id in sorted(review_target_ids)
+                        ],
+                        "reference_facts": [
+                            _compact_mapping_fact(
+                                reference_index[key].model_dump(mode="json")
+                            )
+                            for key in sorted(review_reference_keys, key=repr)
+                        ],
+                        "proposed_mapping": mapping.model_dump(mode="json"),
+                    }
+                    review_result = await self.llm.review_mappings(review_payload)
                     review = FactMappingReview.model_validate(review_result.value)
-                    if review.reference_file_id != document.file_id:
+                    validate_mapping_review_coverage(
+                        review=review,
+                        mapping=mapping,
+                        reference_file_id=document.file_id,
+                    )
+                    mapping_model = (
+                        mapping_result.actual_model or mapping_result.configured_model
+                    )
+                    mapping_review_model = (
+                        review_result.actual_model or review_result.configured_model
+                    )
+                    if (
+                        self.settings.LLM_REQUIRE_INDEPENDENT_MODEL
+                        and (
+                            not mapping_model
+                            or not mapping_review_model
+                            or mapping_model == mapping_review_model
+                        )
+                    ):
                         raise EvidenceValidationError(
-                            "mapping review reference file does not match"
+                            "mapping and mapping review did not use independent models",
+                            code="MAPPING_MODEL_NOT_INDEPENDENT",
                         )
-                    for decision in review.decisions:
-                        key = (
-                            decision.target_fact_id,
-                            decision.reference_field_key,
-                            decision.source_file_id,
-                            location_key(decision.reference_location),
-                        )
-                        if key not in proposed_keys:
-                            raise EvidenceValidationError(
-                                "mapping review decision does not match proposal"
-                            )
-                    for decision in review.missing_requirement_decisions:
-                        if decision.target_fact_id not in requirement_ids:
-                            raise EvidenceValidationError(
-                                "missing requirement review does not match proposal"
-                            )
                     mapping_reviews[document.file_id] = {
                         "value": review.model_dump(mode="json"),
                         "configured_model": review_result.configured_model,
@@ -1034,10 +1188,29 @@ class DraftReviewWorkflowExecutor:
             accepted_refs: set[tuple[str, str]] = set()
             for file_id, extraction in extractions_by_file.items():
                 accepted_refs.update(
-                    accepted_fact_refs(
+                    qualified_fact_refs(
                         extraction,
                         reviews_by_file.get(file_id),
                         self.settings.LLM_CONSENSUS_MIN_CONFIDENCE,
+                        extraction_model=(
+                            state.get("llm_extractions", {})
+                            .get(file_id, {})
+                            .get("actual_model")
+                            or state.get("llm_extractions", {})
+                            .get(file_id, {})
+                            .get("configured_model")
+                        ),
+                        review_model=(
+                            state.get("llm_reviews", {})
+                            .get(file_id, {})
+                            .get("actual_model")
+                            or state.get("llm_reviews", {})
+                            .get(file_id, {})
+                            .get("configured_model")
+                        ),
+                        document=documents_by_file[file_id],
+                        require_independent_model=self.settings.LLM_REQUIRE_INDEPENDENT_MODEL,
+                        require_review=self.settings.LLM_FACT_REVIEW_ENABLED,
                     )
                 )
             for document in dynamic_documents:
@@ -1288,7 +1461,21 @@ class DraftReviewWorkflowExecutor:
             await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
             try:
                 generated = await self.llm.generate_advice(advice_payload(result))
-                merge_model_advice(result, AdviceResponse.model_validate(generated.value))
+                advice = AdviceResponse.model_validate(generated.value)
+                if result.get("metadata", {}).get("review_mode") == "NOT_RUN":
+                    advice = advice.model_copy(
+                        update={
+                            "limitations": list(
+                                dict.fromkeys(
+                                    [
+                                        *advice.limitations,
+                                        "跨资料对应由模型识别，并经过原文证据和程序规则校验，不构成法律判断",
+                                    ]
+                                )
+                            )
+                        }
+                    )
+                merge_model_advice(result, advice)
                 result["metadata"].setdefault("model_runs", []).append(
                     {
                         "purpose": "RISK_ADVICE",
@@ -1388,10 +1575,16 @@ class DraftReviewWorkflowExecutor:
         llm_mapping_reviews = llm_mapping_reviews or {}
         llm_semantic_plans = llm_semantic_plans or {}
         options = options or {}
-        review_enforced = self.llm is not None and hasattr(self.llm, "review_facts")
+        review_enforced = bool(
+            self.llm is not None
+            and self.settings.LLM_FACT_REVIEW_ENABLED
+            and hasattr(self.llm, "review_facts")
+        )
         mapping_enforced = self.llm is not None and hasattr(self.llm, "map_facts")
-        mapping_review_enforced = self.llm is not None and hasattr(
-            self.llm, "review_mappings"
+        mapping_review_enforced = bool(
+            self.llm is not None
+            and self.settings.LLM_MAPPING_REVIEW_ENABLED
+            and hasattr(self.llm, "review_mappings")
         )
         dynamic_documents = [
             document for document in documents if document.role != "TEMPLATE"
@@ -1600,15 +1793,61 @@ class DraftReviewWorkflowExecutor:
             review_value = llm_reviews.get(file_id, {}).get("value")
             review_obj = FactReview.model_validate(review_value) if review_value else None
             accepted_refs.update(
-                accepted_fact_refs(
+                qualified_fact_refs(
                     extraction,
                     review_obj,
                     self.settings.LLM_CONSENSUS_MIN_CONFIDENCE,
+                    extraction_model=llm_extractions.get(file_id, {}).get("actual_model")
+                    or llm_extractions.get(file_id, {}).get("configured_model"),
+                    review_model=llm_reviews.get(file_id, {}).get("actual_model")
+                    or llm_reviews.get(file_id, {}).get("configured_model"),
+                    document=next(
+                        document
+                        for document in documents
+                        if document.file_id == file_id
+                    ),
+                    require_independent_model=self.settings.LLM_REQUIRE_INDEPENDENT_MODEL,
+                    require_review=self.settings.LLM_FACT_REVIEW_ENABLED,
                 )
             )
+        consensus_fields = {
+            (
+                entry.fact.field_key,
+                entry.fact.source_file_id,
+                location_key(entry.fact.location),
+            )
+            for ref, entry in fact_index.items()
+            if ref in accepted_refs
+        }
         qualified_fact_values = {
             ref: entry.fact for ref, entry in fact_index.items() if ref in accepted_refs
         }
+        target_document = next(
+            (document for document in documents if document.role == "TARGET"), None
+        )
+        accepted_target_fact_ids: set[str] = set()
+        if target_document is not None and target_document.file_id in extractions_by_file:
+            target_extraction = extractions_by_file[target_document.file_id]
+            for fact, catalog_item in zip(
+                target_extraction.facts,
+                target_fact_catalog(target_extraction),
+                strict=True,
+            ):
+                if (stable_fact_id(fact), fact.source_file_id) in accepted_refs:
+                    accepted_target_fact_ids.add(catalog_item["target_fact_id"])
+        accepted_reference_keys_by_file: dict[
+            str, set[tuple[str, str, tuple[object, ...]]]
+        ] = {}
+        for document in documents:
+            if document.role != "REFERENCE":
+                continue
+            extraction = extractions_by_file.get(document.file_id)
+            accepted_reference_keys_by_file[document.file_id] = {
+                (fact.source_file_id, fact.field_key, location_key(fact.location))
+                for fact in (extraction.facts if extraction is not None else [])
+                if (stable_fact_id(fact), fact.source_file_id) in accepted_refs
+            }
+        mapping_skipped_reference_file_ids: set[str] = set()
         if mapping_enforced:
             for document in documents:
                 if document.role != "REFERENCE":
@@ -1617,6 +1856,10 @@ class DraftReviewWorkflowExecutor:
                 mapping_value = mapping.get("value") or {}
                 mapping_review = llm_mapping_reviews.get(document.file_id, {})
                 mapping_review_value = mapping_review.get("value") or {}
+                if mapping.get("status") == "SKIPPED_NO_QUALIFIED_FACTS":
+                    mapping_skipped_reference_file_ids.add(document.file_id)
+                    uncertain_reference_file_ids.add(document.file_id)
+                    continue
                 if not mapping_value:
                     uncertain_reference_file_ids.add(document.file_id)
                     warning = ProcessingWarning(
@@ -1641,24 +1884,94 @@ class DraftReviewWorkflowExecutor:
                         and mapping_model != mapping_review_model
                     )
                 )
-                if strict_mapping_review:
-                    review_obj = FactMappingReview.model_validate(mapping_review_value)
-                    decisions = {
-                        (
-                            decision.target_fact_id,
-                            decision.reference_field_key,
-                            decision.source_file_id,
-                            location_key(decision.reference_location),
-                        ): decision
-                        for decision in review_obj.decisions
-                    }
+                if not mapping_review_enforced:
+                    accepted_reference_keys = accepted_reference_keys_by_file.get(
+                        document.file_id, set()
+                    )
                     for proposal in mapping_obj.mappings:
-                        key = (
-                            proposal.target_fact_id,
-                            proposal.reference_field_key,
+                        reference_key = (
                             proposal.source_file_id,
+                            proposal.reference_field_key,
                             location_key(proposal.reference_location),
                         )
+                        if (
+                            proposal.target_fact_id not in accepted_target_fact_ids
+                            or reference_key not in accepted_reference_keys
+                        ):
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "映射引用了无法回查的事实，未生成正式报告",
+                            )
+                        if proposal.confidence < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE:
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "映射结果置信度不足，未生成正式报告",
+                                details={"failure_code": "MAPPING_CONFIDENCE_INVALID"},
+                            )
+                        if proposal.decision == "MATCH":
+                            mapping_records.append(
+                                {
+                                    **proposal.model_dump(mode="json"),
+                                    "status": "ACCEPT",
+                                }
+                            )
+                        else:
+                            mapping_records.append(
+                                {
+                                    **proposal.model_dump(mode="json"),
+                                    "status": "UNCERTAIN",
+                                }
+                            )
+                    for requirement in mapping_obj.missing_requirements:
+                        if requirement.target_fact_id not in accepted_target_fact_ids:
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "缺失要求引用了无法回查的目标事实，未生成正式报告",
+                            )
+                        if requirement.confidence < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE:
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "缺失要求置信度不足，未生成正式报告",
+                                details={"failure_code": "MAPPING_CONFIDENCE_INVALID"},
+                            )
+                        required_missing.add(
+                            (requirement.target_fact_id, document.file_id)
+                        )
+                elif strict_mapping_review:
+                    review_obj = FactMappingReview.model_validate(mapping_review_value)
+                    try:
+                        validate_mapping_review_coverage(
+                            mapping=mapping_obj,
+                            review=review_obj,
+                            reference_file_id=document.file_id,
+                        )
+                    except EvidenceValidationError as exc:
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "动态事实映射复核未完整覆盖全部提案，未生成正式报告",
+                        ) from exc
+                    decisions = {
+                        mapping_proposal_key(decision): decision
+                        for decision in review_obj.decisions
+                    }
+                    accepted_reference_keys = accepted_reference_keys_by_file.get(
+                        document.file_id, set()
+                    )
+                    for proposal in mapping_obj.mappings:
+                        key = mapping_proposal_key(proposal)
+                        reference_key = (
+                            proposal.source_file_id,
+                            proposal.reference_field_key,
+                            location_key(proposal.reference_location),
+                        )
+                        if (
+                            proposal.target_fact_id not in accepted_target_fact_ids
+                            or reference_key not in accepted_reference_keys
+                        ):
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "映射引用了未通过事实评审的事实，未生成正式报告",
+                            )
                         decision = decisions.get(key)
                         accepted = bool(
                             proposal.decision == "MATCH"
@@ -1672,17 +1985,25 @@ class DraftReviewWorkflowExecutor:
                             >= self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
                             and review_obj.evidence_complete
                         )
-                        mapping_records.append(
-                            {
-                                **proposal.model_dump(mode="json"),
-                                "status": "ACCEPT" if accepted else "UNCERTAIN",
-                            }
-                        )
+                        if accepted:
+                            mapping_records.append(
+                                {
+                                    **proposal.model_dump(mode="json"),
+                                    "status": "ACCEPT",
+                                }
+                            )
+                        else:
+                            uncertain_reference_file_ids.add(document.file_id)
                     requirement_decisions = {
                         decision.target_fact_id: decision
                         for decision in review_obj.missing_requirement_decisions
                     }
                     for requirement in mapping_obj.missing_requirements:
+                        if requirement.target_fact_id not in accepted_target_fact_ids:
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "缺失要求引用了未通过事实评审的事实，未生成正式报告",
+                            )
                         decision = requirement_decisions.get(requirement.target_fact_id)
                         if (
                             decision
@@ -1698,6 +2019,8 @@ class DraftReviewWorkflowExecutor:
                             required_missing.add(
                                 (requirement.target_fact_id, document.file_id)
                             )
+                        elif decision is not None:
+                            uncertain_reference_file_ids.add(document.file_id)
                 else:
                     uncertain_reference_file_ids.add(document.file_id)
                 model_runs.append(
@@ -1725,6 +2048,11 @@ class DraftReviewWorkflowExecutor:
                             "status": "SUCCEEDED",
                         }
                     )
+            if mapping_skipped_reference_file_ids and not diagnostic_mode:
+                raise WorkflowError(
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "动态事实检查没有通过独立评审的合格事实，未生成正式报告",
+                )
         existing_warning_codes = {warning["code"] for warning in warnings}
         warnings.extend(
             warning.model_dump(mode="json")
@@ -1764,6 +2092,45 @@ class DraftReviewWorkflowExecutor:
             include_uncertain=False,
             include_required_missing=True,
         )
+        if mapping_enforced and not mapping_review_enforced and not diagnostic_mode:
+            for item in fact_matrix:
+                target_candidate = item.get("target_candidate") or {}
+                target_evidence = {
+                    "file_id": target_candidate.get("source_file_id"),
+                    "text": target_candidate.get("evidence_text"),
+                    "location": target_candidate.get("location"),
+                }
+                for relation in item.get("reference_results", []):
+                    if relation.get("status") != "UNCERTAIN":
+                        continue
+                    candidate = relation.get("candidate") or {}
+                    if not candidate:
+                        continue
+                    source_file_id = candidate.get("source_file_id")
+                    fact_risks.append(
+                        {
+                            "risk_id": (
+                                f"risk_fact_mapping_{item['target_fact_id']}_"
+                                f"{source_file_id}"
+                            ),
+                            "module_code": "FACT_CONSISTENCY",
+                            "risk_type": "ADDITION_OR_CHANGE",
+                            "change_type": "SEMANTIC_MAPPING_UNCERTAIN",
+                            "title": "辅助资料对应关系不明确",
+                            "description": (
+                                "目标事实与辅助资料事实的业务对应关系"
+                                "无法由模型可靠确认。"
+                            ),
+                            "source_evidence": [target_evidence, {
+                                "file_id": source_file_id,
+                                "text": candidate.get("evidence_text"),
+                                "location": candidate.get("location"),
+                            }],
+                            "related_diff_ids": [],
+                            "related_rule_ids": [],
+                            "requires_manual_action": True,
+                        }
+                    )
         if review_enforced:
             reviewed_keys = consensus_fields
             mapped_target_fact_ids = {
@@ -1851,6 +2218,11 @@ class DraftReviewWorkflowExecutor:
                             }
                         )
             for reference_file_id in sorted(uncertain_reference_file_ids):
+                if (
+                    reference_file_id in mapping_skipped_reference_file_ids
+                    and not diagnostic_mode
+                ):
+                    continue
                 fact_reviews.append(
                     {
                         "review_id": f"review_mapping_consensus_{reference_file_id}",
@@ -1869,13 +2241,48 @@ class DraftReviewWorkflowExecutor:
             fact_risks = []
             fact_passed = []
         if fact_reviews:
+            mapped_target_review_gaps = 0
+            mapped_reference_review_gaps = 0
+            for item in fact_matrix:
+                if item.get("target_fact_id") not in mapped_target_fact_ids:
+                    continue
+                target_candidate = item.get("target_candidate") or {}
+                target_key = (
+                    target_candidate.get("field_key"),
+                    target_candidate.get("source_file_id"),
+                    location_key(target_candidate.get("location") or {}),
+                )
+                mapped_target_review_gaps += target_key not in reviewed_keys
+            for extraction in extractions_by_file.values():
+                for fact in extraction.facts:
+                    reference_key = (
+                        fact.source_file_id,
+                        fact.field_key,
+                        location_key(fact.location),
+                    )
+                    fact_key = (
+                        fact.field_key,
+                        fact.source_file_id,
+                        location_key(fact.location),
+                    )
+                    if reference_key in mapped_reference_keys:
+                        mapped_reference_review_gaps += fact_key not in reviewed_keys
             raise WorkflowError(
                 "DYNAMIC_CHECK_INCOMPLETE",
                 "动态事实检查存在无法可靠确认的内容，未生成正式报告",
+                details={
+                    "failure_code": "FACT_CONSENSUS_INCOMPLETE",
+                    "review_item_count": len(fact_reviews),
+                    "mapping_record_count": len(mapping_records),
+                    "uncertain_reference_file_count": len(uncertain_reference_file_ids),
+                    "consensus_field_count": len(consensus_fields),
+                    "mapped_target_review_gaps": mapped_target_review_gaps,
+                    "mapped_reference_review_gaps": mapped_reference_review_gaps,
+                },
             )
         cross_document_diffs = (
             fact_conflict_diff_items(fact_matrix, target_file_id=target_file_id)
-            if review_enforced and mapping_enforced and not diagnostic_mode
+            if mapping_enforced and not diagnostic_mode
             else []
         )
         risk_items = build_risk_items(
@@ -2071,6 +2478,10 @@ class DraftReviewWorkflowExecutor:
             raise WorkflowError(
                 "DYNAMIC_CHECK_INCOMPLETE",
                 "动态数值检查存在无法可靠执行的规则，未生成正式报告",
+                details={
+                    "failure_code": "NUMERIC_CONSENSUS_INCOMPLETE",
+                    "review_item_count": len(numeric_reviews),
+                },
             )
         risk_items.extend(numeric_risks)
         if diagnostic_mode and successful_extractions:
@@ -2133,9 +2544,13 @@ class DraftReviewWorkflowExecutor:
                 "priority_actions": ["处理固定条款、数值和必填问题"],
                 "manual_review_focus": ["模板固定文字、金额期限、占位符和表格必填项"],
                 "limitations": [
-                    "模型语义映射和数值规则仅在证据与双模型共识门内生效，不构成法律判断"
-                    if successful_extractions
-                    else "未执行辅助资料事实抽取、跨文件核对、LLM 或法律判断"
+                    (
+                        "跨资料对应由模型识别，并经过原文证据和程序规则校验，不构成法律判断"
+                        if successful_extractions and not review_enforced
+                        else "模型语义映射和数值规则仅在证据与双模型共识门内生效，不构成法律判断"
+                        if successful_extractions
+                        else "未执行辅助资料事实抽取、跨文件核对、LLM 或法律判断"
+                    )
                 ],
             },
             "metadata": {

@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     LLM_REVIEW_CONTEXT_BLOCKS: int = Field(default=1, ge=0, le=10)
     LLM_STRUCTURE_RETRY_ATTEMPTS: int = 2
     LLM_CONSENSUS_MIN_CONFIDENCE: float = Field(default=0.85, ge=0, le=1)
+    LLM_FACT_REVIEW_ENABLED: bool = False
+    LLM_MAPPING_REVIEW_ENABLED: bool = False
     LLM_REQUIRE_INDEPENDENT_MODEL: bool = True
     LLM_SAME_MODEL_DIAGNOSTIC: bool = False
     LLM_NATIVE_STRUCTURED_OUTPUT: bool = False
@@ -117,10 +119,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_llm_review_mode(self) -> Self:
-        if not self.LLM_REQUIRE_INDEPENDENT_MODEL:
+        if not self.LLM_REQUIRE_INDEPENDENT_MODEL and (
+            self.LLM_FACT_REVIEW_ENABLED or self.LLM_MAPPING_REVIEW_ENABLED
+        ):
             raise ValueError(
-                "LLM_REQUIRE_INDEPENDENT_MODEL must remain true; use "
-                "LLM_SAME_MODEL_DIAGNOSTIC for non-consensus development runs"
+                "LLM_REQUIRE_INDEPENDENT_MODEL must remain true when model review "
+                "is enabled; use disabled review for single-model delivery"
             )
         if self.LLM_SAME_MODEL_DIAGNOSTIC and self.APP_ENV.casefold() not in {
             "development",

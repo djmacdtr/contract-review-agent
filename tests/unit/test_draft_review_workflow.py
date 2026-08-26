@@ -249,6 +249,8 @@ class ConsensusFixtureLlm:
         self.missing_requirement = missing_requirement
         self.advice_calls = 0
         self.review_payloads: list[dict] = []
+        self.mapping_payloads: list[dict] = []
+        self.mapping_review_payloads: list[dict] = []
 
     async def probe_models(self) -> list[str]:
         return [self.extraction_model, self.review_model]
@@ -343,6 +345,7 @@ class ConsensusFixtureLlm:
         )
 
     async def map_facts(self, payload: dict) -> LlmResult:
+        self.mapping_payloads.append(payload)
         fact = payload["reference_facts"][0]
         mappings = []
         missing_requirements = []
@@ -377,7 +380,9 @@ class ConsensusFixtureLlm:
             mock=False,
         )
 
+
     async def review_mappings(self, payload: dict) -> LlmResult:
+        self.mapping_review_payloads.append(payload)
         proposed_mapping = payload["proposed_mapping"]
         decisions = []
         missing_requirement_decisions = []
@@ -447,6 +452,53 @@ class ConsensusFixtureLlm:
             actual_model=self.extraction_model,
             mock=False,
         )
+
+
+class RejectedFactsLlm(ConsensusFixtureLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mapping_calls = 0
+
+    async def review_facts(self, payload: dict) -> LlmResult:
+        result = await super().review_facts(payload)
+        result.value["decisions"][0]["decision"] = "REJECT"
+        return result
+
+    async def map_facts(self, payload: dict) -> LlmResult:
+        self.mapping_calls += 1
+        return await super().map_facts(payload)
+
+
+class IncompleteMappingReviewLlm(ConsensusFixtureLlm):
+    async def review_mappings(self, payload: dict) -> LlmResult:
+        result = await super().review_mappings(payload)
+        result.value["decisions"] = []
+        return result
+
+
+class UnknownTargetMappingLlm(ConsensusFixtureLlm):
+    async def map_facts(self, payload: dict) -> LlmResult:
+        result = await super().map_facts(payload)
+        result.value["mappings"][0]["target_fact_id"] = "target_fact_999999"
+        return result
+
+
+class SameModelMappingReviewLlm(ConsensusFixtureLlm):
+    async def review_mappings(self, payload: dict) -> LlmResult:
+        result = await super().review_mappings(payload)
+        return LlmResult(
+            value=result.value,
+            configured_model=self.extraction_model,
+            actual_model=self.extraction_model,
+            mock=False,
+        )
+
+
+class UncertainMappingLlm(ConsensusFixtureLlm):
+    async def map_facts(self, payload: dict) -> LlmResult:
+        result = await super().map_facts(payload)
+        result.value["mappings"][0]["decision"] = "UNCERTAIN"
+        return result
 
 
 class SemanticPlanFixtureLlm(ConsensusFixtureLlm):
@@ -681,17 +733,21 @@ async def run_consensus_fixture(
     async def no_progress(*_args) -> None:
         return None
 
-    settings = Settings(
-        _env_file=None,
-        TEMP_ROOT=str(tmp_path / "workspaces"),
-        ALLOW_HTTP_DOWNLOADS=True,
-        DOWNLOAD_HOST_ALLOWLIST="fixture-server",
-        LLM_ENABLED=True,
-        LLM_BASE_URL="https://llm.invalid",
-        LLM_API_KEY="unused",
-        LLM_SAME_MODEL_DIAGNOSTIC=same_model_diagnostic,
-        **(settings_overrides or {}),
-    )
+    settings_values = {
+        "TEMP_ROOT": str(tmp_path / "workspaces"),
+        "ALLOW_HTTP_DOWNLOADS": True,
+        "DOWNLOAD_HOST_ALLOWLIST": "fixture-server",
+        "LLM_ENABLED": True,
+        "LLM_BASE_URL": "https://llm.invalid",
+        "LLM_API_KEY": "unused",
+        "LLM_SAME_MODEL_DIAGNOSTIC": same_model_diagnostic,
+        # Existing fixture coverage exercises the opt-in independent-review
+        # path; production defaults are verified separately in test_core.
+        "LLM_FACT_REVIEW_ENABLED": True,
+        "LLM_MAPPING_REVIEW_ENABLED": True,
+    }
+    settings_values.update(settings_overrides or {})
+    settings = Settings(_env_file=None, **settings_values)
     executor = DraftReviewWorkflowExecutor(
         settings,
         downloader=SafeFileDownloadService(
@@ -1196,6 +1252,111 @@ async def test_delivery_path_skips_semantic_plan_and_publishes_accepted_fact_pas
         item["module_code"] == "FACT_CONSISTENCY" and "来源一致" in item["title"]
         for item in result["passed_checks"]
     )
+
+
+async def test_mapping_payload_contains_only_accepted_facts(
+    tmp_path: Path,
+) -> None:
+    llm = ConsensusFixtureLlm()
+
+    await run_consensus_fixture(tmp_path, llm)
+
+    assert len(llm.mapping_payloads) == 1
+    payload = llm.mapping_payloads[0]
+    assert len(payload["target_facts"]) == 1
+    assert len(payload["reference_facts"]) == 1
+    assert payload["target_facts"][0]["source_file_id"] == "fil_target"
+    assert payload["reference_facts"][0]["source_file_id"] == "fil_reference"
+    assert len(llm.mapping_review_payloads) == 1
+    assert len(llm.mapping_review_payloads[0]["target_facts"]) == 1
+    assert len(llm.mapping_review_payloads[0]["reference_facts"]) == 1
+
+
+async def test_mapping_cannot_reference_an_unknown_target_fact(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkflowError, match="跨资料事实映射") as error:
+        await run_consensus_fixture(tmp_path, UnknownTargetMappingLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+
+
+async def test_rejected_facts_are_not_sent_to_mapping_and_do_not_formalize_result(
+    tmp_path: Path,
+) -> None:
+    llm = RejectedFactsLlm()
+
+    with pytest.raises(WorkflowError, match="合格事实"):
+        await run_consensus_fixture(tmp_path, llm)
+
+    assert llm.mapping_calls == 0
+    assert llm.mapping_payloads == []
+
+
+async def test_mapping_review_must_cover_every_proposal(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkflowError, match="跨资料事实映射") as error:
+        await run_consensus_fixture(tmp_path, IncompleteMappingReviewLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+
+
+async def test_mapping_review_requires_an_independent_model(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkflowError, match="跨资料事实映射") as error:
+        await run_consensus_fixture(tmp_path, SameModelMappingReviewLlm())
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+
+
+async def test_single_model_delivery_skips_all_review_calls(
+    tmp_path: Path,
+) -> None:
+    llm = ConsensusFixtureLlm()
+    result = await run_consensus_fixture(
+        tmp_path,
+        llm,
+        settings_overrides={
+            "LLM_FACT_REVIEW_ENABLED": False,
+            "LLM_MAPPING_REVIEW_ENABLED": False,
+            "LLM_SEMANTIC_PLAN_ENABLED": False,
+        },
+    )
+
+    assert llm.review_payloads == []
+    assert llm.mapping_review_payloads == []
+    assert result["fact_matrix"][0]["status"] == "CONSISTENT"
+    assert result["metadata"]["independent_review"] is False
+    assert result["metadata"]["review_mode"] == "NOT_RUN"
+    assert not any(
+        run["purpose"] in {"FACT_REVIEW", "FACT_MAPPING_REVIEW", "SEMANTIC_PLAN"}
+        for run in result["metadata"]["model_runs"]
+    )
+    assert "原文证据和程序规则校验" in result["advice"]["limitations"][0]
+
+
+async def test_single_model_uncertain_mapping_is_a_risk_not_a_pass(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        UncertainMappingLlm(),
+        settings_overrides={
+            "LLM_FACT_REVIEW_ENABLED": False,
+            "LLM_MAPPING_REVIEW_ENABLED": False,
+        },
+    )
+
+    assert result["fact_matrix"][0]["status"] == "UNCERTAIN"
+    assert any(item["title"] == "辅助资料对应关系不明确" for item in result["risk_items"])
+    assert not any(
+        item.get("module_code") == "FACT_CONSISTENCY"
+        and "来源一致" in item.get("title", "")
+        for item in result["passed_checks"]
+    )
+    assert all(risk.get("analysis_advice") for risk in result["risk_items"])
 
 
 async def test_delivery_path_publishes_accepted_fact_conflict_with_two_sided_evidence(

@@ -67,8 +67,8 @@ REAL_FILES = (
 )
 DEFAULT_OUTPUT = Path(".real-diagnostic-temp") / "draft-review-real-safe.jsonl"
 DEFAULT_LOCK = Path(".real-diagnostic-temp") / "draft-review-real.lock"
-MAX_REAL_LOGICAL_CALLS = 10
-MAX_REAL_RUNTIME_SECONDS = 15 * 60
+MAX_REAL_LOGICAL_CALLS = 3
+MAX_REAL_RUNTIME_SECONDS = 10 * 60
 
 
 def safe_error_code(exc: BaseException) -> str:
@@ -92,6 +92,11 @@ def safe_failure_code(exc: BaseException) -> str:
 
     if isinstance(exc, LlmClientError):
         return exc.failure_code or exc.code
+    if isinstance(exc, WorkflowError):
+        if isinstance(exc.details, dict) and isinstance(exc.details.get("failure_code"), str):
+            return str(exc.details["failure_code"])
+        if exc.__cause__ is not None:
+            return safe_failure_code(exc.__cause__)
     return safe_error_code(exc)
 
 
@@ -143,6 +148,26 @@ class SafeMetrics:
     probe_http_calls: int = 0
     checkpoint_reused: int = 0
     checkpoint_saved: int = 0
+    extraction_fact_counts: Counter[str] = field(default_factory=Counter)
+    extraction_fact_digests: dict[str, set[str]] = field(default_factory=dict)
+    fact_review_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    fact_review_decision_digests: dict[str, set[str]] = field(default_factory=dict)
+    mapping_target_fact_counts: Counter[str] = field(default_factory=Counter)
+    mapping_reference_fact_counts: Counter[str] = field(default_factory=Counter)
+    mapping_proposal_counts: Counter[str] = field(default_factory=Counter)
+    mapping_missing_requirement_counts: Counter[str] = field(default_factory=Counter)
+    mapping_decision_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    mapping_review_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    mapping_review_decision_digests: dict[str, set[str]] = field(default_factory=dict)
+    mapping_gate_counts: dict[str, Counter[str]] = field(default_factory=dict)
+
+    def record_mapping_model_gate(
+        self, file_name: str, mapping_model: str | None, review_model: str | None
+    ) -> None:
+        counts = self.mapping_gate_counts.setdefault(file_name, Counter())
+        counts["independent_models"] = int(
+            bool(mapping_model and review_model and mapping_model != review_model)
+        )
     call_context: contextvars.ContextVar[tuple[str | None, str | None, str | None]] = field(
         default_factory=lambda: contextvars.ContextVar(
             "draft_review_diagnostic_call",
@@ -154,6 +179,225 @@ class SafeMetrics:
     current_file_id: str | None = None
     current_batch_id: str | None = None
     first_failure_stage: str | None = None
+
+    def _file_name(self, file_id: str | None) -> str:
+        return self.file_names.get(file_id, "任务级")
+
+    def record_extraction_value(self, file_name: str, value: Any) -> None:
+        facts = value.get("facts") if isinstance(value, dict) else None
+        if not isinstance(facts, list):
+            return
+        digests = self.extraction_fact_digests.setdefault(file_name, set())
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            digest = hashlib.sha256(
+                json.dumps(fact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            digests.add(digest)
+        self.extraction_fact_counts[file_name] = len(digests)
+
+    def record_fact_review_value(self, file_name: str, value: Any) -> None:
+        decisions = value.get("decisions") if isinstance(value, dict) else None
+        if not isinstance(decisions, list):
+            return
+        counts = self.fact_review_counts.setdefault(file_name, Counter())
+        digests = self.fact_review_decision_digests.setdefault(file_name, set())
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+            digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "field_key": decision.get("field_key"),
+                        "source_file_id": decision.get("source_file_id"),
+                        "location": decision.get("location"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if digest in digests:
+                continue
+            digests.add(digest)
+            counts[str(decision.get("decision", "UNKNOWN")).lower()] += 1
+        counts["covered"] = len(digests)
+        counts["uncovered"] = max(
+            self.extraction_fact_counts.get(file_name, 0) - counts["covered"], 0
+        )
+
+    def record_mapping_payload(self, file_name: str, payload: dict[str, Any]) -> None:
+        target_facts = payload.get("target_facts")
+        reference_facts = payload.get("reference_facts")
+        if isinstance(target_facts, list):
+            self.mapping_target_fact_counts[file_name] = len(target_facts)
+        if isinstance(reference_facts, list):
+            self.mapping_reference_fact_counts[file_name] = len(reference_facts)
+
+    def record_mapping_result(self, file_name: str, value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        mappings = value.get("mappings")
+        requirements = value.get("missing_requirements")
+        if isinstance(mappings, list):
+            self.mapping_proposal_counts[file_name] = len(mappings)
+            decision_counts = self.mapping_decision_counts.setdefault(file_name, Counter())
+            for mapping in mappings:
+                if isinstance(mapping, dict):
+                    decision_counts[str(mapping.get("decision", "UNKNOWN")).lower()] += 1
+        if isinstance(requirements, list):
+            self.mapping_missing_requirement_counts[file_name] = len(requirements)
+
+    def record_mapping_review(self, file_name: str, payload: dict[str, Any], value: Any) -> None:
+        proposed = (payload.get("proposed_mapping") or {}) if isinstance(payload, dict) else {}
+        proposals = proposed.get("mappings") if isinstance(proposed, dict) else None
+        requirements = (
+            proposed.get("missing_requirements") if isinstance(proposed, dict) else None
+        )
+        counts = self.mapping_review_counts.setdefault(file_name, Counter())
+        digests = self.mapping_review_decision_digests.setdefault(file_name, set())
+        decisions = value.get("decisions") if isinstance(value, dict) else None
+        if isinstance(decisions, list):
+            for decision in decisions:
+                if not isinstance(decision, dict):
+                    continue
+                digest = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "target_fact_id": decision.get("target_fact_id"),
+                            "reference_field_key": decision.get("reference_field_key"),
+                            "source_file_id": decision.get("source_file_id"),
+                            "reference_location": decision.get("reference_location"),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if digest in digests:
+                    continue
+                digests.add(digest)
+                counts[str(decision.get("decision", "UNKNOWN")).lower()] += 1
+        requirement_decisions = (
+            value.get("missing_requirement_decisions")
+            if isinstance(value, dict)
+            else None
+        )
+        if isinstance(requirement_decisions, list):
+            counts["missing_review_covered"] = len(requirement_decisions)
+            counts["missing_review_accept"] = sum(
+                item.get("decision") == "ACCEPT"
+                for item in requirement_decisions
+                if isinstance(item, dict)
+            )
+            counts["missing_review_reject"] = sum(
+                item.get("decision") == "REJECT"
+                for item in requirement_decisions
+                if isinstance(item, dict)
+            )
+            counts["missing_review_uncertain"] = sum(
+                item.get("decision") == "UNCERTAIN"
+                for item in requirement_decisions
+                if isinstance(item, dict)
+            )
+        proposal_count = len(proposals) if isinstance(proposals, list) else 0
+        requirement_count = len(requirements) if isinstance(requirements, list) else 0
+        counts["covered"] = len(digests)
+        counts["omitted"] = max(proposal_count - counts["covered"], 0)
+        counts["extra"] = max(counts["covered"] - proposal_count, 0)
+        counts["missing_review_omitted"] = max(
+            requirement_count - counts.get("missing_review_covered", 0), 0
+        )
+        if isinstance(value, dict):
+            counts["review_evidence_complete"] = int(
+                value.get("evidence_complete") is True
+            )
+            counts["review_confidence_qualified"] = int(
+                isinstance(value.get("confidence"), (int, float))
+                and not isinstance(value.get("confidence"), bool)
+                and float(value["confidence"]) >= 0.8
+            )
+            proposed_items = (
+                proposed.get("mappings") if isinstance(proposed, dict) else None
+            )
+            review_items = value.get("decisions")
+            if isinstance(proposed_items, list) and isinstance(review_items, list):
+                def identity(item: dict[str, Any]) -> str:
+                    return hashlib.sha256(
+                        json.dumps(
+                            {
+                                "target_fact_id": item.get("target_fact_id"),
+                                "reference_field_key": item.get("reference_field_key"),
+                                "source_file_id": item.get("source_file_id"),
+                                "reference_location": item.get("reference_location"),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+                proposals_by_id = {
+                    identity(item): item
+                    for item in proposed_items
+                    if isinstance(item, dict)
+                }
+                reviews_by_id = {
+                    identity(item): item
+                    for item in review_items
+                    if isinstance(item, dict)
+                }
+                qualified = 0
+                for item_id, proposal in proposals_by_id.items():
+                    review_item = reviews_by_id.get(item_id)
+                    if (
+                        proposal.get("decision") == "MATCH"
+                        and isinstance(proposal.get("confidence"), (int, float))
+                        and not isinstance(proposal.get("confidence"), bool)
+                        and float(proposal["confidence"]) >= 0.8
+                        and isinstance(review_item, dict)
+                        and review_item.get("decision") == "ACCEPT"
+                        and isinstance(review_item.get("confidence"), (int, float))
+                        and not isinstance(review_item.get("confidence"), bool)
+                        and float(review_item["confidence"]) >= 0.8
+                    ):
+                        qualified += 1
+                if not (
+                    counts["review_evidence_complete"]
+                    and counts["review_confidence_qualified"]
+                ):
+                    qualified = 0
+                gate_counts = self.mapping_gate_counts.setdefault(file_name, Counter())
+                gate_counts["proposals"] = len(proposals_by_id)
+                gate_counts["individually_qualified"] = qualified
+                gate_counts["consumed"] = qualified
+
+    def safe_aggregate_summary(self) -> dict[str, Any]:
+        return {
+            "extraction_fact_counts": dict(self.extraction_fact_counts),
+            "fact_review_counts": {
+                file_name: dict(counts) for file_name, counts in self.fact_review_counts.items()
+            },
+            "mapping_target_fact_counts": dict(self.mapping_target_fact_counts),
+            "mapping_reference_fact_counts": dict(self.mapping_reference_fact_counts),
+            "mapping_proposal_counts": dict(self.mapping_proposal_counts),
+            "mapping_missing_requirement_counts": dict(self.mapping_missing_requirement_counts),
+            "mapping_decision_counts": {
+                file_name: dict(counts)
+                for file_name, counts in self.mapping_decision_counts.items()
+            },
+            "mapping_review_counts": {
+                file_name: dict(counts)
+                for file_name, counts in self.mapping_review_counts.items()
+            },
+            "mapping_gate_counts": {
+                file_name: dict(counts)
+                for file_name, counts in self.mapping_gate_counts.items()
+            },
+        }
 
     def set_phase(self, phase: str) -> None:
         if not self.phase_events or self.phase_events[-1] != phase:
@@ -419,6 +663,7 @@ class RecordingLlm:
     def __init__(self, client: OpenAIContractLlmClient, metrics: SafeMetrics) -> None:
         self.client = client
         self.metrics = metrics
+        self.mapping_models: dict[str, str | None] = {}
 
     async def _call(
         self,
@@ -488,28 +733,49 @@ class RecordingLlm:
         )
 
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult:
-        return await self._call(
+        result = await self._call(
             "FACT_REVIEW",
             payload,
             self.client.review_facts,
             file_id=payload.get("file_id"),
         )
+        self.metrics.record_fact_review_value(
+            self.metrics._file_name(payload.get("file_id")), result.value
+        )
+        return result
 
     async def map_facts(self, payload: dict[str, Any]) -> LlmResult:
-        return await self._call(
+        result = await self._call(
             "FACT_MAPPING",
             payload,
             self.client.map_facts,
             file_id=payload.get("reference_file_id"),
         )
+        file_name = self.metrics._file_name(payload.get("reference_file_id"))
+        self.metrics.record_mapping_payload(file_name, payload)
+        self.metrics.record_mapping_result(file_name, result.value)
+        self.mapping_models[payload["reference_file_id"]] = (
+            result.actual_model or result.configured_model
+        )
+        return result
 
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult:
-        return await self._call(
+        result = await self._call(
             "FACT_MAPPING_REVIEW",
             payload,
             self.client.review_mappings,
             file_id=payload.get("reference_file_id"),
         )
+        self.metrics.record_mapping_review(
+            self.metrics._file_name(payload.get("reference_file_id")), payload, result.value
+        )
+        reference_file_id = payload.get("reference_file_id")
+        self.metrics.record_mapping_model_gate(
+            self.metrics._file_name(reference_file_id),
+            self.mapping_models.get(reference_file_id),
+            result.actual_model or result.configured_model,
+        )
+        return result
 
     async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult:
         return await self._call(
@@ -534,10 +800,13 @@ class RecordingCheckpointStore:
         checkpoint = await self.inner.load(batch_id, **kwargs)
         if checkpoint is not None:
             self.metrics.checkpoint_reused += 1
+            file_name = self.metrics.file_names_by_sha.get(str(kwargs.get("file_sha256", "")))
+            if file_name and checkpoint.value is not None:
+                if checkpoint.extraction_version in {"numeric-v2", TEXT_EXTRACTION_VERSION}:
+                    self.metrics.record_extraction_value(file_name, checkpoint.value)
+                elif checkpoint.extraction_version == "fact-review-v1":
+                    self.metrics.record_fact_review_value(file_name, checkpoint.value)
             if checkpoint.extraction_version in {"numeric-v2", TEXT_EXTRACTION_VERSION}:
-                file_name = self.metrics.file_names_by_sha.get(
-                    str(kwargs.get("file_sha256", ""))
-                )
                 if file_name:
                     self.metrics.completed_batch_counts[file_name] += 1
             self.metrics.writer.emit(
@@ -549,6 +818,12 @@ class RecordingCheckpointStore:
     async def save(self, checkpoint: ExtractionCheckpoint) -> None:
         await self.inner.save(checkpoint)
         self.metrics.checkpoint_saved += 1
+        file_name = self.metrics.file_names_by_sha.get(checkpoint.file_sha256 or "")
+        if file_name and checkpoint.value is not None:
+            if checkpoint.extraction_version in {"numeric-v2", TEXT_EXTRACTION_VERSION}:
+                self.metrics.record_extraction_value(file_name, checkpoint.value)
+            elif checkpoint.extraction_version == "fact-review-v1":
+                self.metrics.record_fact_review_value(file_name, checkpoint.value)
 
 
 class LocalRealFileDownloader:
@@ -605,6 +880,8 @@ def diagnostic_settings() -> Settings:
         LLM_EXTRACTION_MAX_SPLIT_DEPTH=8,
         LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT=128,
         LLM_SEMANTIC_FACT_BATCH_SIZE=8,
+        LLM_FACT_REVIEW_ENABLED=False,
+        LLM_MAPPING_REVIEW_ENABLED=False,
         LLM_SEMANTIC_PLAN_ENABLED=False,
         LLM_REVIEW_BATCH_MAX_CHARS=8000,
         LLM_SAME_MODEL_DIAGNOSTIC=False,
@@ -645,12 +922,19 @@ def _location_present(side: Any) -> bool:
 def _result_summary(result: dict[str, Any], metrics: SafeMetrics) -> dict[str, Any]:
     TaskResultData.model_validate(result)
     diff_items = result.get("diff_items", [])
-    advice_items = (result.get("advice") or {}).get("risk_advices", [])
-    advice_count = sum(
+    risk_items = result.get("risk_items", [])
+    model_advice_items = (result.get("advice") or {}).get("risk_advices", [])
+    formal_advice_count = sum(
         isinstance(item, dict)
         and isinstance(item.get("analysis_advice"), str)
         and bool(item["analysis_advice"].strip())
-        for item in advice_items
+        for item in risk_items
+    )
+    model_advice_count = sum(
+        isinstance(item, dict)
+        and isinstance(item.get("analysis_advice"), str)
+        and bool(item["analysis_advice"].strip())
+        for item in model_advice_items
     )
     evidence_pairs = sum(
         _location_present(item.get("baseline")) and _location_present(item.get("target"))
@@ -662,16 +946,43 @@ def _result_summary(result: dict[str, Any], metrics: SafeMetrics) -> dict[str, A
         and isinstance(item.get("analysis_advice"), str)
         and "\n" not in item["analysis_advice"]
         and 0 < len(item["analysis_advice"]) <= 240
-        for item in advice_items
+        for item in risk_items
+    )
+    fact_matrix = result.get("fact_matrix", [])
+    fact_matrix_status_counts = Counter(
+        str(item.get("status"))
+        for item in fact_matrix
+        if isinstance(item, dict) and item.get("status")
+    )
+    consumed_mapping_count = sum(
+        relation.get("status") in {"CONSISTENT", "CONFLICT"}
+        for item in fact_matrix
+        if isinstance(item, dict)
+        for relation in item.get("reference_results", [])
+        if isinstance(relation, dict)
     )
     return {
         "result_schema_valid": True,
         "execution_mode": result.get("metadata", {}).get("execution_mode"),
         "formal_diff_count": len(diff_items),
         "diff_evidence_pair_count": evidence_pairs,
-        "ai_advice_count": advice_count,
+        "risk_item_count": len(risk_items),
+        "ai_advice_count": formal_advice_count,
+        "model_advice_count": model_advice_count,
+        "fallback_advice_count": max(formal_advice_count - model_advice_count, 0),
         "short_ai_advice_count": short_advice_count,
         "conclusion": result.get("conclusion"),
+        "fact_matrix_status_counts": dict(fact_matrix_status_counts),
+        "fact_matrix_consumed_mapping_count": consumed_mapping_count,
+        "formal_fact_conflict_count": fact_matrix_status_counts.get("CONFLICT", 0),
+        "formal_fact_missing_count": fact_matrix_status_counts.get("MISSING", 0),
+        "formal_fact_uncertain_count": fact_matrix_status_counts.get("UNCERTAIN", 0),
+        "formal_fact_passed_count": sum(
+            item.get("module_code") == "FACT_CONSISTENCY"
+            for item in result.get("passed_checks", [])
+            if isinstance(item, dict)
+        ),
+        "fact_mapping_aggregates": metrics.safe_aggregate_summary(),
         "document_request_counts": {
             file_name: metrics.document_request_counts.get(file_name, 0)
             for file_name, _role in REAL_FILES
@@ -1151,6 +1462,15 @@ async def run_once(
             error_code=failure,
             failure_subcode=failure_subcode,
             first_failure_stage=metrics.first_failure_stage,
+            failure_detail_counts=(
+                {
+                    key: value
+                    for key, value in exc.details.items()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                }
+                if isinstance(exc, WorkflowError) and isinstance(exc.details, dict)
+                else None
+            ),
         )
     finally:
         if transport is not None:
@@ -1206,6 +1526,7 @@ async def run_once(
                 workflow_phase_events=metrics.phase_events,
                 response_chars=metrics.response_chars,
                 request_chars=metrics.request_chars,
+                fact_mapping_aggregates=metrics.safe_aggregate_summary(),
                 result=result_summary,
             )
         finally:

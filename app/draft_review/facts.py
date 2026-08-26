@@ -255,6 +255,146 @@ def accepted_fact_refs(
     return accepted
 
 
+def qualified_fact_refs(
+    extraction: DocumentFactExtraction,
+    review: FactReview | None,
+    min_confidence: float,
+    *,
+    extraction_model: str | None = None,
+    review_model: str | None = None,
+    document: ParsedDocument | None = None,
+    require_independent_model: bool = True,
+    require_review: bool = True,
+) -> set[tuple[str, str]]:
+    """Return the single fact set that downstream dynamic consumers may use.
+
+    ``accepted_fact_refs`` is retained as a compatibility helper for callers
+    that only need the historical review decision check.  Production mapping,
+    semantic planning, and result construction use this gate.  When
+    ``require_review`` is false, the same evidence/identity/confidence checks
+    apply without a review decision; when it is true, model identity and
+    review completeness are also required.
+    """
+
+    fact_keys = [
+        (fact.field_key, fact.source_file_id, location_key(fact.location))
+        for fact in extraction.facts
+    ]
+    decision_keys = [
+        (decision.field_key, decision.source_file_id, location_key(decision.location))
+        for decision in review.decisions
+    ] if review is not None else []
+    if len(fact_keys) != len(set(fact_keys)):
+        return set()
+    if not require_review:
+        if document is not None:
+            try:
+                validate_extraction_evidence(document, extraction)
+            except EvidenceValidationError:
+                return set()
+        return {
+            (stable_fact_id(fact), fact.source_file_id)
+            for fact in extraction.facts
+            if fact.source_file_id == extraction.profile.file_id
+            and fact.confidence >= min_confidence
+        }
+    if (
+        review is None
+        or review.file_id != extraction.profile.file_id
+        or not review.evidence_complete
+        or review.confidence < min_confidence
+    ):
+        return set()
+    if require_independent_model and (
+        not extraction_model
+        or not review_model
+        or extraction_model == review_model
+    ):
+        return set()
+    if len(decision_keys) != len(set(decision_keys)) or set(decision_keys) != set(fact_keys):
+        return set()
+    decisions = {
+        (decision.field_key, decision.source_file_id, location_key(decision.location)): decision
+        for decision in review.decisions
+    }
+    evidence = _evidence_at(document) if document is not None else None
+    qualified: set[tuple[str, str]] = set()
+    for fact in extraction.facts:
+        key = (fact.field_key, fact.source_file_id, location_key(fact.location))
+        decision = decisions[key]
+        if (
+            fact.source_file_id != extraction.profile.file_id
+            or fact.confidence < min_confidence
+            or decision.decision != "ACCEPT"
+            or decision.confidence < min_confidence
+        ):
+            continue
+        if evidence is not None:
+            candidates = evidence.get(location_key(fact.location), [])
+            if not candidates or not any(
+                normalize_text(fact.evidence_text) in normalize_text(candidate)
+                for candidate in candidates
+            ):
+                continue
+        qualified.add((stable_fact_id(fact), fact.source_file_id))
+    return qualified
+
+
+def mapping_proposal_key(item: Any) -> tuple[str, str, str, tuple[object, ...]]:
+    """Build the stable identity used by mapping and mapping-review gates."""
+
+    def get(name: str) -> Any:
+        return getattr(item, name) if hasattr(item, name) else item[name]
+
+    return (
+        str(get("target_fact_id")),
+        str(get("reference_field_key")),
+        str(get("source_file_id")),
+        location_key(get("reference_location")),
+    )
+
+
+def missing_requirement_key(item: Any) -> str:
+    if hasattr(item, "target_fact_id"):
+        return str(item.target_fact_id)
+    return str(item["target_fact_id"])
+
+
+def validate_mapping_review_coverage(
+    mapping: Any,
+    review: Any,
+    reference_file_id: str,
+) -> None:
+    """Require a one-to-one review decision for every mapping proposal."""
+
+    if (
+        mapping.reference_file_id != reference_file_id
+        or review.reference_file_id != reference_file_id
+    ):
+        raise EvidenceValidationError(
+            "mapping and review reference file does not match",
+            code="MAPPING_FILE_ID_MISMATCH",
+        )
+    proposal_keys = [mapping_proposal_key(item) for item in mapping.mappings]
+    review_keys = [mapping_proposal_key(item) for item in review.decisions]
+    requirement_keys = [missing_requirement_key(item) for item in mapping.missing_requirements]
+    requirement_review_keys = [
+        missing_requirement_key(item) for item in review.missing_requirement_decisions
+    ]
+    if (
+        len(proposal_keys) != len(set(proposal_keys))
+        or len(review_keys) != len(set(review_keys))
+        or set(proposal_keys) != set(review_keys)
+        or len(requirement_keys) != len(set(requirement_keys))
+        or len(requirement_review_keys) != len(set(requirement_review_keys))
+        or set(requirement_keys) != set(requirement_review_keys)
+    ):
+        raise EvidenceValidationError(
+            "mapping review does not cover exactly every proposal and requirement",
+            code="MAPPING_REVIEW_INCOMPLETE",
+        )
+
+
 def verified_fact_index(
     extractions: dict[str, DocumentFactExtraction],
     reviews: dict[str, FactReview | None],

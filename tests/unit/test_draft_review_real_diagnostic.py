@@ -170,6 +170,50 @@ def test_real_diagnostic_blocks_calls_after_the_configured_limit(tmp_path) -> No
     assert metrics.logical_calls == 1
 
 
+def test_safe_aggregate_metrics_keep_only_fact_and_mapping_counts(tmp_path) -> None:
+    writer = SafeMetricWriter(tmp_path / "aggregates.jsonl")
+    metrics = SafeMetrics(writer=writer, file_names={"fil_reference": "reference.docx"})
+    try:
+        metrics.record_extraction_value(
+            "target.docx",
+            {"facts": [{"field_key": "secret_value", "raw_value": "contract text"}]},
+        )
+        metrics.record_fact_review_value(
+            "target.docx",
+            {"decisions": [{"field_key": "secret_value", "decision": "ACCEPT"}]},
+        )
+        metrics.record_mapping_payload(
+            "reference.docx",
+            {"target_facts": [{"fact_id": "target_fact_000001"}], "reference_facts": []},
+        )
+        metrics.record_mapping_result(
+            "reference.docx",
+            {"mappings": [{"target_fact_id": "target_fact_000001"}], "missing_requirements": []},
+        )
+        metrics.record_mapping_review(
+            "reference.docx",
+            {
+                "proposed_mapping": {
+                    "mappings": [{"target_fact_id": "target_fact_000001"}],
+                    "missing_requirements": [],
+                }
+            },
+            {"decisions": [{"target_fact_id": "target_fact_000001", "decision": "ACCEPT"}]},
+        )
+        aggregates = metrics.safe_aggregate_summary()
+    finally:
+        writer.close()
+
+    assert aggregates["extraction_fact_counts"] == {"target.docx": 1}
+    assert aggregates["fact_review_counts"]["target.docx"]["accept"] == 1
+    assert aggregates["fact_review_counts"]["target.docx"]["uncovered"] == 0
+    assert aggregates["mapping_target_fact_counts"] == {"reference.docx": 1}
+    assert aggregates["mapping_proposal_counts"] == {"reference.docx": 1}
+    assert aggregates["mapping_review_counts"]["reference.docx"]["accept"] == 1
+    serialized = (tmp_path / "aggregates.jsonl").read_text(encoding="utf-8")
+    assert "contract text" not in serialized
+
+
 @pytest.mark.asyncio
 async def test_concurrent_recording_keeps_http_calls_with_their_logical_file(
     tmp_path,

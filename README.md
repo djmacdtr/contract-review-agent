@@ -138,6 +138,7 @@ docker volume inspect contract-review-postgres-data
 复制 `.env.example` 为 `.env`。示例只包含开发默认值，LLM/OCR Key 为空，`.env` 已被 Git 忽略。
 
 - `LLM_ENABLED=false`，模型配置默认 `GLM-5.2`；启用后 DRAFT_REVIEW 按文档分块抽取事实并校验证据，事实、评审或映射能力未可靠完成时任务失败；Advice 失败不会改变确定性结论。
+- v1 交付默认使用单模型模式：`LLM_FACT_REVIEW_ENABLED=false`、`LLM_MAPPING_REVIEW_ENABLED=false`、`LLM_SEMANTIC_PLAN_ENABLED=false`。此模式仍执行原文证据回查、事实身份校验和程序数值比较；只有显式开启评审开关时，`LLM_REQUIRE_INDEPENDENT_MODEL=true` 才启用独立模型门。
 - `MOCK_STAGE_DELAY_SECONDS` 控制控制台可见的模拟阶段延时，测试中设为 `0`。
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
 - `ALLOW_HTTP_DOWNLOADS` 默认关闭；开发 fixture 需要显式开启，并将 `DOWNLOAD_HOST_ALLOWLIST` 精确设为 `fixture-server`。
@@ -154,7 +155,7 @@ docker volume inspect contract-review-postgres-data
 - DRAFT_REVIEW 事实抽取使用紧凑两阶段链路：第一阶段只返回开放式 profile/facts，证据正文由程序按位置回查；数值候选由程序高召回定位并交给模型分类。事实完成证据评审和跨文档映射后，内部 `plan_semantics` 才生成动态语义概念及声明式数值规则；该步骤不改变公开 API，也不接入 FINAL_COMPARE。
 - 紧凑抽取和语义规划均限制数组、字段长度及数值 AST 深度/节点数；超过安全边界时分批处理或失败，不静默截断。抽取阶段不生成 `missing_field_keys`、`semantic_concepts` 或 `validation_specs`，完整结果字段由程序兼容性回填。
 - 事实评审的 JSON Schema 至少要求一个决策，并按当前批次候选数动态设置 `minItems=maxItems=N`；Adapter 继续校验候选身份恰好覆盖一次，失败时最多执行一次只包含遗漏身份的结构纠错。
-- `LLM_SAME_MODEL_DIAGNOSTIC=false` 仅供 development/test/evaluation 显式联调。同模型评审不会形成独立共识、模型风险或模型通过项，且不能生成正式 `PASS`；正式模式必须保持 `LLM_REQUIRE_INDEPENDENT_MODEL=true`。
+- `LLM_SAME_MODEL_DIAGNOSTIC=false` 仅供 development/test/evaluation 显式联调。同模型评审不会形成独立共识、模型风险或模型通过项；真正独立模型评审作为后续增强，禁止把同模型双调用描述为独立共识。
 - 模型事实与跨文档映射只补充跨文档一致性分析，不能删除、合并、过滤或覆盖确定性文本对齐生成的原始版本差异。
 
 ### 本机真实 OCR 验证
