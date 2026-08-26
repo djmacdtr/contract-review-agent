@@ -31,8 +31,9 @@ def test_llm_configuration_defaults() -> None:
     assert settings.LLM_ADVICE_MODEL == "GLM-5.2"
     assert settings.LLM_ENABLE_EMBEDDING is False
     assert settings.LLM_ENABLE_RERANK is False
-    assert settings.LLM_REVIEW_BATCH_MAX_CHARS == 12000
+    assert settings.LLM_REVIEW_BATCH_MAX_CHARS == 8000
     assert settings.LLM_REVIEW_CONTEXT_BLOCKS == 1
+    assert settings.LLM_SEMANTIC_PLAN_ENABLED is False
     assert settings.LLM_SAME_MODEL_DIAGNOSTIC is False
     assert settings.PAGE_MISSING_MIN_EQUIVALENT == 0.8
     assert settings.PAGE_MISSING_MIN_ANCHOR_SIMILARITY == 0.85

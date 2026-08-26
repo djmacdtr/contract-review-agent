@@ -174,7 +174,6 @@ def advice_payload(result: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
             for item in result.get("risk_items", [])
-            if item.get("related_diff_ids")
         ],
         "diff_items": [
             {
@@ -204,11 +203,7 @@ def _advice_side(side: Any) -> dict[str, Any] | None:
 
 
 def merge_model_advice(result: dict[str, Any], response: AdviceResponse) -> None:
-    current_ids = {
-        item["risk_id"]
-        for item in result.get("risk_items", [])
-        if item.get("related_diff_ids")
-    }
+    current_ids = {item["risk_id"] for item in result.get("risk_items", [])}
     technical_ids = {
         *current_ids,
         *(item.get("file_id") for item in result.get("files", [])),

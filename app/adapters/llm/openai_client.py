@@ -16,23 +16,31 @@ from app.adapters.llm.schemas import (
     CompactDocumentFactExtraction,
     CompactDocumentOverview,
     CompactFactBatchExtraction,
+    CompactFactReview,
+    CompactSemanticPlanResponse,
     DocumentFactExtraction,
     FactMappingResponse,
     FactMappingReview,
     FactReview,
     NumericCandidateExtraction,
+    SemanticConceptPlan,
+    SemanticEvidenceRef,
+    SemanticFactRef,
     SemanticPlanResponse,
+    SemanticValidationSpec,
     TextFactExtraction,
 )
 from app.core.config import Settings
 from app.documents.models import DocumentLocation
 from app.draft_review.facts import (
+    TEXT_FACT_VALUE_TYPES,
     EvidenceValidationError,
     expand_compact_extraction,
     expand_document_overview,
     expand_fact_batch,
     expand_numeric_candidate_response,
     expand_text_fact_response,
+    location_key,
 )
 
 JsonValidator = Callable[[Any], dict[str, Any]]
@@ -79,9 +87,13 @@ NUMERIC_CANDIDATE_SYSTEM_PROMPT = (
 )
 TEXT_FACT_SYSTEM_PROMPT = (
     "你是开放式合同非数值事实抽取器。只返回 JSON 对象，不要 Markdown。"
-    "逐个扫描输入 units，事实只能引用输入中的 unit_id。quote 必须是该 unit 原文的精确子串。"
+    "逐个扫描输入 units，事实只能引用输入中的候选 unit_id。quote 必须是该 unit 原文的精确子串。"
+    "readonly_context 仅用于理解标题、字段标签和表头，绝不能作为事实来源或 quote 来源。"
     "只返回 unit_id、semantic_key、display_name、value_type、quote、confidence。"
+    "数值、日期和标识类事实由 numeric-v2 处理；本链只返回 TEXT、ENTITY 或 UNKNOWN。"
     "不得返回文件身份、位置、证据副本、稳定事实 ID 或原文外的推测。"
+    "没有可可靠识别的非数值事实时，必须返回 JSON {\"items\":[]}，不得返回解释、拒绝语或自然语言。"
+    "无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {\"items\":[]}，不得猜测或改写。"
     "一次最多返回 12 项；如果可能还有更多事实，不要遗漏，程序会继续拆分。"
     "严格遵守 TextFactExtraction。"
 )
@@ -89,12 +101,15 @@ SEMANTIC_PLAN_SYSTEM_PROMPT = (
     "你是合同事实语义规划器。只返回一个 JSON 对象，不要 Markdown。"
     "输入只包含已经通过事实评审的事实和已经通过映射评审的关系，且所有事实都有稳定 fact_id。"
     "只生成开放式语义概念和必要的声明式数值校验规则，不得发明输入中不存在的事实。"
-    "概念必须通过 fact_refs 引用事实，并通过 evidence_refs 指明 source_file_id 和位置。"
+    "概念只返回 fact_ids 引用事实，不要返回 source_file_id、位置或证据文本；"
+    "程序会根据已验证事实回填这些字段。"
     "规则 AST 的 fact 节点必须同时使用 fact_id 和 source_file_id，"
     "禁止使用 field_key 或 concept_id。"
-    "规则 evidence_refs 必须准确标明各来源文件，不得把辅助资料位置当成目标文件位置。"
+    "规则只返回 expression，不要返回 evidence_refs；程序会根据 AST 中的事实回填证据位置。"
     "校验规则只能使用允许的 numeric AST；不要输出代码、自然语言表达式或重复事实证据。"
-    "没有可靠概念或规则时返回空数组。严格遵守 SemanticPlanResponse。"
+    "只为当前输入目标事实批次生成必要的概念和规则；不要为每条事实机械创建概念，"
+    "不要重复输入事实，也不要引用当前批次之外的目标事实。"
+    "没有可靠概念或规则时返回空数组。严格遵守 CompactSemanticPlanResponse。"
 )
 REVIEW_SYSTEM_PROMPT = (
     "你是独立的合同事实评审器。逐项核验主模型给出的候选事实是否确实来自同一文件、"
@@ -374,15 +389,21 @@ def _validate_numeric_candidates(value: Any, payload: dict[str, Any]) -> dict[st
 def _validate_text_facts(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         response = TextFactExtraction.model_validate(value)
+        response = response.model_copy(
+            update={
+                "items": [
+                    item
+                    for item in response.items
+                    if item.value_type in TEXT_FACT_VALUE_TYPES
+                ]
+            }
+        )
         expand_text_fact_response(payload, response)
     except EvidenceValidationError as exc:
         raise LlmClientError(
             "LLM_EXTRACTION_EVIDENCE_INVALID",
             "模型非数值事实未通过安全证据校验",
-            correction_message=(
-                "上一响应的 unit_id 或 quote 未通过校验。只引用输入 unit_id，"
-                "quote 必须是对应 unit 原文的精确子串。"
-            ),
+            correction_message=_text_evidence_correction_message(exc.code),
             failure_code=exc.code,
         ) from exc
     except ValidationError as exc:
@@ -395,6 +416,205 @@ def _validate_text_facts(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             validation_summary=summary,
         ) from exc
     return response.model_dump(mode="json")
+
+
+def _text_evidence_correction_message(failure_code: str | None) -> str:
+    guidance = {
+        "FACT_UNIT_NOT_FOUND": "只引用本次输入 units 中实际存在的 unit_id。",
+        "FACT_QUOTE_NOT_GROUNDED": (
+            "quote 必须是对应 unit 原文的精确子串；无法唯一回查时不要返回该事实。"
+        ),
+        "FACT_IDENTITY_DUPLICATED": "同一个 unit_id 和 semantic_key 只能返回一次。",
+    }.get(
+        failure_code,
+        "只引用本次输入 units 中实际存在且能唯一回查的事实。",
+    )
+    return (
+        "上一响应未通过非数值事实证据校验。"
+        f"{guidance}如果没有任何事实能严格通过校验，必须只返回 JSON {{\"items\":[]}}；"
+        "不得输出解释、拒绝语、Markdown、原文外的推测或改写。"
+    )
+
+
+def _semantic_fact_catalog(
+    payload: dict[str, Any],
+) -> dict[tuple[str, str], DocumentLocation]:
+    catalog: dict[tuple[str, str], DocumentLocation] = {}
+    for document in payload.get("documents", []):
+        if not isinstance(document, dict):
+            continue
+        for fact in document.get("facts", []):
+            if not isinstance(fact, dict):
+                continue
+            fact_id = fact.get("fact_id")
+            source_file_id = fact.get("source_file_id")
+            location = fact.get("location")
+            if not isinstance(fact_id, str) or not isinstance(source_file_id, str):
+                continue
+            if not isinstance(location, dict):
+                continue
+            key = (fact_id, source_file_id)
+            parsed_location = DocumentLocation.model_validate(location)
+            existing = catalog.get(key)
+            if existing is not None and location_key(existing) != location_key(parsed_location):
+                raise LlmClientError(
+                    "LLM_SEMANTIC_PLAN_INVALID",
+                    "语义规划输入包含冲突的事实身份",
+                )
+            catalog[key] = parsed_location
+    return catalog
+
+
+def _semantic_correction_error(message: str) -> LlmClientError:
+    return LlmClientError(
+        "LLM_SCHEMA_INVALID",
+        message,
+        correction_message=(
+            "上一响应未通过语义事实引用校验。只引用当前输入 documents 中实际存在的 fact_id；"
+            "概念只返回当前批次的 fact_ids，规则 AST 的 fact 节点必须使用当前输入中的"
+            "fact_id 和 source_file_id。不要返回证据位置、文件外事实、解释或 Markdown。"
+        ),
+        failure_code="LLM_SEMANTIC_PLAN_INVALID",
+    )
+
+
+def _semantic_ast_refs(node: Any) -> set[tuple[str, str]]:
+    if not isinstance(node, dict):
+        raise _semantic_correction_error("语义规则 AST 不是对象")
+    if node.get("op") == "fact":
+        fact_id = node.get("fact_id")
+        source_file_id = node.get("source_file_id")
+        if not isinstance(fact_id, str) or not isinstance(source_file_id, str):
+            raise _semantic_correction_error("语义规则事实节点缺少限定身份")
+        return {(fact_id, source_file_id)}
+    references: set[tuple[str, str]] = set()
+    for key in ("args", "left", "right"):
+        child = node.get(key)
+        if isinstance(child, list):
+            for item in child:
+                references.update(_semantic_ast_refs(item))
+        elif isinstance(child, dict):
+            references.update(_semantic_ast_refs(child))
+    return references
+
+
+def _semantic_evidence_refs(
+    references: set[tuple[str, str]],
+    catalog: dict[tuple[str, str], DocumentLocation],
+) -> list[SemanticEvidenceRef]:
+    evidence: list[SemanticEvidenceRef] = []
+    seen: set[tuple[str, tuple[object, ...]]] = set()
+    for reference in sorted(references):
+        location = catalog.get(reference)
+        if location is None:
+            raise _semantic_correction_error("语义规划引用了当前批次之外的事实")
+        key = (reference[1], location_key(location))
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence.append(
+            SemanticEvidenceRef(
+                source_file_id=reference[1],
+                location=location,
+            )
+        )
+    if not evidence:
+        raise _semantic_correction_error("语义规划结果缺少可回查证据")
+    return evidence
+
+
+def _validate_compact_semantic_plan(
+    value: Any,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        compact = CompactSemanticPlanResponse.model_validate(value)
+    except ValidationError as exc:
+        summary = _safe_validation_summary(exc)
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型语义规划结果不符合结构约束",
+            correction_message=_schema_correction_message(summary),
+            validation_summary=summary,
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+        ) from exc
+    if compact.file_id != payload.get("file_id"):
+        raise _semantic_correction_error("模型语义规划文件身份不匹配")
+
+    catalog = _semantic_fact_catalog(payload)
+    by_fact_id: dict[str, tuple[str, str]] = {}
+    for fact_id, source_file_id in catalog:
+        existing = by_fact_id.get(fact_id)
+        if existing is not None and existing[1] != source_file_id:
+            raise LlmClientError(
+                "LLM_SEMANTIC_PLAN_INVALID",
+                "语义规划输入包含重复事实 ID",
+            )
+        by_fact_id[fact_id] = (fact_id, source_file_id)
+
+    concepts: list[SemanticConceptPlan] = []
+    for concept in compact.semantic_concepts:
+        references: set[tuple[str, str]] = set()
+        for fact_id in concept.fact_ids:
+            reference = by_fact_id.get(fact_id)
+            if reference is None:
+                raise _semantic_correction_error("语义概念引用了当前批次之外的事实")
+            references.add(reference)
+        try:
+            concepts.append(
+                SemanticConceptPlan(
+                    concept_id=concept.concept_id,
+                    display_name=concept.display_name,
+                    value_type=concept.value_type,
+                    aliases=concept.aliases,
+                    fact_refs=[
+                        SemanticFactRef(fact_id=fact_id, source_file_id=source_file_id)
+                        for fact_id, source_file_id in sorted(references)
+                    ],
+                    evidence_refs=_semantic_evidence_refs(references, catalog),
+                    confidence=concept.confidence,
+                )
+            )
+        except ValidationError as exc:
+            summary = _safe_validation_summary(exc)
+            raise LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "模型语义规划结果不符合结构约束",
+                correction_message=_schema_correction_message(summary),
+                validation_summary=summary,
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            ) from exc
+
+    validation_specs: list[SemanticValidationSpec] = []
+    for spec in compact.validation_specs:
+        references = _semantic_ast_refs(spec.expression)
+        try:
+            validation_specs.append(
+                SemanticValidationSpec(
+                    validation_id=spec.validation_id,
+                    display_name=spec.display_name,
+                    expression=spec.expression,
+                    evidence_refs=_semantic_evidence_refs(references, catalog),
+                    confidence=spec.confidence,
+                )
+            )
+        except ValidationError as exc:
+            summary = _safe_validation_summary(exc)
+            raise LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "模型语义规划结果不符合结构约束",
+                correction_message=_schema_correction_message(summary),
+                validation_summary=summary,
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            ) from exc
+    return _validate_semantic_plan(
+        SemanticPlanResponse(
+            file_id=compact.file_id,
+            semantic_concepts=concepts,
+            validation_specs=validation_specs,
+        ).model_dump(mode="json"),
+        payload,
+    )
 
 
 def _validate_semantic_plan(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -469,6 +689,118 @@ def review_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
     decisions["minItems"] = len(identities)
     decisions["maxItems"] = len(identities)
     return schema
+
+
+def compact_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Send only evidence needed for review; identity remains program-owned."""
+
+    compact: dict[str, Any] = {
+        "facts": [
+            {
+                "fact_index": index,
+                "display_name": fact.get("display_name"),
+                "value_type": fact.get("value_type"),
+                "raw_value": fact.get("raw_value"),
+                "evidence_text": fact.get("evidence_text"),
+            }
+            for index, fact in enumerate(payload.get("facts", []), start=1)
+            if isinstance(fact, dict)
+        ],
+        "semantic_concepts": payload.get("semantic_concepts", []),
+        "validation_specs": payload.get("validation_specs", []),
+    }
+    compact["review_requirements"] = {
+        "required_decision_count": len(compact["facts"]),
+        "one_decision_per_fact": True,
+        "decisions_addressed_by_fact_index": True,
+        "identity_and_evidence_are_program_owned": True,
+    }
+    return compact
+
+
+def compact_review_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    facts = payload.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise LlmClientError(
+            "LLM_REVIEW_INPUT_INVALID",
+            "事实评审至少需要一个候选事实",
+        )
+    schema = deepcopy(CompactFactReview.model_json_schema())
+    decisions = schema["properties"]["decisions"]
+    decisions["minItems"] = len(facts)
+    decisions["maxItems"] = len(facts)
+    return schema
+
+
+def compact_review_correction_message(
+    payload: dict[str, Any], value: Any
+) -> str:
+    expected = set(range(1, len(payload.get("facts", [])) + 1))
+    actual = (
+        [
+            item.get("fact_index")
+            for item in value.get("decisions", [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(value, dict) and isinstance(value.get("decisions"), list)
+        else []
+    )
+    valid_actual = {item for item in actual if isinstance(item, int)}
+    missing = sorted(expected - valid_actual)
+    duplicates = sorted({item for item in actual if actual.count(item) > 1})
+    unexpected = sorted(valid_actual - expected)
+    requirements = {
+        "required_decision_count": len(expected),
+        "missing_fact_indices": missing,
+        "duplicate_fact_indices": duplicates,
+        "unexpected_fact_indices": unexpected,
+    }
+    return (
+        "上一响应未完整覆盖输入事实。必须为每个 fact_index 恰好返回一个 decisions 项，"
+        "不得遗漏、重复或新增。只返回符合 Schema 的 JSON 对象："
+        + json.dumps(requirements, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _validate_compact_review(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        compact = CompactFactReview.model_validate(value)
+    except ValidationError:
+        # Keep compatibility with already deployed clients and test fixtures
+        # that still return the verbose internal response shape.
+        return _validate_review(value, payload)
+    expected = set(range(1, len(payload.get("facts", [])) + 1))
+    actual = [item.fact_index for item in compact.decisions]
+    if len(actual) != len(expected) or len(actual) != len(set(actual)) or set(actual) != expected:
+        raise LlmClientError(
+            "LLM_REVIEW_INCOMPLETE",
+            "模型评审未完整覆盖候选事实",
+            correction_message=compact_review_correction_message(payload, value),
+        )
+    decisions = []
+    for item in compact.decisions:
+        fact = payload["facts"][item.fact_index - 1]
+        decisions.append(
+            {
+                "field_key": fact["field_key"],
+                "source_file_id": fact["source_file_id"],
+                "location": fact["location"],
+                "decision": item.decision,
+                "evidence_text": fact.get("evidence_text", ""),
+                "confidence": item.confidence,
+                "reason_code": item.reason_code,
+            }
+        )
+    return FactReview.model_validate(
+        {
+            "file_id": payload["file_id"],
+            "decisions": decisions,
+            "semantic_concepts": payload.get("semantic_concepts", []),
+            "validation_specs": payload.get("validation_specs", []),
+            "confidence": compact.confidence,
+            "evidence_complete": compact.evidence_complete,
+        }
+    ).model_dump(mode="json")
 
 
 def review_correction_message(payload: dict[str, Any], value: Any) -> str:
@@ -639,18 +971,23 @@ class OpenAIContractLlmClient:
             model=self.settings.LLM_EXTRACTION_MODEL,
             system=SEMANTIC_PLAN_SYSTEM_PROMPT,
             payload=payload,
-            validator=lambda value: _validate_semantic_plan(value, payload),
-            schema=SemanticPlanResponse,
+            validator=lambda value: _validate_compact_semantic_plan(value, payload),
+            schema=CompactSemanticPlanResponse,
         )
 
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult:
-        response_schema = review_response_schema(payload)
+        wire_payload = compact_review_payload(payload)
+        response_schema = compact_review_response_schema(wire_payload)
         return await self._structured_completion(
             model=self.settings.LLM_REVIEW_MODEL,
-            system=REVIEW_SYSTEM_PROMPT,
-            payload=payload,
-            validator=lambda value: _validate_review(value, payload),
-            schema=FactReview,
+            system=(
+                REVIEW_SYSTEM_PROMPT
+                + "评审响应使用紧凑协议：仅返回每个事实的 fact_index、decision、confidence、"
+                "reason_code；不要返回文件身份、位置或证据文本。"
+            ),
+            payload=wire_payload,
+            validator=lambda value: _validate_compact_review(value, payload),
+            schema=CompactFactReview,
             response_schema=response_schema,
             max_structure_retries=1,
         )
@@ -773,6 +1110,16 @@ class OpenAIContractLlmClient:
                     last_error = LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
                     last_error.__cause__ = exc
                 except LlmClientError as exc:
+                    # Keep the first validated failure reason when a single
+                    # allowed correction itself is malformed.  This preserves
+                    # FACT_* evidence subcodes in safe diagnostics instead of
+                    # collapsing them into the later transport/JSON wrapper.
+                    if (
+                        exc.failure_code is None
+                        and last_error is not None
+                        and last_error.failure_code is not None
+                    ):
+                        exc.failure_code = last_error.failure_code
                     last_error = exc
                     exc.request_attempts = request_attempts
                     exc.structure_retries = structure_attempt

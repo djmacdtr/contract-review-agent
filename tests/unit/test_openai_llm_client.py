@@ -215,6 +215,60 @@ async def test_review_retries_once_with_missing_candidate_identities() -> None:
     assert "amount" in correction and "term" in correction
 
 
+async def test_review_compact_response_rehydrates_program_owned_identity() -> None:
+    payload = review_payload()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert schema["title"] == "CompactFactReview"
+        return httpx.Response(
+            200,
+            json={
+                "model": "reviewer",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "decisions": [
+                                        {
+                                            "fact_index": 1,
+                                            "decision": "ACCEPT",
+                                            "confidence": 0.9,
+                                            "reason_code": "EVIDENCE_MATCHED",
+                                        },
+                                        {
+                                            "fact_index": 2,
+                                            "decision": "REJECT",
+                                            "confidence": 0.8,
+                                            "reason_code": "VALUE_MISMATCH",
+                                        },
+                                    ],
+                                    "confidence": 0.85,
+                                    "evidence_complete": True,
+                                }
+                            )
+                        }
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_NATIVE_STRUCTURED_OUTPUT=True),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.review_facts(payload)
+
+    assert result.value["decisions"][0]["source_file_id"] == "fil_reference"
+    assert result.value["decisions"][0]["location"]["paragraph_index"] == 1
+    assert result.value["decisions"][1]["field_key"] == "term"
+    assert result.value["decisions"][1]["decision"] == "REJECT"
+
+
 async def test_real_http_clients_do_not_read_environment_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -456,7 +510,7 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert "SemanticPlanResponse" in body["messages"][0]["content"]
+        assert "CompactSemanticPlanResponse" in body["messages"][0]["content"]
         return httpx.Response(
             200,
             json={
@@ -473,18 +527,7 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
                                             "display_name": "融资金额",
                                             "value_type": "MONEY",
                                             "aliases": [],
-                                            "fact_refs": [
-                                                {
-                                                    "fact_id": fact_id,
-                                                    "source_file_id": "fil_reference",
-                                                }
-                                            ],
-                                            "evidence_refs": [
-                                                {
-                                                    "source_file_id": "fil_reference",
-                                                    "location": {"paragraph_index": 1},
-                                                }
-                                            ],
+                                            "fact_ids": [fact_id],
                                             "confidence": 0.9,
                                         }
                                     ],
@@ -501,12 +544,6 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
                                                 },
                                                 "right": {"op": "literal", "value": "0"},
                                             },
-                                            "evidence_refs": [
-                                                {
-                                                    "source_file_id": "fil_reference",
-                                                    "location": {"paragraph_index": 1},
-                                                }
-                                            ],
                                             "confidence": 0.9,
                                         }
                                     ],
@@ -525,7 +562,22 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
         sleeper=no_sleep,
     )
     result = await client.plan_semantics(
-        {"file_id": "fil_reference", "documents": [], "mappings": {}}
+        {
+            "file_id": "fil_reference",
+            "documents": [
+                {
+                    "file_id": "fil_reference",
+                    "facts": [
+                        {
+                            "fact_id": fact_id,
+                            "source_file_id": "fil_reference",
+                            "location": {"paragraph_index": 1},
+                        }
+                    ],
+                }
+            ],
+            "mappings": {},
+        }
     )
 
     assert result.value["file_id"] == "fil_reference"
@@ -644,6 +696,107 @@ async def test_fact_batch_uses_compact_schema_without_program_owned_identity() -
     assert body["response_format"]["type"] == "json_schema"
     assert "evidence_text" not in json.dumps(result.value)
     assert "source_file_id" not in json.dumps(result.value)
+
+
+async def test_text_fact_prompt_requires_empty_json_object_when_no_fact_is_grounded() -> None:
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic_text",
+        "units": [
+            {
+                "unit_id": "unit_1",
+                "type": "PARAGRAPH",
+                "text": "本段不包含可可靠识别的非数值事实。",
+                "location": {"paragraph_index": 0},
+            }
+        ],
+        "readonly_context": [],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "{\"items\":[]}" in body["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"items": []}'},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.extract_text_facts(payload)
+
+    assert result.value == {"items": []}
+
+
+async def test_text_evidence_subcode_survives_malformed_correction() -> None:
+    unit_id = "unit_aaaaaaaa"
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic_text",
+        "units": [
+            {
+                "unit_id": unit_id,
+                "type": "PARAGRAPH",
+                "text": "保证人为甲方。",
+                "location": {"paragraph_index": 0},
+            }
+        ],
+        "readonly_context": [],
+    }
+    invalid_evidence = {
+        "items": [
+            {
+                "unit_id": unit_id,
+                "semantic_key": "guarantor",
+                "display_name": "保证人",
+                "value_type": "ENTITY",
+                "quote": "乙方",
+                "confidence": 0.9,
+            }
+        ]
+    }
+    responses = iter(
+        [json.dumps(invalid_evidence, ensure_ascii=False), "无法严格回查。"]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": next(responses)},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    with pytest.raises(LlmClientError) as caught:
+        await client.extract_text_facts(payload)
+
+    assert caught.value.code == "LLM_INVALID_JSON"
+    assert caught.value.failure_code == "FACT_QUOTE_NOT_GROUNDED"
+    assert caught.value.structure_retries == 1
 
 
 async def test_length_finish_reason_is_not_structure_corrected() -> None:

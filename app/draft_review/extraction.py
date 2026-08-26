@@ -20,7 +20,9 @@ from app.draft_review.checkpoints import ExtractionCheckpoint, ExtractionCheckpo
 from app.draft_review.facts import (
     NUMERIC_EXTRACTION_VERSION,
     TEXT_EXTRACTION_VERSION,
+    TEXT_FACT_VALUE_TYPES,
     EvidenceValidationError,
+    TextExtractionCandidate,
     build_document_overview_payload,
     build_fact_batch_payload,
     build_numeric_candidate_payload,
@@ -33,9 +35,14 @@ from app.draft_review.facts import (
     plan_document_batches,
     plan_numeric_document_batches,
     plan_simplified_document_batches,
+    plan_text_candidate_batches,
     plan_text_document_batches,
+    rehydrate_fact_evidence,
+    rehydrate_numeric_fact_evidence,
+    split_table_text_unit,
     stable_batch_id,
     stable_unit_id,
+    validate_extraction_evidence,
 )
 
 
@@ -71,6 +78,58 @@ def _payload_digest(payload: dict[str, Any]) -> str:
         ).encode("utf-8")
     ).hexdigest()[:24]
     return digest
+
+
+def _validate_fact_identity_set(facts: list[FactCandidate]) -> None:
+    """Reject conflicting values assigned to one fact identity."""
+
+    values_by_identity: dict[tuple[object, ...], str] = {}
+    for fact in facts:
+        identity = (
+            fact.field_key,
+            fact.source_file_id,
+            fact.value_type,
+            tuple(sorted(fact.location.model_dump(mode="json").items())),
+        )
+        value = fact.raw_value
+        previous = values_by_identity.get(identity)
+        if previous is not None and previous != value:
+            raise EvidenceValidationError(
+                "conflicting duplicate fact identity",
+                code="FACT_IDENTITY_CONFLICT",
+            )
+        values_by_identity[identity] = value
+
+
+def _validated_checkpoint_facts(
+    document: ParsedDocument,
+    profile: DocumentFactExtraction,
+    checkpoint_value: dict[str, Any],
+    chain: str,
+) -> list[FactCandidate] | None:
+    """Return only checkpoint values that still pass current Reduce guards."""
+
+    try:
+        facts = [FactCandidate.model_validate(item) for item in checkpoint_value.get("facts", [])]
+        if chain == "text":
+            facts = [fact for fact in facts if fact.value_type in TEXT_FACT_VALUE_TYPES]
+        facts = (
+            rehydrate_numeric_fact_evidence(document, facts)
+            if chain == "numeric"
+            else rehydrate_fact_evidence(document, facts)
+        )
+        _validate_fact_identity_set(facts)
+        validate_extraction_evidence(
+            document,
+            DocumentFactExtraction(
+                profile=profile.profile,
+                facts=facts,
+                missing_field_keys=[],
+            ),
+        )
+    except (TypeError, ValueError):
+        return None
+    return facts
 
 
 def _child_plan(
@@ -272,6 +331,7 @@ async def extract_documents_with_map_reduce(
                 "document_id": plan["document_id"],
                 "plan": plan,
                 "error_code": _error_code(exc),
+                "failure_code": getattr(exc, "failure_code", None),
                 "error": exc,
                 "request_attempts": getattr(exc, "request_attempts", 1) or 1,
                 "structure_retries": getattr(exc, "structure_retries", 0),
@@ -608,7 +668,7 @@ async def extract_documents_with_wave_map_reduce(
         )
 
     recovery_budget = {
-        file_id: max(2, (count * 20 + 99) // 100)
+        file_id: max(2, (count * 30 + 99) // 100)
         for file_id, count in per_document_plan_count.items()
     }
     planned_calls = len(initial_plans) * 2
@@ -629,6 +689,7 @@ async def extract_documents_with_wave_map_reduce(
     recovery_counts: Counter[str] = Counter()
     logical_calls = 0
     wave_count = 0
+
     format_evidence_streak = 0
 
     async def invoke(method_name: str, payload: dict[str, Any]) -> LlmResult:
@@ -877,6 +938,7 @@ async def extract_documents_with_independent_map_reduce(
     checkpoint_store: ExtractionCheckpointStore | None = None,
     task_id: str | None = None,
     source_task_id: str | None = None,
+    text_candidates_by_document: dict[str, list[TextExtractionCandidate]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Run profile, numeric and text extraction as independent Map–Reduce chains.
 
@@ -892,6 +954,29 @@ async def extract_documents_with_independent_map_reduce(
     logical_calls = 0
     document_logical_calls: Counter[str] = Counter()
     wave_count = 0
+
+    async def materialize_checkpoint(checkpoint: ExtractionCheckpoint) -> None:
+        """Copy an ancestor success into the current retry task."""
+
+        if (
+            checkpoint_store is not None
+            and task_id
+            and checkpoint.task_id
+            and checkpoint.task_id != task_id
+        ):
+            await checkpoint_store.save(
+                ExtractionCheckpoint(
+                    task_id=task_id,
+                    file_sha256=checkpoint.file_sha256,
+                    extraction_version=checkpoint.extraction_version,
+                    batch_id=checkpoint.batch_id,
+                    payload_digest=checkpoint.payload_digest,
+                    value=checkpoint.value,
+                    status="SUCCEEDED",
+                    model_name=checkpoint.model_name,
+                    source_task_id=checkpoint.task_id,
+                )
+            )
 
     async def profile_once(
         document: ParsedDocument,
@@ -916,6 +1001,7 @@ async def extract_documents_with_independent_map_reduce(
                 source_task_id=source_task_id,
             )
             if checkpoint is not None and checkpoint.value is not None:
+                await materialize_checkpoint(checkpoint)
                 profile_value = DocumentFactExtraction.model_validate(checkpoint.value)
                 return document.file_id, profile_value, {
                     "status": "SUCCEEDED",
@@ -979,12 +1065,26 @@ async def extract_documents_with_independent_map_reduce(
         chain = parent["chain"]
         version = NUMERIC_EXTRACTION_VERSION if chain == "numeric" else TEXT_EXTRACTION_VERSION
         batch_id = stable_batch_id(document.sha256, blocks, version)
+        context_map = parent.get("context_units_by_block_id", {})
         if chain == "numeric":
             payload = build_numeric_candidate_payload(document, blocks, batch_id=batch_id)
             count = len(payload["numeric_candidates"])
             estimate = min(settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000)
         else:
-            payload = build_text_fact_payload(document, blocks, batch_id=batch_id)
+            context_units: list[dict[str, Any]] = []
+            seen_context_ids: set[str] = set()
+            for block in blocks:
+                for item in context_map.get(block.block_id, []):
+                    context_id = str(item.get("context_id", ""))
+                    if context_id and context_id not in seen_context_ids:
+                        seen_context_ids.add(context_id)
+                        context_units.append(item)
+            payload = build_text_fact_payload(
+                document,
+                blocks,
+                batch_id=batch_id,
+                context_units=context_units,
+            )
             count = 0
             estimate = min(settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000)
         payload.update(
@@ -1009,6 +1109,11 @@ async def extract_documents_with_independent_map_reduce(
             "parent_batch_id": parent["batch_id"],
             "planned_batch_count": parent.get("planned_batch_count", 0),
             "extraction_version": version,
+            "context_units_by_block_id": {
+                block.block_id: context_map.get(block.block_id, [])
+                for block in blocks
+                if context_map.get(block.block_id)
+            },
         }
 
     initial_by_chain: dict[str, list[dict[str, Any]]] = {"numeric": [], "text": []}
@@ -1024,14 +1129,37 @@ async def extract_documents_with_independent_map_reduce(
                 settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
             ),
         )
-        text_plans = plan_text_document_batches(
-            document,
-            max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-            max_text_units=min(getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 32), 32),
-            estimated_output_token_limit=min(
-                settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
-            ),
-        )
+        if text_candidates_by_document is not None and document.role == "TARGET":
+            text_plans = plan_text_candidate_batches(
+                document,
+                text_candidates_by_document.get(document.file_id, []),
+                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                max_candidates=min(
+                    getattr(settings, "LLM_EXTRACTION_MAX_TEXT_CANDIDATES", 8), 4
+                ),
+                estimated_output_token_limit=min(
+                    settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+                ),
+            )
+        else:
+            # Auxiliary documents are open-ended and showed saturation and
+            # cross-unit quote failures at wider batches in the real runs.
+            # Keep the public planning ceiling at 16, but use a safer effective
+            # wave unit count for the
+            # independent text chain; target candidates remain governed by
+            # the separate candidate limit.
+            effective_text_units = min(
+                getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 16),
+                1 if document.role != "TARGET" else 16,
+            )
+            text_plans = plan_text_document_batches(
+                document,
+                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                max_text_units=effective_text_units,
+                estimated_output_token_limit=min(
+                    settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+                ),
+            )
         for chain, plans in (("numeric", numeric_plans), ("text", text_plans)):
             per_document_chain_count[(document.file_id, chain)] = len(plans)
             for plan in plans:
@@ -1046,8 +1174,11 @@ async def extract_documents_with_independent_map_reduce(
                 )
                 initial_by_chain[chain].append(plan)
 
-    async def invoke_plan(plan: dict[str, Any]) -> dict[str, Any]:
-        nonlocal logical_calls
+    async def load_checkpoint_outcome(
+        plan: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Load and validate one successful checkpoint, if it is reusable."""
+
         payload = plan["payload"]
         digest = _payload_digest(payload)
         if checkpoint_store is not None:
@@ -1060,24 +1191,37 @@ async def extract_documents_with_independent_map_reduce(
                 source_task_id=source_task_id,
             )
             if checkpoint is not None and checkpoint.value is not None:
-                facts = [
-                    FactCandidate.model_validate(item)
-                    for item in checkpoint.value.get("facts", [])
-                ]
-                return {
-                    "status": "SUCCEEDED",
-                    "batch_id": plan["batch_id"],
-                    "document_id": plan["document_id"],
-                    "chain": plan["chain"],
-                    "plan": plan,
-                    "facts": facts,
-                    "checkpoint_reused": True,
-                    "configured_model": checkpoint.model_name,
-                    "actual_model": None,
-                    "duration_ms": 0,
-                    "request_attempts": 0,
-                    "structure_retries": 0,
-                }
+                facts = _validated_checkpoint_facts(
+                    documents_by_id[plan["document_id"]],
+                    profiles[plan["document_id"]],
+                    checkpoint.value,
+                    plan["chain"],
+                )
+                if facts is not None:
+                    await materialize_checkpoint(checkpoint)
+                    return {
+                        "status": "SUCCEEDED",
+                        "batch_id": plan["batch_id"],
+                        "document_id": plan["document_id"],
+                        "chain": plan["chain"],
+                        "plan": plan,
+                        "facts": facts,
+                        "checkpoint_reused": True,
+                        "configured_model": checkpoint.model_name,
+                        "actual_model": None,
+                        "duration_ms": 0,
+                        "request_attempts": 0,
+                        "structure_retries": 0,
+                    }
+        return None
+
+    async def invoke_plan(plan: dict[str, Any]) -> dict[str, Any]:
+        nonlocal logical_calls
+        payload = plan["payload"]
+        digest = _payload_digest(payload)
+        checkpoint_outcome = await load_checkpoint_outcome(plan)
+        if checkpoint_outcome is not None:
+            return checkpoint_outcome
         if (
             logical_calls >= settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL
             or document_logical_calls[plan["document_id"]]
@@ -1099,6 +1243,10 @@ async def extract_documents_with_independent_map_reduce(
                 if plan["chain"] == "numeric":
                     result = await llm.extract_numeric_candidates(payload)
                     facts, _classified = expand_numeric_candidate_response(payload, result.value)
+                    facts = rehydrate_numeric_fact_evidence(
+                        documents_by_id[plan["document_id"]], facts
+                    )
+                    _validate_fact_identity_set(facts)
                 else:
                     try:
                         result = await llm.extract_text_facts(
@@ -1110,6 +1258,10 @@ async def extract_documents_with_independent_map_reduce(
                             raise
                         result = await llm.extract_text_facts(payload)
                     facts = expand_text_fact_response(payload, result.value)
+                    facts = rehydrate_fact_evidence(
+                        documents_by_id[plan["document_id"]], facts
+                    )
+                    _validate_fact_identity_set(facts)
             if checkpoint_store is not None:
                 await checkpoint_store.save(
                     ExtractionCheckpoint(
@@ -1150,6 +1302,7 @@ async def extract_documents_with_independent_map_reduce(
                 "chain": plan["chain"],
                 "plan": plan,
                 "error_code": _error_code(exc),
+                "failure_code": getattr(exc, "failure_code", None),
                 "error": exc,
                 "checkpoint_reused": False,
                 "request_attempts": getattr(exc, "request_attempts", 1) or 1,
@@ -1181,16 +1334,77 @@ async def extract_documents_with_independent_map_reduce(
         if not initial:
             return {}, {"planned": 0, "recovery": 0, "first_wave_success_rate": 1.0}
         recovery_budget = {
-            document_id: max(2, (count * 20 + 99) // 100)
+            document_id: max(2, (count * 30 + 99) // 100)
             for (document_id, plan_chain), count in per_document_chain_count.items()
             if plan_chain == chain
         }
-        pending = list(initial)
+        pending: list[dict[str, Any]] = []
         all_outcomes: dict[str, dict[str, Any]] = {}
         superseded: set[str] = set()
         recovery_counts: Counter[str] = Counter()
         first_wave: list[dict[str, Any]] = []
         nonrecoverable_streak = 0
+
+        def recovery_groups(plan: dict[str, Any], failure_code: str) -> list[list[DocumentBlock]]:
+            blocks = plan["blocks"]
+            if len(blocks) > 1:
+                midpoint = len(blocks) // 2
+                return [blocks[:midpoint], blocks[midpoint:]]
+            if chain in {"numeric", "text"} and failure_code in {
+                "FACT_BATCH_SATURATED",
+                "FACT_UNIT_NOT_FOUND",
+                "FACT_QUOTE_NOT_GROUNDED",
+                "FACT_IDENTITY_DUPLICATED",
+                "FACT_IDENTITY_CONFLICT",
+                "FACT_VALUE_NOT_GROUNDED",
+            }:
+                cell_units = split_table_text_unit(blocks[0])
+                if len(cell_units) > 1:
+                    return [[unit] for unit in cell_units]
+            return []
+
+        # A prior task may have failed a table-row parent after its column
+        # children were already completed.  Reuse the complete child set
+        # before dispatching the known-failing parent again.  This is
+        # especially important for auxiliary tables: the parent row is the
+        # planning unit, but the column children are the durable recovery
+        # units.  Partial child availability falls back to the normal parent
+        # path so coverage is never silently reduced.
+        for plan in initial:
+            precovery_groups = (
+                [[unit] for unit in split_table_text_unit(plan["blocks"][0])]
+                if chain == "text" and len(plan["blocks"]) == 1
+                else []
+            )
+            if checkpoint_store is None or len(precovery_groups) <= 1:
+                pending.append(plan)
+                continue
+            document = documents_by_id[plan["document_id"]]
+            child_plans = [
+                make_child_plan(document, plan, child_blocks)
+                for child_blocks in precovery_groups
+            ]
+            child_outcomes = [
+                await load_checkpoint_outcome(child_plan) for child_plan in child_plans
+            ]
+            if all(outcome is not None for outcome in child_outcomes):
+                for outcome in child_outcomes:
+                    assert outcome is not None
+                    all_outcomes[outcome["batch_id"]] = outcome
+                all_outcomes[plan["batch_id"]] = {
+                    "status": "SUPERSEDED",
+                    "batch_id": plan["batch_id"],
+                    "document_id": plan["document_id"],
+                    "chain": plan["chain"],
+                    "plan": plan,
+                    "facts": [],
+                    "checkpoint_reused": False,
+                }
+                superseded.add(plan["batch_id"])
+                recovery_counts[plan["document_id"]] += 1
+                continue
+            pending.append(plan)
+
         while pending:
             wave_count += 1
             wave = pending[: settings.LLM_EXTRACTION_WAVE_SIZE]
@@ -1208,16 +1422,20 @@ async def extract_documents_with_independent_map_reduce(
                     nonrecoverable_streak = 0
                     continue
                 code = outcome.get("error_code", "LLM_EXTRACTION_FAILED")
+                failure_code = outcome.get("failure_code") or code
                 plan = outcome["plan"]
+                child_groups = recovery_groups(plan, failure_code)
                 recoverable = (
-                    len(plan["blocks"]) > 1
+                    bool(child_groups)
                     and int(plan.get("depth", 0)) < settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
-                    and code
+                    and failure_code
                     in {
                         "FACT_BATCH_SATURATED",
                         "FACT_UNIT_NOT_FOUND",
                         "FACT_QUOTE_NOT_GROUNDED",
                         "FACT_IDENTITY_DUPLICATED",
+                        "FACT_IDENTITY_CONFLICT",
+                        "FACT_VALUE_NOT_GROUNDED",
                         "LLM_OUTPUT_TRUNCATED",
                         "LLM_INVALID_JSON",
                         "LLM_SCHEMA_INVALID",
@@ -1227,27 +1445,25 @@ async def extract_documents_with_independent_map_reduce(
                     }
                 )
                 if recoverable:
-                    midpoint = len(plan["blocks"]) // 2
-                    if midpoint <= 0:
-                        recoverable = False
-                    else:
-                        document = documents_by_id[plan["document_id"]]
-                        children = [
-                            *children,
-                            make_child_plan(document, plan, plan["blocks"][:midpoint]),
-                            make_child_plan(document, plan, plan["blocks"][midpoint:]),
-                        ]
-                        recovery_counts[plan["document_id"]] += 1
-                        if (
-                            recovery_counts[plan["document_id"]]
-                            > recovery_budget[plan["document_id"]]
-                        ):
-                            raise WorkflowError(
-                                "DYNAMIC_CHECK_INCOMPLETE", "事实抽取恢复预算已用尽"
-                            )
-                        superseded.add(plan["batch_id"])
-                        continue
-                if code in {
+                    document = documents_by_id[plan["document_id"]]
+                    children = [
+                        *children,
+                        *[
+                            make_child_plan(document, plan, child_blocks)
+                            for child_blocks in child_groups
+                        ],
+                    ]
+                    recovery_counts[plan["document_id"]] += 1
+                    if (
+                        recovery_counts[plan["document_id"]]
+                        > recovery_budget[plan["document_id"]]
+                    ):
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE", "事实抽取恢复预算已用尽"
+                        )
+                    superseded.add(plan["batch_id"])
+                    continue
+                if failure_code in {
                     "LLM_INVALID_JSON",
                     "LLM_SCHEMA_INVALID",
                     "FACT_UNIT_NOT_FOUND",
@@ -1277,12 +1493,29 @@ async def extract_documents_with_independent_map_reduce(
             if plan_chain != chain:
                 continue
             document = documents_by_id[file_id]
-            expected = {
+            expected: set[str] = {
                 unit_id
                 for plan in initial
                 if plan["document_id"] == document.file_id
                 for unit_id in plan["unit_ids"]
             }
+            # A recovered table row may be partitioned into column units when
+            # merged-cell text makes the row quote ambiguous.  Replace the
+            # superseded row identity with its child identities before the
+            # final coverage check; ordinary paragraph/row bisection keeps the
+            # same unit IDs and therefore needs no special treatment.
+            for batch_id in superseded:
+                parent = all_outcomes.get(batch_id)
+                if parent is None or parent["document_id"] != document.file_id:
+                    continue
+                expected.difference_update(parent["plan"]["unit_ids"])
+                expected.update(
+                    unit_id
+                    for child in all_outcomes.values()
+                    if child["document_id"] == document.file_id
+                    and child["plan"].get("parent_batch_id") == batch_id
+                    for unit_id in child["plan"]["unit_ids"]
+                )
             actual: set[str] = set()
             for outcome in by_document.get(document.file_id, []):
                 unit_ids = set(outcome["plan"]["unit_ids"])
@@ -1296,6 +1529,8 @@ async def extract_documents_with_independent_map_reduce(
             "FACT_UNIT_NOT_FOUND",
             "FACT_QUOTE_NOT_GROUNDED",
             "FACT_IDENTITY_DUPLICATED",
+            "FACT_IDENTITY_CONFLICT",
+            "FACT_VALUE_NOT_GROUNDED",
             "LLM_OUTPUT_TRUNCATED",
             "LLM_INVALID_JSON",
             "LLM_SCHEMA_INVALID",
@@ -1305,11 +1540,12 @@ async def extract_documents_with_independent_map_reduce(
         }
 
         def is_recoverable_first_wave(item: dict[str, Any]) -> bool:
+            failure_code = item.get("failure_code") or item.get("error_code")
             return (
                 item.get("status") == "FAILED"
-                and len(item["plan"]["blocks"]) > 1
+                and bool(recovery_groups(item["plan"], failure_code))
                 and int(item["plan"].get("depth", 0)) < settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
-                and item.get("error_code") in recoverable_codes
+                and failure_code in recoverable_codes
             )
 
         denominator = sum(not is_recoverable_first_wave(item) for item in first_wave)

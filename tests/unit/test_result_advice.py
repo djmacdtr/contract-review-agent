@@ -78,7 +78,7 @@ def test_fallback_advice_uses_current_change_file_and_business_location() -> Non
     assert "passed_checks" not in payload
 
 
-def test_advice_payload_excludes_risks_without_customer_diff_evidence() -> None:
+def test_advice_payload_includes_every_formal_risk() -> None:
     result = result_fixture()
     result["risk_items"].append(
         {
@@ -91,7 +91,8 @@ def test_advice_payload_excludes_risks_without_customer_diff_evidence() -> None:
     )
 
     assert [item["risk_id"] for item in advice_payload(result)["risk_items"]] == [
-        "risk_000001"
+        "risk_000001",
+        "risk_internal_rule",
     ]
 
 

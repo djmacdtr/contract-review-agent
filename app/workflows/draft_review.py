@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, TypedDict
 
 import structlog
@@ -7,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
-from app.adapters.llm.base import ContractLlmClient
+from app.adapters.llm.base import ContractLlmClient, LlmResult
 from app.adapters.llm.openai_client import (
     LlmClientError,
     OpenAIContractLlmClient,
@@ -20,7 +21,9 @@ from app.adapters.llm.schemas import (
     FactMappingResponse,
     FactMappingReview,
     FactReview,
+    SemanticConceptPlan,
     SemanticPlanResponse,
+    SemanticValidationSpec,
 )
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
@@ -28,17 +31,20 @@ from app.core.errors import WorkflowError
 from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
+from app.draft_review.checkpoints import ExtractionCheckpoint
 from app.draft_review.extraction import (
     extract_documents_with_independent_map_reduce,
     extract_documents_with_map_reduce,
 )
 from app.draft_review.facts import (
+    FACT_REVIEW_CHECKPOINT_VERSION,
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
     EvidenceValidationError,
     accepted_fact_refs,
     build_fact_index,
     build_fact_matrix,
     build_fact_review_batches,
+    build_template_text_candidates,
     chunk_document,
     compact_extraction_payload,
     extraction_payload_chars,
@@ -49,7 +55,9 @@ from app.draft_review.facts import (
     merge_chunk_extractions,
     merge_fact_review_batches,
     project_semantic_plan,
+    review_payload_digest,
     stable_fact_id,
+    stable_review_batch_id,
     target_fact_catalog,
     validate_semantic_plan,
 )
@@ -71,6 +79,224 @@ from app.workflows.types import WorkflowOutput
 DRAFT_REVIEW_WORKFLOW_VERSION = "0.7.0"
 DRAFT_REVIEW_RULES_VERSION = "0.6.0"
 logger = structlog.get_logger(__name__)
+
+
+def _compact_semantic_fact(fact: dict[str, Any]) -> dict[str, Any]:
+    """Keep semantic planning inputs bounded without removing identity/value."""
+
+    return {
+        key: fact[key]
+        for key in (
+            "fact_id",
+            "source_file_id",
+            "field_key",
+            "concept_id",
+            "display_name",
+            "value_type",
+            "raw_value",
+            "location",
+            "confidence",
+        )
+        if key in fact
+    }
+
+
+def _build_semantic_plan_payloads(
+    payload: dict[str, Any],
+    *,
+    fact_batch_size: int,
+) -> list[dict[str, Any]]:
+    """Split semantic planning by target facts while retaining linked sources.
+
+    The target facts are the planning focus.  Reference facts remain available
+    in each batch because a mapped target fact may need a cross-document rule.
+    Only accepted mappings whose target is in the current focus are repeated.
+    This bounds generated plan size without changing the public extraction
+    result or allowing a batch to reference an omitted fact.
+    """
+
+    primary_file_id = str(payload["file_id"])
+    documents = payload.get("documents", [])
+    primary_document = next(
+        (
+            document
+            for document in documents
+            if isinstance(document, dict) and document.get("file_id") == primary_file_id
+        ),
+        None,
+    )
+    if primary_document is None:
+        return [payload]
+    target_facts = [
+        _compact_semantic_fact(fact)
+        for fact in primary_document.get("facts", [])
+        if isinstance(fact, dict)
+    ]
+    if not target_facts:
+        return [payload]
+    if fact_batch_size < 1:
+        raise ValueError("semantic fact batch size must be positive")
+
+    accepted_mappings = [
+        mapping
+        for mapping in payload.get("accepted_mappings", [])
+        if isinstance(mapping, dict)
+    ]
+    batches: list[dict[str, Any]] = []
+    for start in range(0, len(target_facts), fact_batch_size):
+        target_batch = target_facts[start : start + fact_batch_size]
+        target_ids = {
+            str(fact.get("fact_id"))
+            for fact in target_batch
+            if fact.get("fact_id")
+        }
+        batch_mappings = [
+            mapping
+            for mapping in accepted_mappings
+            if mapping.get("target", {}).get("fact_id") in target_ids
+        ]
+        linked_reference_ids = {
+            mapping.get("reference", {}).get("fact_id")
+            for mapping in batch_mappings
+            if mapping.get("reference", {}).get("fact_id")
+        }
+        batch_documents: list[dict[str, Any]] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+            facts = (
+                target_batch
+                if document.get("file_id") == primary_file_id
+                else [
+                    _compact_semantic_fact(fact)
+                    for fact in document.get("facts", [])
+                    if isinstance(fact, dict)
+                    and fact.get("fact_id") in linked_reference_ids
+                ]
+            )
+            batch_documents.append(
+                {
+                    key: value
+                    for key, value in {
+                        "file_id": document.get("file_id"),
+                        "role": document.get("role"),
+                        "profile": document.get("profile"),
+                        "facts": facts,
+                    }.items()
+                    if value is not None
+                }
+            )
+        batches.append(
+            {
+                **payload,
+                "documents": batch_documents,
+                "accepted_mappings": batch_mappings,
+                "semantic_requirements": {
+                    **payload.get("semantic_requirements", {}),
+                    "planning_scope": {
+                        "target_fact_count": len(target_batch),
+                        "target_fact_batch_start": start + 1,
+                        "target_fact_batch_end": start + len(target_batch),
+                        "only_emit_plans_for_target_batch": True,
+                    },
+                },
+            }
+        )
+    return batches
+
+
+def _merge_semantic_plan_parts(
+    parts: list[SemanticPlanResponse],
+    *,
+    primary_file_id: str,
+) -> SemanticPlanResponse:
+    """Reduce split semantic plans with strict identity/conflict checks."""
+
+    if not parts:
+        raise EvidenceValidationError("semantic plan returned no parts")
+    if any(part.file_id != primary_file_id for part in parts):
+        raise EvidenceValidationError("semantic plan file_id does not match primary document")
+
+    concepts: dict[str, SemanticConceptPlan] = {}
+    specs: dict[str, SemanticValidationSpec] = {}
+    for part in parts:
+        for concept in part.semantic_concepts:
+            existing = concepts.get(concept.concept_id)
+            if existing is None:
+                concepts[concept.concept_id] = concept
+                continue
+            if (
+                existing.display_name != concept.display_name
+                or existing.value_type != concept.value_type
+            ):
+                raise EvidenceValidationError(
+                    "semantic concept identity conflict",
+                    code="FACT_IDENTITY_CONFLICT",
+                )
+            fact_refs = [item.model_dump(mode="json") for item in existing.fact_refs]
+            fact_ref_keys = {
+                (item.fact_id, item.source_file_id) for item in existing.fact_refs
+            }
+            for item in concept.fact_refs:
+                if (item.fact_id, item.source_file_id) not in fact_ref_keys:
+                    fact_refs.append(item.model_dump(mode="json"))
+                    fact_ref_keys.add((item.fact_id, item.source_file_id))
+            evidence_refs = [
+                item.model_dump(mode="json") for item in existing.evidence_refs
+            ]
+            evidence_keys = {
+                (item.source_file_id, location_key(item.location))
+                for item in existing.evidence_refs
+            }
+            for item in concept.evidence_refs:
+                key = (item.source_file_id, location_key(item.location))
+                if key not in evidence_keys:
+                    evidence_refs.append(item.model_dump(mode="json"))
+                    evidence_keys.add(key)
+            aliases = list(dict.fromkeys([*existing.aliases, *concept.aliases]))
+            concepts[concept.concept_id] = SemanticConceptPlan.model_validate(
+                {
+                    **existing.model_dump(mode="json"),
+                    "aliases": aliases,
+                    "fact_refs": fact_refs,
+                    "evidence_refs": evidence_refs,
+                    "confidence": max(existing.confidence, concept.confidence),
+                }
+            )
+        for spec in part.validation_specs:
+            existing = specs.get(spec.validation_id)
+            if existing is None:
+                specs[spec.validation_id] = spec
+                continue
+            if existing.expression != spec.expression:
+                raise EvidenceValidationError(
+                    "semantic validation identity conflict",
+                    code="FACT_IDENTITY_CONFLICT",
+                )
+            evidence_refs = [
+                item.model_dump(mode="json") for item in existing.evidence_refs
+            ]
+            evidence_keys = {
+                (item.source_file_id, location_key(item.location))
+                for item in existing.evidence_refs
+            }
+            for item in spec.evidence_refs:
+                key = (item.source_file_id, location_key(item.location))
+                if key not in evidence_keys:
+                    evidence_refs.append(item.model_dump(mode="json"))
+                    evidence_keys.add(key)
+            specs[spec.validation_id] = SemanticValidationSpec.model_validate(
+                {
+                    **existing.model_dump(mode="json"),
+                    "evidence_refs": evidence_refs,
+                    "confidence": max(existing.confidence, spec.confidence),
+                }
+            )
+    return SemanticPlanResponse(
+        file_id=primary_file_id,
+        semantic_concepts=list(concepts.values()),
+        validation_specs=list(specs.values()),
+    )
 
 
 def _dynamic_failure_code(exc: BaseException) -> str:
@@ -229,6 +455,13 @@ class DraftReviewWorkflowExecutor:
                             checkpoint_store=self.checkpoint_store,
                             task_id=state.get("task_id"),
                             source_task_id=state.get("options", {}).get("source_task_id"),
+                            text_candidates_by_document={
+                                document.file_id: build_template_text_candidates(
+                                    state["template_review"], document
+                                )
+                                for document in state["parsed_documents"]
+                                if document.role == "TARGET"
+                            },
                         )
                     )
                     # The remainder of this node (fact review and its
@@ -238,6 +471,100 @@ class DraftReviewWorkflowExecutor:
                     reviews: dict[str, dict[str, Any]] = {}
                     review_method = getattr(self.llm, "review_facts", None)
                     if review_method is not None:
+                        source_task_id = state.get("options", {}).get("source_task_id")
+                        task_id = state.get("task_id")
+
+                        async def review_one(
+                            document: ParsedDocument,
+                            review_payload: dict[str, Any],
+                        ) -> tuple[dict[str, Any], FactReview, LlmResult]:
+                            batch_id = stable_review_batch_id(document, review_payload)
+                            payload_digest = review_payload_digest(review_payload)
+                            checkpoint = None
+                            if self.checkpoint_store is not None:
+                                checkpoint = await self.checkpoint_store.load(
+                                    batch_id,
+                                    task_id=task_id,
+                                    source_task_id=source_task_id,
+                                    file_sha256=document.sha256,
+                                    extraction_version=FACT_REVIEW_CHECKPOINT_VERSION,
+                                    payload_digest=payload_digest,
+                                )
+                            if checkpoint is not None and checkpoint.value is not None:
+                                review = FactReview.model_validate(checkpoint.value)
+                                if (
+                                    task_id
+                                    and checkpoint.task_id
+                                    and checkpoint.task_id != task_id
+                                ):
+                                    await self.checkpoint_store.save(
+                                        ExtractionCheckpoint(
+                                            task_id=task_id,
+                                            file_sha256=checkpoint.file_sha256,
+                                            extraction_version=checkpoint.extraction_version,
+                                            batch_id=checkpoint.batch_id,
+                                            payload_digest=checkpoint.payload_digest,
+                                            value=checkpoint.value,
+                                            status="SUCCEEDED",
+                                            model_name=checkpoint.model_name,
+                                            source_task_id=checkpoint.task_id,
+                                        )
+                                    )
+                                return (
+                                    review_payload,
+                                    review,
+                                    LlmResult(
+                                        value=review.model_dump(mode="json"),
+                                        configured_model=checkpoint.model_name or "CHECKPOINT",
+                                        actual_model=None,
+                                        mock=False,
+                                    ),
+                                )
+                            result = await review_method(review_payload)
+                            review = FactReview.model_validate(result.value)
+                            if self.checkpoint_store is not None:
+                                await self.checkpoint_store.save(
+                                    ExtractionCheckpoint(
+                                        task_id=task_id,
+                                        file_sha256=document.sha256,
+                                        extraction_version=FACT_REVIEW_CHECKPOINT_VERSION,
+                                        batch_id=batch_id,
+                                        payload_digest=payload_digest,
+                                        value=review.model_dump(mode="json"),
+                                        status="SUCCEEDED",
+                                        model_name=result.configured_model,
+                                        source_task_id=source_task_id,
+                                    )
+                                )
+                            return review_payload, review, result
+
+                        async def review_all(
+                            document: ParsedDocument,
+                            review_payloads: list[dict[str, Any]],
+                        ) -> list[tuple[dict[str, Any], FactReview, LlmResult]]:
+                            semaphore = asyncio.Semaphore(
+                                self.settings.LLM_EXTRACTION_TASK_CONCURRENCY
+                            )
+
+                            async def bounded_review(
+                                review_payload: dict[str, Any],
+                            ) -> tuple[dict[str, Any], FactReview, LlmResult]:
+                                async with semaphore:
+                                    return await review_one(document, review_payload)
+
+                            tasks = [
+                                asyncio.create_task(bounded_review(review_payload))
+                                for review_payload in review_payloads
+                            ]
+                            try:
+                                return list(await asyncio.gather(*tasks))
+                            except BaseException:
+                                for task in tasks:
+                                    if not task.done():
+                                        task.cancel()
+                                await asyncio.gather(*tasks, return_exceptions=True)
+                                raise
+
                         for document in state["parsed_documents"]:
                             if document.role == "TEMPLATE":
                                 continue
@@ -256,9 +583,8 @@ class DraftReviewWorkflowExecutor:
                             review_duration_ms = 0
                             review_request_attempts = 0
                             review_structure_retries = 0
-                            for review_payload in review_payloads:
-                                review_result = await review_method(review_payload)
-                                review = FactReview.model_validate(review_result.value)
+                            review_results = await review_all(document, review_payloads)
+                            for review_payload, review, review_result in review_results:
                                 reviewed_batches.append((review_payload, review))
                                 if review_result.configured_model:
                                     configured_models.add(review_result.configured_model)
@@ -835,15 +1161,61 @@ class DraftReviewWorkflowExecutor:
                 },
             }
             try:
-                result = await self.llm.plan_semantics(payload)
-                plan = SemanticPlanResponse.model_validate(result.value)
-                validate_semantic_plan(
-                    primary_file_id=primary.file_id,
-                    documents_by_file=documents_by_file,
-                    plan=plan,
-                    fact_index=fact_index,
-                    accepted_refs=accepted_refs,
+                semantic_payloads = _build_semantic_plan_payloads(
+                    payload,
+                    fact_batch_size=self.settings.LLM_SEMANTIC_FACT_BATCH_SIZE,
                 )
+                semantic_semaphore = asyncio.Semaphore(
+                    self.settings.LLM_EXTRACTION_TASK_CONCURRENCY
+                )
+
+                async def run_semantic_batch(
+                    semantic_payload: dict[str, Any],
+                ) -> tuple[SemanticPlanResponse, Any]:
+                    async with semantic_semaphore:
+                        semantic_result = await self.llm.plan_semantics(semantic_payload)
+                    plan_part = SemanticPlanResponse.model_validate(semantic_result.value)
+                    validate_semantic_plan(
+                        primary_file_id=primary.file_id,
+                        documents_by_file=documents_by_file,
+                        plan=plan_part,
+                        fact_index=fact_index,
+                        accepted_refs=accepted_refs,
+                    )
+                    return plan_part, semantic_result
+
+                semantic_tasks = [
+                    asyncio.create_task(run_semantic_batch(semantic_payload))
+                    for semantic_payload in semantic_payloads
+                ]
+                try:
+                    semantic_parts = await asyncio.gather(*semantic_tasks)
+                except BaseException:
+                    for task in semantic_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*semantic_tasks, return_exceptions=True)
+                    raise
+                plan_parts = [part for part, _result in semantic_parts]
+                semantic_results = [result for _part, result in semantic_parts]
+                plan = _merge_semantic_plan_parts(
+                    plan_parts,
+                    primary_file_id=primary.file_id,
+                )
+                configured_models = {
+                    result.configured_model
+                    for result in semantic_results
+                    if result.configured_model
+                }
+                actual_models = {
+                    result.actual_model
+                    for result in semantic_results
+                    if result.actual_model
+                }
+                if len(configured_models) > 1 or len(actual_models) > 1:
+                    raise EvidenceValidationError(
+                        "semantic planning model identity changed between batches"
+                    )
                 projected_concepts, projected_specs = project_semantic_plan(plan)
                 updated_extractions = dict(state.get("llm_extractions", {}))
                 existing = DocumentFactExtraction.model_validate(
@@ -861,11 +1233,18 @@ class DraftReviewWorkflowExecutor:
                 plans = {
                     primary.file_id: {
                         "value": plan.model_dump(mode="json"),
-                        "configured_model": result.configured_model,
-                        "actual_model": result.actual_model,
-                        "duration_ms": result.duration_ms,
-                        "request_attempts": result.request_attempts,
-                        "structure_retries": result.structure_retries,
+                        "configured_model": next(iter(configured_models), None),
+                        "actual_model": next(iter(actual_models), None),
+                        "duration_ms": sum(
+                            result.duration_ms for result in semantic_results
+                        ),
+                        "request_attempts": sum(
+                            result.request_attempts for result in semantic_results
+                        ),
+                        "structure_retries": sum(
+                            result.structure_retries for result in semantic_results
+                        ),
+                        "batch_count": len(semantic_payloads),
                         "verification_mode": (
                             "SAME_MODEL_DIAGNOSTIC"
                             if self.settings.LLM_SAME_MODEL_DIAGNOSTIC
@@ -951,8 +1330,14 @@ class DraftReviewWorkflowExecutor:
         graph.add_edge("parse_documents", "compare_template")
         graph.add_edge("compare_template", "extract_facts")
         graph.add_edge("extract_facts", "map_cross_document_facts")
-        graph.add_edge("map_cross_document_facts", "plan_semantics")
-        graph.add_edge("plan_semantics", "build_result")
+        if self.settings.LLM_SEMANTIC_PLAN_ENABLED:
+            graph.add_edge("map_cross_document_facts", "plan_semantics")
+            graph.add_edge("plan_semantics", "build_result")
+        else:
+            # Delivery mode publishes only independently reviewed mappings and
+            # deterministic fact comparisons. Semantic planning remains
+            # available behind its internal configuration switch.
+            graph.add_edge("map_cross_document_facts", "build_result")
         graph.add_edge("build_result", "generate_advice")
         graph.add_edge("generate_advice", "persist_result")
         graph.add_edge("persist_result", END)
@@ -1148,7 +1533,10 @@ class DraftReviewWorkflowExecutor:
                         (fact.field_key, fact.source_file_id, location_key(fact.location))
                         for fact in extractions_by_file[document.file_id].facts
                     )
-                validation_specs.extend(extractions_by_file[document.file_id].validation_specs)
+                if self.settings.LLM_SEMANTIC_PLAN_ENABLED:
+                    validation_specs.extend(
+                        extractions_by_file[document.file_id].validation_specs
+                    )
                 model_runs.append(
                     {
                         "file_id": document.file_id,
@@ -1370,30 +1758,85 @@ class DraftReviewWorkflowExecutor:
         fact_risks, fact_reviews, fact_passed = fact_matrix_result_items(
             fact_matrix,
             include_conflicts=False,
+            # Accepted missing requirements are formal risks. An unaccepted
+            # mapping is excluded from formal conclusions: it cannot become a
+            # risk or a pass, and does not erase accepted mapping evidence.
             include_uncertain=False,
+            include_required_missing=True,
         )
         if review_enforced:
             reviewed_keys = consensus_fields
-            target_ids = {
-                document.file_id for document in documents if document.role == "TARGET"
+            mapped_target_fact_ids = {
+                str(record["target_fact_id"])
+                for record in mapping_records
+                if record.get("target_fact_id")
             }
-            for file_id, extraction in extractions_by_file.items():
-                if file_id not in target_ids:
+            mapped_reference_keys = {
+                (
+                    str(record["source_file_id"]),
+                    str(record["reference_field_key"]),
+                    location_key(record["reference_location"]),
+                )
+                for record in mapping_records
+                if all(
+                    record.get(key)
+                    for key in (
+                        "source_file_id",
+                        "reference_field_key",
+                        "reference_location",
+                    )
+                )
+            }
+            for item in fact_matrix:
+                if item.get("target_fact_id") not in mapped_target_fact_ids:
                     continue
+                target_candidate = item.get("target_candidate") or {}
+                target_key = (
+                    target_candidate.get("field_key"),
+                    target_candidate.get("source_file_id"),
+                    location_key(target_candidate.get("location") or {}),
+                )
+                if target_key not in reviewed_keys:
+                    fact_reviews.append(
+                        {
+                            "review_id": f"review_fact_consensus_{item['target_fact_id']}",
+                            "module_code": "FACT_CONSISTENCY",
+                            "reason_code": "FACT_CONSENSUS_UNCERTAIN",
+                            "title": f"{item['display_name']}需要双模型复核",
+                            "description": "用于跨资料映射的事实未通过独立评审共识门。",
+                            "source_evidence": [
+                                {
+                                    "file_id": target_candidate.get("source_file_id"),
+                                    "text": target_candidate.get("evidence_text"),
+                                    "location": target_candidate.get("location"),
+                                }
+                            ],
+                            "related_diff_ids": [],
+                            "requires_manual_action": True,
+                        }
+                    )
+            for extraction in extractions_by_file.values():
                 for fact in extraction.facts:
-                    key = (fact.field_key, fact.source_file_id, location_key(fact.location))
-                    if key not in reviewed_keys:
+                    reference_key = (
+                        fact.source_file_id,
+                        fact.field_key,
+                        location_key(fact.location),
+                    )
+                    fact_key = (fact.field_key, fact.source_file_id, location_key(fact.location))
+                    if (
+                        reference_key in mapped_reference_keys
+                        and fact_key not in reviewed_keys
+                    ):
                         fact_reviews.append(
                             {
                                 "review_id": (
-                                    f"review_fact_consensus_{fact.field_key}_{fact.source_file_id}"
+                                    "review_fact_consensus_"
+                                    f"{fact.field_key}_{fact.source_file_id}"
                                 ),
                                 "module_code": "FACT_CONSISTENCY",
                                 "reason_code": "FACT_CONSENSUS_UNCERTAIN",
                                 "title": f"{fact.display_name}需要双模型复核",
-                                "description": (
-                                    "主模型事实未通过独立评审共识门，不影响自动风险或通过。"
-                                ),
+                                "description": "用于跨资料映射的事实未通过独立评审共识门。",
                                 "source_evidence": [
                                     {
                                         "file_id": fact.source_file_id,
@@ -1407,6 +1850,19 @@ class DraftReviewWorkflowExecutor:
                                 "requires_manual_action": True,
                             }
                         )
+            for reference_file_id in sorted(uncertain_reference_file_ids):
+                fact_reviews.append(
+                    {
+                        "review_id": f"review_mapping_consensus_{reference_file_id}",
+                        "module_code": "FACT_CONSISTENCY",
+                        "reason_code": "MAPPING_CONSENSUS_UNCERTAIN",
+                        "title": "跨资料映射需要独立复核",
+                        "description": "映射或映射复核未形成独立模型共识。",
+                        "source_evidence": [{"file_id": reference_file_id}],
+                        "related_diff_ids": [],
+                        "requires_manual_action": True,
+                    }
+                )
         if fact_reviews and diagnostic_mode:
             diagnostic_review_items.extend(fact_reviews)
             fact_reviews = []
@@ -1635,12 +2091,16 @@ class DraftReviewWorkflowExecutor:
             if diagnostic_mode and successful_extractions
             else "PASS"
         )
-        public_semantic_concepts = [] if diagnostic_mode else [
+        public_semantic_concepts = [] if (
+            diagnostic_mode or not self.settings.LLM_SEMANTIC_PLAN_ENABLED
+        ) else [
             concept
             for extraction in extractions_by_file.values()
             for concept in extraction.semantic_concepts
         ]
-        public_validation_specs = [] if diagnostic_mode else [
+        public_validation_specs = [] if (
+            diagnostic_mode or not self.settings.LLM_SEMANTIC_PLAN_ENABLED
+        ) else [
             spec.model_dump(mode="json")
             for spec in {spec.validation_id: spec for spec in validation_specs}.values()
         ]

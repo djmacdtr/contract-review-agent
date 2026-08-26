@@ -6,14 +6,18 @@ from docx import Document
 
 from app.adapters.llm.base import LlmResult
 from app.adapters.llm.openai_client import LlmClientError
+from app.adapters.llm.schemas import SemanticPlanResponse
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.schemas.results import TaskResultData
 from app.services.downloader import SafeFileDownloadService
+from app.services.temp_files import TaskWorkspace
 from app.workflows.draft_review import (
     DraftReviewWorkflowExecutor,
+    _build_semantic_plan_payloads,
     _dynamic_failure_code,
+    _merge_semantic_plan_parts,
     logger,
 )
 
@@ -227,6 +231,9 @@ class ConsensusFixtureLlm:
         include_numeric_rule: bool = False,
         review_rule_mismatch: bool = False,
         invalid_advice_evidence: bool = False,
+        advice_failure: bool = False,
+        fact_values: dict[str, str] | None = None,
+        missing_requirement: bool = False,
     ) -> None:
         self.extraction_confidence = extraction_confidence
         self.review_confidence = review_confidence
@@ -237,6 +244,9 @@ class ConsensusFixtureLlm:
         self.include_numeric_rule = include_numeric_rule
         self.review_rule_mismatch = review_rule_mismatch
         self.invalid_advice_evidence = invalid_advice_evidence
+        self.advice_failure = advice_failure
+        self.fact_values = fact_values or {}
+        self.missing_requirement = missing_requirement
         self.advice_calls = 0
         self.review_payloads: list[dict] = []
 
@@ -275,7 +285,7 @@ class ConsensusFixtureLlm:
                         "field_key": "amount",
                         "display_name": "金额",
                         "value_type": "MONEY",
-                        "raw_value": "100",
+                        "raw_value": self.fact_values.get(file_id, "100"),
                         "normalized_hint": None,
                         "source_file_id": file_id,
                         "evidence_text": first["text"],
@@ -334,21 +344,33 @@ class ConsensusFixtureLlm:
 
     async def map_facts(self, payload: dict) -> LlmResult:
         fact = payload["reference_facts"][0]
+        mappings = []
+        missing_requirements = []
+        if self.missing_requirement:
+            missing_requirements.append(
+                {
+                    "target_fact_id": payload["target_facts"][0]["target_fact_id"],
+                    "confidence": self.extraction_confidence,
+                    "reason_code": "REQUIRED_BY_SOURCE_CONTEXT",
+                }
+            )
+        else:
+            mappings.append(
+                {
+                    "target_fact_id": payload["target_facts"][0]["target_fact_id"],
+                    "reference_field_key": fact["field_key"],
+                    "source_file_id": fact["source_file_id"],
+                    "reference_location": fact["location"],
+                    "decision": "MATCH",
+                    "confidence": self.extraction_confidence,
+                    "reason_code": "SAME_BUSINESS_FACT",
+                }
+            )
         return LlmResult(
             value={
                 "reference_file_id": payload["reference_file_id"],
-                "mappings": [
-                    {
-                        "target_fact_id": payload["target_facts"][0]["target_fact_id"],
-                        "reference_field_key": fact["field_key"],
-                        "source_file_id": fact["source_file_id"],
-                        "reference_location": fact["location"],
-                        "decision": "MATCH",
-                        "confidence": self.extraction_confidence,
-                        "reason_code": "SAME_BUSINESS_FACT",
-                    }
-                ],
-                "missing_requirements": [],
+                "mappings": mappings,
+                "missing_requirements": missing_requirements,
             },
             configured_model=self.extraction_model,
             actual_model=self.extraction_model,
@@ -356,22 +378,36 @@ class ConsensusFixtureLlm:
         )
 
     async def review_mappings(self, payload: dict) -> LlmResult:
-        proposal = payload["proposed_mapping"]["mappings"][0]
+        proposed_mapping = payload["proposed_mapping"]
+        decisions = []
+        missing_requirement_decisions = []
+        if proposed_mapping["mappings"]:
+            proposal = proposed_mapping["mappings"][0]
+            decisions.append(
+                {
+                    "target_fact_id": proposal["target_fact_id"],
+                    "reference_field_key": proposal["reference_field_key"],
+                    "source_file_id": proposal["source_file_id"],
+                    "reference_location": proposal["reference_location"],
+                    "decision": "ACCEPT",
+                    "confidence": self.review_confidence,
+                    "reason_code": "MAPPING_VERIFIED",
+                }
+            )
+        for requirement in proposed_mapping["missing_requirements"]:
+            missing_requirement_decisions.append(
+                {
+                    "target_fact_id": requirement["target_fact_id"],
+                    "decision": "ACCEPT",
+                    "confidence": self.review_confidence,
+                    "reason_code": "MISSING_REQUIREMENT_VERIFIED",
+                }
+            )
         return LlmResult(
             value={
                 "reference_file_id": payload["reference_file_id"],
-                "decisions": [
-                    {
-                        "target_fact_id": proposal["target_fact_id"],
-                        "reference_field_key": proposal["reference_field_key"],
-                        "source_file_id": proposal["source_file_id"],
-                        "reference_location": proposal["reference_location"],
-                        "decision": "ACCEPT",
-                        "confidence": self.review_confidence,
-                        "reason_code": "MAPPING_VERIFIED",
-                    }
-                ],
-                "missing_requirement_decisions": [],
+                "decisions": decisions,
+                "missing_requirement_decisions": missing_requirement_decisions,
                 "confidence": self.review_confidence,
                 "evidence_complete": self.evidence_complete,
             },
@@ -382,6 +418,8 @@ class ConsensusFixtureLlm:
 
     async def generate_advice(self, payload: dict) -> LlmResult:
         self.advice_calls += 1
+        if self.advice_failure:
+            raise LlmClientError("LLM_UPSTREAM_ERROR", "模型建议不可用")
         risk_advices = [
             {
                 "risk_id": risk["risk_id"],
@@ -473,6 +511,138 @@ class SemanticPlanFixtureLlm(ConsensusFixtureLlm):
         )
 
 
+def test_semantic_plan_payloads_split_target_facts_and_retain_reference_context() -> None:
+    payload = {
+        "file_id": "target",
+        "role": "TARGET",
+        "documents": [
+            {
+                "file_id": "target",
+                "role": "TARGET",
+                "profile": {},
+                "facts": [
+                    {
+                        "fact_id": f"fact_{index:024x}",
+                        "source_file_id": "target",
+                        "field_key": f"field_{index}",
+                        "display_name": "字段",
+                        "value_type": "NUMBER",
+                        "raw_value": str(index),
+                        "location": {"paragraph_index": index},
+                        "confidence": 0.95,
+                    }
+                    for index in range(1, 4)
+                ],
+            },
+            {
+                "file_id": "reference",
+                "role": "REFERENCE",
+                "profile": {},
+                "facts": [
+                    {
+                        "fact_id": "fact_000000000000000000000002",
+                        "source_file_id": "reference",
+                        "field_key": "reference_value",
+                        "display_name": "参考值",
+                        "value_type": "NUMBER",
+                        "raw_value": "4",
+                        "location": {"paragraph_index": 4},
+                        "confidence": 0.95,
+                    }
+                ],
+            },
+        ],
+        "accepted_mappings": [
+            {
+                "target": {
+                    "fact_id": "fact_000000000000000000000001",
+                    "source_file_id": "target",
+                },
+                "reference": {
+                        "fact_id": "fact_000000000000000000000002",
+                    "source_file_id": "reference",
+                },
+                "decision": "ACCEPT",
+            }
+        ],
+        "semantic_requirements": {"numeric_ast_only": True},
+    }
+
+    batches = _build_semantic_plan_payloads(payload, fact_batch_size=2)
+
+    assert [len(batch["documents"][0]["facts"]) for batch in batches] == [2, 1]
+    assert [len(batch["documents"][1]["facts"]) for batch in batches] == [1, 0]
+    assert len(batches[0]["accepted_mappings"]) == 1
+    assert batches[1]["accepted_mappings"] == []
+    assert batches[0]["semantic_requirements"]["planning_scope"][
+        "only_emit_plans_for_target_batch"
+    ] is True
+
+
+def test_semantic_plan_parts_merge_duplicate_concepts_without_dropping_evidence() -> None:
+    parts = [
+        SemanticPlanResponse.model_validate(
+            {
+                "file_id": "target",
+                "semantic_concepts": [
+                    {
+                        "concept_id": "amount",
+                        "display_name": "金额",
+                        "value_type": "MONEY",
+                        "fact_refs": [
+                            {
+                                "fact_id": "fact_000000000000000000000001",
+                                "source_file_id": "target",
+                            }
+                        ],
+                        "evidence_refs": [
+                            {
+                                "source_file_id": "target",
+                                "location": {"paragraph_index": 1},
+                            }
+                        ],
+                        "confidence": 0.9,
+                    }
+                ],
+                "validation_specs": [],
+            }
+        ),
+        SemanticPlanResponse.model_validate(
+            {
+                "file_id": "target",
+                "semantic_concepts": [
+                    {
+                        "concept_id": "amount",
+                        "display_name": "金额",
+                        "value_type": "MONEY",
+                        "fact_refs": [
+                            {
+                                "fact_id": "fact_000000000000000000000002",
+                                "source_file_id": "target",
+                            }
+                        ],
+                        "evidence_refs": [
+                            {
+                                "source_file_id": "target",
+                                "location": {"paragraph_index": 2},
+                            }
+                        ],
+                        "confidence": 0.95,
+                    }
+                ],
+                "validation_specs": [],
+            }
+        ),
+    ]
+
+    merged = _merge_semantic_plan_parts(parts, primary_file_id="target")
+
+    assert len(merged.semantic_concepts) == 1
+    assert len(merged.semantic_concepts[0].fact_refs) == 2
+    assert len(merged.semantic_concepts[0].evidence_refs) == 2
+    assert merged.semantic_concepts[0].confidence == 0.95
+
+
 async def run_consensus_fixture(
     tmp_path: Path,
     llm: ConsensusFixtureLlm,
@@ -481,6 +651,7 @@ async def run_consensus_fixture(
     same_model_diagnostic: bool = False,
     target_body: str = "金额100",
     template_body: str = "金额100",
+    reference_body: str = "金额100",
     expanded_table: bool = False,
     settings_overrides: dict | None = None,
 ) -> dict:
@@ -501,7 +672,7 @@ async def run_consensus_fixture(
     bodies = {
         "/target.docx": target_bytes,
         "/template.docx": template_bytes,
-        "/reference.docx": build_docx(tmp_path / "reference.docx", "资料", "金额100"),
+        "/reference.docx": build_docx(tmp_path / "reference.docx", "资料", reference_body),
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -995,6 +1166,105 @@ async def test_invalid_advice_risk_id_falls_back_without_changing_result(
     )
 
 
+def test_delivery_graph_bypasses_semantic_plan_after_mapping_review(tmp_path: Path) -> None:
+    async def no_progress(*_args) -> None:
+        return None
+
+    executor = DraftReviewWorkflowExecutor(Settings(_env_file=None))
+    graph = executor._build_graph(TaskWorkspace(tmp_path, "tsk_delivery_graph"), no_progress)
+    edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+
+    # Mapping and its independent review run within map_cross_document_facts.
+    assert ("map_cross_document_facts", "build_result") in edges
+    assert ("map_cross_document_facts", "plan_semantics") not in edges
+    assert ("build_result", "generate_advice") in edges
+    assert ("generate_advice", "persist_result") in edges
+
+
+async def test_delivery_path_skips_semantic_plan_and_publishes_accepted_fact_pass(
+    tmp_path: Path,
+) -> None:
+    llm = SemanticPlanFixtureLlm()
+
+    result = await run_consensus_fixture(tmp_path, llm)
+
+    assert llm.plan_calls == 0
+    assert result["metadata"]["semantic_concepts"] == []
+    assert result["metadata"]["validation_specs"] == []
+    assert not any(run["purpose"] == "SEMANTIC_PLAN" for run in result["metadata"]["model_runs"])
+    assert any(
+        item["module_code"] == "FACT_CONSISTENCY" and "来源一致" in item["title"]
+        for item in result["passed_checks"]
+    )
+
+
+async def test_delivery_path_publishes_accepted_fact_conflict_with_two_sided_evidence(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        ConsensusFixtureLlm(
+            fact_values={"fil_target": "100万元", "fil_reference": "120万元"}
+        ),
+        target_body="金额100万元",
+        template_body="金额100万元",
+        reference_body="金额120万元",
+    )
+
+    conflict_risk = next(
+        item
+        for item in result["risk_items"]
+        if item["module_code"] == "FACT_CONSISTENCY"
+        and item["change_type"] == "NUMERIC_CHANGED"
+    )
+    assert {item["file_id"] for item in conflict_risk["source_evidence"]} == {
+        "fil_target",
+        "fil_reference",
+    }
+    assert conflict_risk["analysis_advice"]
+    assert any(item["diff_type"] == "NUMERIC_CHANGED" for item in result["diff_items"])
+
+
+async def test_delivery_path_publishes_accepted_missing_requirement_as_risk(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        ConsensusFixtureLlm(missing_requirement=True),
+    )
+
+    missing_risk = next(
+        item
+        for item in result["risk_items"]
+        if item["change_type"] == "REQUIRED_SOURCE_MISSING"
+    )
+    assert missing_risk["module_code"] == "FACT_CONSISTENCY"
+    assert missing_risk["source_evidence"][0]["file_id"] == "fil_target"
+    assert missing_risk["analysis_advice"]
+
+
+async def test_advice_failure_keeps_formal_result_and_fallback_for_each_risk(
+    tmp_path: Path,
+) -> None:
+    llm = ConsensusFixtureLlm(advice_failure=True)
+
+    result = await run_consensus_fixture(
+        tmp_path,
+        llm,
+        target_body="固定条款乙",
+        template_body="固定条款甲",
+    )
+
+    assert llm.advice_calls == 1
+    assert result["conclusion"] == "RISK_FOUND"
+    assert result["risk_items"]
+    assert all(item["analysis_advice"] for item in result["risk_items"])
+    assert any(
+        warning["code"] == "LLM_ADVICE_UNAVAILABLE"
+        for warning in result["warnings"]
+    )
+
+
 async def test_independent_review_receives_source_blocks(tmp_path: Path) -> None:
     llm = ConsensusFixtureLlm()
 
@@ -1018,7 +1288,11 @@ async def test_semantic_plan_runs_after_mapping_and_is_programmatically_checked(
     tmp_path: Path,
 ) -> None:
     llm = SemanticPlanFixtureLlm()
-    result = await run_consensus_fixture(tmp_path, llm)
+    result = await run_consensus_fixture(
+        tmp_path,
+        llm,
+        settings_overrides={"LLM_SEMANTIC_PLAN_ENABLED": True},
+    )
 
     assert llm.plan_calls == 1
     assert result["metadata"]["semantic_concepts"]
@@ -1088,6 +1362,7 @@ async def test_same_model_semantic_plan_stays_out_of_public_formal_checks(
         tmp_path,
         SemanticPlanFixtureLlm(),
         same_model_diagnostic=True,
+        settings_overrides={"LLM_SEMANTIC_PLAN_ENABLED": True},
     )
 
     assert result["metadata"]["semantic_concepts"] == []
@@ -1144,4 +1419,5 @@ async def test_numeric_rule_requires_exact_primary_and_reviewer_consensus(
         await run_consensus_fixture(
             tmp_path,
             ConsensusFixtureLlm(include_numeric_rule=True, review_rule_mismatch=True),
+            settings_overrides={"LLM_SEMANTIC_PLAN_ENABLED": True},
         )

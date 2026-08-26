@@ -6,11 +6,13 @@ import pytest
 
 from app.adapters.llm.base import LlmResult
 from app.core.config import Settings
+from app.core.errors import WorkflowError
 from scripts.draft_review_real_diagnostic import (
     RecordingTransport,
     SafeMetrics,
     SafeMetricWriter,
     claim_once,
+    host_diagnostic_database_url,
 )
 from scripts.llm_structured_output_probe import probe_mode
 
@@ -144,6 +146,28 @@ def test_one_shot_lock_refuses_a_second_real_run(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="second run"):
         claim_once(lock_path)
+
+
+def test_host_diagnostic_uses_published_postgres_port() -> None:
+    assert host_diagnostic_database_url(
+        "postgresql+asyncpg://user:password@postgres:5432/contract_review"
+    ) == "postgresql+asyncpg://user:password@127.0.0.1:15432/contract_review"
+    external_url = "postgresql+asyncpg://user:password@db.example:5432/contract_review"
+    assert host_diagnostic_database_url(external_url) == external_url
+
+
+def test_real_diagnostic_blocks_calls_after_the_configured_limit(tmp_path) -> None:
+    writer = SafeMetricWriter(tmp_path / "limit.jsonl")
+    metrics = SafeMetrics(writer=writer, file_names={}, max_logical_calls=1)
+    try:
+        metrics.begin_logical("FACT_MAPPING", "fil_reference")
+        metrics.end_logical()
+        with pytest.raises(WorkflowError, match="调用上限"):
+            metrics.begin_logical("AI_ADVICE", None)
+    finally:
+        writer.close()
+
+    assert metrics.logical_calls == 1
 
 
 @pytest.mark.asyncio

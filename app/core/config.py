@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     # Text facts use a smaller structural-unit ceiling than numeric batches so
     # a dense response can be split before it reaches the 12-item saturation
     # boundary.
-    LLM_EXTRACTION_MAX_TEXT_UNITS: int = Field(default=32, ge=1, le=128)
+    LLM_EXTRACTION_MAX_TEXT_UNITS: int = Field(default=16, ge=1, le=128)
+    LLM_EXTRACTION_MAX_TEXT_CANDIDATES: int = Field(default=8, ge=1, le=12)
     LLM_EXTRACTION_WAVE_SIZE: int = Field(default=6, ge=1, le=8)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET: int = Field(default=40, ge=1, le=128)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=50, ge=1, le=256)
@@ -81,10 +82,14 @@ class Settings(BaseSettings):
     LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT: int = Field(
         default=128, ge=1, le=512
     )
+    # Semantic planning is an optional enhancement. The delivery path relies
+    # on independently reviewed fact mappings and deterministic comparison.
+    LLM_SEMANTIC_PLAN_ENABLED: bool = False
+    LLM_SEMANTIC_FACT_BATCH_SIZE: int = Field(default=8, ge=8, le=128)
     # Deprecated compatibility knob for the legacy fixture adapter; production
     # extraction uses the N + recovery budget above.
     LLM_EXTRACTION_MAX_REQUESTS_PER_DOCUMENT: int = Field(default=16, ge=1, le=128)
-    LLM_REVIEW_BATCH_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
+    LLM_REVIEW_BATCH_MAX_CHARS: int = Field(default=8000, ge=1000, le=100000)
     LLM_REVIEW_CONTEXT_BLOCKS: int = Field(default=1, ge=0, le=10)
     LLM_STRUCTURE_RETRY_ATTEMPTS: int = 2
     LLM_CONSENSUS_MIN_CONFIDENCE: float = Field(default=0.85, ge=0, le=1)

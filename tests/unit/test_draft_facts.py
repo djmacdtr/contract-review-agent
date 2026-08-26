@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -30,6 +31,7 @@ from app.draft_review.facts import (
     build_fact_review_batches,
     chunk_document,
     compact_extraction_payload,
+    compare_facts,
     estimate_extraction_output_tokens,
     expand_compact_extraction,
     expand_fact_batch,
@@ -40,6 +42,7 @@ from app.draft_review.facts import (
     merge_chunk_extractions,
     merge_fact_review_batches,
     normalize_fact,
+    normalized_fact_components,
     plan_document_batches,
     stable_fact_id,
     stable_unit_id,
@@ -730,6 +733,32 @@ def test_deterministic_fact_normalization(value_type: str, raw: str, expected: s
     assert normalize_fact(fact) == expected
 
 
+def test_numeric_comparison_uses_decimal_normalization() -> None:
+    target = FactCandidate(
+        field_key="rate",
+        display_name="利率",
+        value_type="PERCENTAGE",
+        raw_value="0.10%",
+        source_file_id="fil_target",
+        evidence_text="利率为0.10%",
+        location=DocumentLocation(paragraph_index=0),
+        confidence=1,
+    )
+    reference = target.model_copy(
+        update={
+            "source_file_id": "fil_reference",
+            "raw_value": "0.1%",
+            "evidence_text": "利率为0.1%",
+        }
+    )
+
+    components = normalized_fact_components(target)
+    assert components is not None
+    assert components["value"] == Decimal("0.10")
+    assert isinstance(components["value"], Decimal)
+    assert compare_facts(target, reference) is True
+
+
 def test_matrix_conflict_becomes_risk_while_not_mentioned_is_not_a_risk() -> None:
     matrix = build_fact_matrix(
         {
@@ -826,6 +855,27 @@ def test_reliably_required_but_missing_source_becomes_deletion_risk() -> None:
     assert reviews == [] and passed == []
     assert risks[0]["risk_type"] == "DELETION_OR_MISSING"
     assert risks[0]["change_type"] == "REQUIRED_SOURCE_MISSING"
+
+
+def test_required_missing_can_publish_without_review_items() -> None:
+    target = extraction("fil_target", "1000万元")
+    matrix = build_fact_matrix(
+        {"fil_target": target, "fil_reference": extraction("fil_reference", "5")},
+        target_file_id="fil_target",
+        reference_file_ids=["fil_reference"],
+        mapping_records=[],
+        required_missing={("target_fact_000001", "fil_reference")},
+    )
+
+    risks, reviews, passed = fact_matrix_result_items(
+        matrix,
+        include_uncertain=False,
+        include_required_missing=True,
+    )
+
+    assert [item["change_type"] for item in risks] == ["REQUIRED_SOURCE_MISSING"]
+    assert reviews == []
+    assert passed == []
 
 
 def test_required_missing_source_prevents_pass_for_same_fact() -> None:
@@ -1042,6 +1092,76 @@ def test_review_batch_resolves_table_cell_to_parent_table_block() -> None:
     )[0]
 
     assert [block["block_id"] for block in batch["blocks"]] == ["before", "table", "after"]
+
+
+def test_review_batch_compacts_oversized_table_context_to_exact_fact_evidence() -> None:
+    location = DocumentLocation(table_index=0, row=0, column=0)
+    cell_text = "目标值" + ("上下文" * 5000)
+    table = ParsedTable(
+        table_index=0,
+        rows=[
+            TableRow(
+                row=0,
+                cells=[
+                    TableCell(
+                        raw_text=cell_text,
+                        normalized_text=cell_text,
+                        location=location,
+                    )
+                ],
+            )
+        ],
+    )
+    document = ParsedDocument(
+        file_id="fil_large_table",
+        role="REFERENCE",
+        file_name="large-table.docx",
+        sha256="b" * 64,
+        page_count=None,
+        parser_name="python-docx",
+        blocks=[
+            DocumentBlock(
+                block_id="large_table",
+                type="TABLE",
+                order=0,
+                raw_text=cell_text,
+                normalized_text=cell_text,
+                location=DocumentLocation(table_index=0),
+                table=table,
+            )
+        ],
+    )
+    extracted = DocumentFactExtraction.model_validate(
+        {
+            "profile": {
+                "file_id": "fil_large_table",
+                "document_kind": "项目资料",
+                "confidence": 0.9,
+                "evidence_locations": [{"table_index": 0}],
+            },
+            "facts": [
+                {
+                    "field_key": "project_value",
+                    "display_name": "项目值",
+                    "value_type": "TEXT",
+                    "raw_value": "目标值",
+                    "source_file_id": "fil_large_table",
+                    "evidence_text": "目标值",
+                    "location": location.model_dump(mode="json"),
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    batches = build_fact_review_batches(
+        document, extracted, max_chars=12000, context_blocks=1
+    )
+
+    assert len(batches) == 1
+    assert len(json.dumps(batches[0], ensure_ascii=False, separators=(",", ":"))) <= 12000
+    assert batches[0]["blocks"][0]["type"] == "EVIDENCE"
+    assert batches[0]["blocks"][0]["text"] == "目标值"
 
 
 def test_review_batch_merge_requires_exact_decision_coverage() -> None:

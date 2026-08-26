@@ -14,6 +14,7 @@ x-app: &app
     PDF_MIN_TEXT_CHARS_PER_PAGE: ${PDF_MIN_TEXT_CHARS_PER_PAGE:-20}
     OCR_ENABLED: ${OCR_ENABLED:-false}
     LLM_ENABLED: ${LLM_ENABLED:-false}
+    LLM_SEMANTIC_PLAN_ENABLED: ${LLM_SEMANTIC_PLAN_ENABLED:-false}
     OCR_BASE_URL: ${OCR_BASE_URL:-}
     OCR_AUTH_HEADER: ${OCR_AUTH_HEADER:-}
   depends_on:
@@ -24,6 +25,8 @@ x-app: &app
 services:
   postgres:
     image: postgres:16.10-alpine
+    ports:
+      - "127.0.0.1:15432:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-contract_review}
       POSTGRES_USER: ${POSTGRES_USER:-contract}

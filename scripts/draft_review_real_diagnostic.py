@@ -12,6 +12,8 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import socket
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -19,6 +21,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.adapters.llm.base import LlmResult
 from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
@@ -26,16 +35,24 @@ from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.documents.parsers import DocxParser
+from app.draft_review.checkpoints import (
+    ExtractionCheckpoint,
+    SqlAlchemyExtractionCheckpointStore,
+)
 from app.draft_review.facts import (
     TEXT_EXTRACTION_VERSION,
+    EvidenceValidationError,
+    build_template_text_candidates,
     build_text_fact_payload,
     expand_text_fact_response,
     extraction_units,
     numeric_candidates,
+    plan_text_candidate_batches,
     plan_text_document_batches,
     stable_batch_id,
     stable_unit_id,
 )
+from app.draft_review.template_checks import analyze_template
 from app.schemas.results import TaskResultData
 from app.services.downloader import DOCX_MIME, LocalFile
 from app.services.temp_files import TaskWorkspace
@@ -50,6 +67,8 @@ REAL_FILES = (
 )
 DEFAULT_OUTPUT = Path(".real-diagnostic-temp") / "draft-review-real-safe.jsonl"
 DEFAULT_LOCK = Path(".real-diagnostic-temp") / "draft-review-real.lock"
+MAX_REAL_LOGICAL_CALLS = 10
+MAX_REAL_RUNTIME_SECONDS = 15 * 60
 
 
 def safe_error_code(exc: BaseException) -> str:
@@ -57,8 +76,14 @@ def safe_error_code(exc: BaseException) -> str:
         return exc.code
     if isinstance(exc, WorkflowError):
         return exc.code
+    if isinstance(exc, EvidenceValidationError):
+        return exc.code
     if isinstance(exc, TimeoutError):
         return "TIMEOUT"
+    if isinstance(exc, socket.gaierror):
+        # The diagnostic must expose a stable infrastructure category rather
+        # than a DNS/database implementation exception or hidden host detail.
+        return "CHECKPOINT_UNAVAILABLE"
     return type(exc).__name__
 
 
@@ -68,6 +93,17 @@ def safe_failure_code(exc: BaseException) -> str:
     if isinstance(exc, LlmClientError):
         return exc.failure_code or exc.code
     return safe_error_code(exc)
+
+
+def host_diagnostic_database_url(database_url: str) -> str:
+    """Route the host-run diagnostic to the published PostgreSQL port only."""
+
+    url = make_url(database_url)
+    if url.host == "postgres" and url.port == 5432:
+        return url.set(host="127.0.0.1", port=15432).render_as_string(
+            hide_password=False
+        )
+    return database_url
 
 
 class SafeMetricWriter:
@@ -91,6 +127,8 @@ class SafeMetricWriter:
 class SafeMetrics:
     writer: SafeMetricWriter
     file_names: dict[str, str]
+    max_logical_calls: int | None = None
+    file_names_by_sha: dict[str, str] = field(default_factory=dict)
     http_calls: int = 0
     logical_calls: int = 0
     response_chars: int = 0
@@ -103,6 +141,8 @@ class SafeMetrics:
     completed_batch_counts: Counter[str] = field(default_factory=Counter)
     recovery_counts: Counter[str] = field(default_factory=Counter)
     probe_http_calls: int = 0
+    checkpoint_reused: int = 0
+    checkpoint_saved: int = 0
     call_context: contextvars.ContextVar[tuple[str | None, str | None, str | None]] = field(
         default_factory=lambda: contextvars.ContextVar(
             "draft_review_diagnostic_call",
@@ -126,6 +166,23 @@ class SafeMetrics:
         file_id: str | None,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        if (
+            self.max_logical_calls is not None
+            and self.logical_calls >= self.max_logical_calls
+        ):
+            self.current_operation = operation
+            self.current_file_id = file_id
+            self.set_phase(operation)
+            self.writer.emit(
+                "logical_call_blocked",
+                operation=operation,
+                file_name=self.file_names.get(file_id, "任务级"),
+                reason_code="REAL_LOGICAL_CALL_LIMIT_REACHED",
+            )
+            raise WorkflowError(
+                "REAL_LOGICAL_CALL_LIMIT_REACHED",
+                "真实任务已达到新增模型调用上限",
+            )
         self.logical_calls += 1
         self.logical_counts[operation] += 1
         self.current_operation = operation
@@ -184,6 +241,7 @@ class SafeMetrics:
             # batch metrics rather than double-counting model calls.
             if batch_id is not None and operation in {
                 "FACT_EXTRACTION",
+                "NUMERIC_CANDIDATE_EXTRACTION",
                 "TEXT_FACT_EXTRACTION",
             }:
                 file_name = self.file_names.get(file_id, "任务级")
@@ -380,6 +438,7 @@ class RecordingLlm:
             self.metrics.end_logical(result=result)
             return result
 
+
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
         return await self._call(
             "FACT_EXTRACTION",
@@ -464,6 +523,34 @@ class RecordingLlm:
         return await self._call("AI_ADVICE", payload, self.client.generate_advice)
 
 
+class RecordingCheckpointStore:
+    """Decorate the SQL store with aggregate-only diagnostic counters."""
+
+    def __init__(self, inner: SqlAlchemyExtractionCheckpointStore, metrics: SafeMetrics) -> None:
+        self.inner = inner
+        self.metrics = metrics
+
+    async def load(self, batch_id: str, **kwargs: Any) -> ExtractionCheckpoint | None:
+        checkpoint = await self.inner.load(batch_id, **kwargs)
+        if checkpoint is not None:
+            self.metrics.checkpoint_reused += 1
+            if checkpoint.extraction_version in {"numeric-v2", TEXT_EXTRACTION_VERSION}:
+                file_name = self.metrics.file_names_by_sha.get(
+                    str(kwargs.get("file_sha256", ""))
+                )
+                if file_name:
+                    self.metrics.completed_batch_counts[file_name] += 1
+            self.metrics.writer.emit(
+                "checkpoint_reused",
+                extraction_version=checkpoint.extraction_version,
+            )
+        return checkpoint
+
+    async def save(self, checkpoint: ExtractionCheckpoint) -> None:
+        await self.inner.save(checkpoint)
+        self.metrics.checkpoint_saved += 1
+
+
 class LocalRealFileDownloader:
     def __init__(self, source_by_name: dict[str, Path]) -> None:
         self.source_by_name = source_by_name
@@ -493,9 +580,16 @@ class LocalRealFileDownloader:
 
 
 def diagnostic_settings() -> Settings:
+    base_settings = Settings()
     return Settings(
+        DATABASE_URL=host_diagnostic_database_url(base_settings.DATABASE_URL),
         OCR_ENABLED=False,
         LLM_MAX_OUTPUT_TOKENS=4096,
+        # The current gateway model list has no GLM reviewer alias.  DeepSeek
+        # is the only currently listed, attributable text model with proven
+        # JSON-Schema support; Qwen is too slow/unstable and MiniMax is routed
+        # to DeepSeek by the gateway.
+        LLM_REVIEW_MODEL="DeepSeek-V4-Flash-0731",
         LLM_STRUCTURE_RETRY_ATTEMPTS=1,
         LLM_EXTRACTION_PAYLOAD_MAX_CHARS=12000,
         LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES=48,
@@ -504,10 +598,15 @@ def diagnostic_settings() -> Settings:
         LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS=2000,
         LLM_EXTRACTION_TASK_CONCURRENCY=2,
         LLM_EXTRACTION_WAVE_SIZE=6,
-        LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET=40,
-        LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL=50,
+        LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET=MAX_REAL_LOGICAL_CALLS,
+        LLM_EXTRACTION_MAX_TEXT_UNITS=16,
+        LLM_EXTRACTION_MAX_TEXT_CANDIDATES=8,
+        LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL=MAX_REAL_LOGICAL_CALLS,
         LLM_EXTRACTION_MAX_SPLIT_DEPTH=8,
         LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT=128,
+        LLM_SEMANTIC_FACT_BATCH_SIZE=8,
+        LLM_SEMANTIC_PLAN_ENABLED=False,
+        LLM_REVIEW_BATCH_MAX_CHARS=8000,
         LLM_SAME_MODEL_DIAGNOSTIC=False,
         LLM_REQUIRE_INDEPENDENT_MODEL=True,
     )
@@ -629,10 +728,12 @@ async def run_canary_once(
     sample_dir: Path = SAMPLE_DIR,
     force_probe: bool = False,
 ) -> int:
-    """Run the one-shot five-batch business canary; no structure retries."""
+    """Run the one-shot target-candidate canary; no structure retries."""
 
     claim_once(lock_path)
     writer = SafeMetricWriter(output_path)
+    metrics = SafeMetrics(writer=writer, file_names={"canary_target": REAL_FILES[0][0]})
+    transport: RecordingTransport | None = None
     try:
         settings = diagnostic_settings()
         if force_probe:
@@ -656,39 +757,84 @@ async def run_canary_once(
             )
         settings.LLM_RESPONSE_FORMAT = selected_format
         settings.LLM_NATIVE_STRUCTURED_OUTPUT = selected_format == "json_schema"
+        parser = DocxParser()
         target_path = sample_dir / REAL_FILES[0][0]
-        content = target_path.read_bytes()
-        local_file = LocalFile(
+        template_path = sample_dir / REAL_FILES[1][0]
+        target_content = target_path.read_bytes()
+        template_content = template_path.read_bytes()
+        target_file = LocalFile(
             file_id="canary_target",
             role="TARGET",
             file_name=target_path.name,
             safe_url="local-diagnostic://redacted",
             path=target_path,
-            file_size=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
+            file_size=len(target_content),
+            sha256=hashlib.sha256(target_content).hexdigest(),
             detected_mime_type=DOCX_MIME,
         )
-        document = await DocxParser().parse(local_file)
-        units = _canary_units(document)
-        if len(units) != 5:
-            writer.emit("canary_finished", status="BLOCKED", reason_code="CANARY_UNIT_SELECTION")
+        template_file = LocalFile(
+            file_id="canary_template",
+            role="TEMPLATE",
+            file_name=template_path.name,
+            safe_url="local-diagnostic://redacted",
+            path=template_path,
+            file_size=len(template_content),
+            sha256=hashlib.sha256(template_content).hexdigest(),
+            detected_mime_type=DOCX_MIME,
+        )
+        document = await parser.parse(target_file)
+        template = await parser.parse(template_file)
+        template_review = analyze_template(template, document)
+        candidates = build_template_text_candidates(template_review, document)
+        plans = plan_text_candidate_batches(
+            document,
+            candidates,
+            max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+            max_candidates=settings.LLM_EXTRACTION_MAX_TEXT_CANDIDATES,
+            estimated_output_token_limit=settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS,
+        )
+        selected_plans = plans[:3]
+        if not selected_plans:
+            writer.emit(
+                "canary_finished",
+                status="BLOCKED",
+                reason_code="CANARY_CANDIDATE_SELECTION",
+            )
             return 2
-        client = OpenAIContractLlmClient(settings)
+        transport = RecordingTransport(
+            httpx.AsyncHTTPTransport(retries=0),
+            metrics,
+            read_timeout=settings.LLM_TIMEOUT_SECONDS,
+        )
+        client = OpenAIContractLlmClient(settings, transport=transport)
+        recorder = RecordingLlm(client, metrics)
         results: list[dict[str, Any]] = []
-        for index, unit in enumerate(units, start=1):
-            batch_id = stable_batch_id(document.sha256, [unit], TEXT_EXTRACTION_VERSION)
+        for index, plan in enumerate(selected_plans, start=1):
+            payload = dict(plan["payload"])
+            payload.update(
+                {
+                    "batch_depth": 0,
+                    "parent_batch_id": None,
+                    "planned_batch_count": len(plans),
+                }
+            )
             try:
-                payload = build_text_fact_payload(document, [unit], batch_id=batch_id)
-                result = await client.extract_text_facts(
+                result = await recorder.extract_text_facts(
                     payload, allow_structure_correction=False
                 )
                 expand_text_fact_response(payload, result.value)
-                chain = "text"
                 results.append(
                     {
                         "sample_index": index,
-                        "unit_type": unit.type,
-                        "chain": chain,
+                        "candidate_count": len(plan["blocks"]),
+                        "location_type": (
+                            "table"
+                            if any(
+                                block.location.table_index is not None
+                                for block in plan["blocks"]
+                            )
+                            else "paragraph"
+                        ),
                         "status": "SUCCEEDED",
                         "finish_reason": result.finish_reason,
                         "response_item_count": len(result.value.get("items", [])),
@@ -698,7 +844,7 @@ async def run_canary_once(
                 results.append(
                     {
                         "sample_index": index,
-                        "unit_type": unit.type,
+                        "candidate_count": len(plan["blocks"]),
                         "status": "FAILED",
                         "error_code": safe_error_code(exc),
                     }
@@ -709,6 +855,8 @@ async def run_canary_once(
                     status="FAILED",
                     business_calls=index,
                     passed=sum(item["status"] == "SUCCEEDED" for item in results),
+                    http_calls=metrics.http_calls,
+                    logical_calls=metrics.logical_calls,
                 )
                 return 2
         writer.emit(
@@ -716,13 +864,25 @@ async def run_canary_once(
             status="SUCCEEDED",
             business_calls=len(results),
             passed=len(results),
+            candidate_count=len(candidates),
+            planned_candidate_batch_count=len(plans),
+            http_calls=metrics.http_calls,
+            logical_calls=metrics.logical_calls,
             batches=results,
         )
         return 0
     except BaseException as exc:
-        writer.emit("canary_finished", status="FAILED", error_code=safe_error_code(exc))
+        writer.emit(
+            "canary_finished",
+            status="FAILED",
+            error_code=safe_error_code(exc),
+            http_calls=metrics.http_calls,
+            logical_calls=metrics.logical_calls,
+        )
         return 2
     finally:
+        if transport is not None:
+            await transport.close_all()
         writer.close()
 
 
@@ -868,14 +1028,22 @@ async def run_once(
     lock_path: Path = DEFAULT_LOCK,
     sample_dir: Path = SAMPLE_DIR,
     force_probe: bool = False,
+    source_task_id: str | None = None,
 ) -> int:
     claim_once(lock_path)
 
     writer = SafeMetricWriter(output_path)
-    metrics = SafeMetrics(writer=writer, file_names={})
+    metrics = SafeMetrics(
+        writer=writer,
+        file_names={},
+        max_logical_calls=MAX_REAL_LOGICAL_CALLS,
+    )
     result_summary: dict[str, Any] = {}
     failure: str | None = None
+    failure_subcode: str | None = None
     transport: RecordingTransport | None = None
+    checkpoint_engine: AsyncEngine | None = None
+    started_at = time.monotonic()
     try:
         settings = diagnostic_settings()
         if not settings.llm_configured:
@@ -915,6 +1083,10 @@ async def run_once(
         missing = [file_name for file_name, path in source_by_name.items() if not path.is_file()]
         if missing:
             raise FileNotFoundError("real diagnostic sample is incomplete")
+        metrics.file_names_by_sha = {
+            hashlib.sha256(path.read_bytes()).hexdigest(): file_name
+            for file_name, path in source_by_name.items()
+        }
         files = _file_inputs(metrics)
         writer.emit("run_started", file_count=len(files), ocr_enabled=False)
         transport = RecordingTransport(
@@ -923,10 +1095,23 @@ async def run_once(
             read_timeout=settings.LLM_TIMEOUT_SECONDS,
         )
         client = OpenAIContractLlmClient(settings, transport=transport)
+        checkpoint_engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+        checkpoint_session_factory = async_sessionmaker(
+            checkpoint_engine,
+            expire_on_commit=False,
+            class_=AsyncSession,
+        )
+        checkpoint_store = RecordingCheckpointStore(
+            SqlAlchemyExtractionCheckpointStore(checkpoint_session_factory), metrics
+        )
+        task_id = "real_" + hashlib.sha256(
+            str(output_path.resolve()).encode("utf-8")
+        ).hexdigest()[:16]
         executor = DraftReviewWorkflowExecutor(
             settings,
             downloader=LocalRealFileDownloader(source_by_name),
             llm=RecordingLlm(client, metrics),
+            checkpoint_store=checkpoint_store,
         )
 
         async def progress(stage: TaskStage, value: int, _message: str) -> None:
@@ -936,13 +1121,16 @@ async def run_once(
             metrics.set_phase(phase)
             writer.emit("workflow_progress", stage=stage.value, progress=value)
 
-        output = await executor.run(
-            task_id="tsk_real_diagnostic_in_memory",
-            task_type=TaskType.DRAFT_REVIEW,
-            files=files,
-            options={},
-            progress_callback=progress,
-        )
+        async with asyncio.timeout(MAX_REAL_RUNTIME_SECONDS):
+            output = await executor.run(
+                task_id=task_id,
+                task_type=TaskType.DRAFT_REVIEW,
+                files=files,
+                options={
+                    "source_task_id": source_task_id or "tsk_real_diagnostic_in_memory"
+                },
+                progress_callback=progress,
+            )
         result_summary = _result_summary(output.result, metrics)
         writer.emit("result_verified", **result_summary)
     except asyncio.CancelledError:
@@ -953,6 +1141,7 @@ async def run_once(
             )
     except Exception as exc:
         failure = safe_error_code(exc)
+        failure_subcode = safe_failure_code(exc)
         if metrics.first_failure_stage is None:
             metrics.first_failure_stage = metrics.current_operation or (
                 metrics.phase_events[-1] if metrics.phase_events else None
@@ -960,6 +1149,7 @@ async def run_once(
         writer.emit(
             "run_failed",
             error_code=failure,
+            failure_subcode=failure_subcode,
             first_failure_stage=metrics.first_failure_stage,
         )
     finally:
@@ -969,21 +1159,37 @@ async def run_once(
             except BaseException as exc:
                 if failure is None:
                     failure = safe_error_code(exc)
+                    failure_subcode = safe_failure_code(exc)
                 if metrics.first_failure_stage is None:
                     metrics.first_failure_stage = metrics.current_operation or (
                         metrics.phase_events[-1] if metrics.phase_events else None
                     )
                 writer.emit("transport_close_failed", error_code=safe_error_code(exc))
+        if checkpoint_engine is not None:
+            try:
+                await checkpoint_engine.dispose()
+            except BaseException as exc:
+                if failure is None:
+                    failure = safe_error_code(exc)
+                    failure_subcode = safe_failure_code(exc)
+                if metrics.first_failure_stage is None:
+                    metrics.first_failure_stage = "CHECKPOINT_CLOSE"
+                writer.emit("checkpoint_close_failed", error_code=safe_error_code(exc))
         try:
             writer.emit(
                 "final_summary",
                 status="FAILED" if failure else "SUCCEEDED",
                 first_failure_stage=metrics.first_failure_stage,
                 failure_code=failure,
+                failure_subcode=failure_subcode,
                 http_calls=metrics.http_calls + metrics.probe_http_calls,
                 task_http_calls=metrics.http_calls,
                 probe_http_calls=metrics.probe_http_calls,
                 logical_calls=metrics.logical_calls,
+                logical_call_limit=MAX_REAL_LOGICAL_CALLS,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+                checkpoint_reused=metrics.checkpoint_reused,
+                checkpoint_saved=metrics.checkpoint_saved,
                 operation_request_counts=dict(metrics.operation_request_counts),
                 document_request_counts={
                     file_name: metrics.document_request_counts.get(file_name, 0)
@@ -1019,6 +1225,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="显式执行部署级结构化输出探测；普通合同任务不重复探测",
     )
+    parser.add_argument(
+        "--source-task-id",
+        default=None,
+        help="仅用于从同一文件哈希和抽取版本读取成功 checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -1044,6 +1255,7 @@ if __name__ == "__main__":
                 lock_path=arguments.lock,
                 sample_dir=arguments.sample_dir,
                 force_probe=arguments.probe,
+                source_task_id=arguments.source_task_id,
             )
         )
     )

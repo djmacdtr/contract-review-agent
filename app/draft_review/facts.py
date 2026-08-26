@@ -69,6 +69,15 @@ class FactIndexEntry:
 FactIndex = dict[tuple[str, str], FactIndexEntry]
 
 
+@dataclass(frozen=True)
+class TextExtractionCandidate:
+    """A target-side template delta eligible for non-numeric extraction."""
+
+    block: DocumentBlock
+    diff_ids: tuple[str, ...] = ()
+    context_units: tuple[dict[str, Any], ...] = ()
+
+
 NUMERIC_VALUE_TYPES = {
     "MONEY",
     "PERCENTAGE",
@@ -475,7 +484,12 @@ def stable_unit_id(block: DocumentBlock) -> str:
 EXTRACTION_VERSION = "structured-map-reduce-v2"
 PROFILE_EXTRACTION_VERSION = "profile-v2"
 NUMERIC_EXTRACTION_VERSION = "numeric-v2"
-TEXT_EXTRACTION_VERSION = "text-v3"
+TEXT_EXTRACTION_VERSION = "text-v4"
+FACT_REVIEW_CHECKPOINT_VERSION = "fact-review-v1"
+TEXT_FACT_VALUE_TYPES = frozenset({"TEXT", "ENTITY", "UNKNOWN"})
+# A TABLE_STRUCTURE_EXPANDED diff has no template-aligned fact-level unit
+# identity.  The deterministic template diff remains authoritative for it;
+# row/cell changes with a concrete location remain ordinary text candidates.
 
 
 def stable_batch_id(
@@ -494,6 +508,51 @@ def stable_batch_id(
         ).encode()
     ).hexdigest()[:24]
     return f"batch_{digest}"
+
+
+def stable_review_batch_id(document: ParsedDocument, payload: dict[str, Any]) -> str:
+    """Derive an idempotent review key from file content and review identities."""
+
+    review_identity = {
+        "file_sha256": document.sha256,
+        "facts": [
+            {
+                "field_key": fact.get("field_key"),
+                "source_file_id": fact.get("source_file_id"),
+                "location": fact.get("location"),
+            }
+            for fact in payload.get("facts", [])
+            if isinstance(fact, dict)
+        ],
+        "semantic_concepts": [
+            item.get("concept_id")
+            for item in payload.get("semantic_concepts", [])
+            if isinstance(item, dict)
+        ],
+        "validation_specs": [
+            item.get("validation_id")
+            for item in payload.get("validation_specs", [])
+            if isinstance(item, dict)
+        ],
+        "version": FACT_REVIEW_CHECKPOINT_VERSION,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            review_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()[:24]
+    return f"review_{digest}"
+
+
+def review_payload_digest(payload: dict[str, Any]) -> str:
+    """Hash the complete review input so changed evidence cannot reuse a result."""
+
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
 
 
 def estimate_extraction_output_tokens(max_facts: int, numeric_candidate_count: int) -> int:
@@ -570,18 +629,259 @@ def build_text_fact_payload(
     blocks: list[DocumentBlock],
     *,
     batch_id: str,
+    context_units: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "file_id": document.file_id,
         "role": document.role,
         "batch_id": batch_id,
         "units": _simplified_units(blocks),
+        "readonly_context": context_units or [],
         "requirements": {
             "max_items": 12,
             "quote_must_be_exact_or_format_equivalent_substring": True,
+            "facts_must_reference_candidate_units_only": True,
+            "readonly_context_cannot_be_used_as_evidence": True,
             "identity_and_location_are_program_owned": True,
         },
     }
+
+
+def _target_block_for_location(
+    document: ParsedDocument,
+    location: DocumentLocation,
+) -> DocumentBlock | None:
+    wanted = location_key(location)
+    for block in document.blocks:
+        if location_key(block.location) == wanted:
+            return block
+        if block.table is not None and block.location.table_index == location.table_index:
+            for row in block.table.rows:
+                for cell in row.cells:
+                    if location_key(cell.location) == wanted:
+                        return block
+    return None
+
+
+def _context_unit(
+    *,
+    context_id: str,
+    text: str,
+    location: DocumentLocation,
+) -> dict[str, Any]:
+    return {
+        "context_id": context_id,
+        "type": "READONLY_CONTEXT",
+        "text": text,
+        "location": compact_location(location),
+    }
+
+
+def _template_candidate_context(
+    document: ParsedDocument,
+    anchor: DocumentBlock | None,
+    target_location: DocumentLocation,
+    candidate_text: str,
+) -> tuple[dict[str, Any], ...]:
+    if anchor is None:
+        return ()
+    # A table-level structural delta is already a synthetic INSERT fragment,
+    # not a row/cell unit.  Supplying the whole owning table as context makes
+    # it easy for the model to quote unrelated text.  Keep the candidate
+    # isolated; deterministic template comparison still carries the table
+    # structure result.
+    if (
+        target_location.table_index is not None
+        and target_location.row is None
+        and target_location.column is None
+    ):
+        return ()
+    context: list[dict[str, Any]] = []
+    # The complete owning block is read-only context.  The candidate unit is
+    # still the only legal source for a returned quote.
+    context_text = anchor.raw_text
+    if len(context_text) > 2000:
+        anchor_position = context_text.find(candidate_text.strip())
+        if anchor_position < 0:
+            anchor_position = 0
+        context_start = max(0, anchor_position - 600)
+        context_end = min(len(context_text), anchor_position + len(candidate_text) + 600)
+        context_text = context_text[context_start:context_end]
+    context.append(
+        _context_unit(
+            context_id=f"context_{anchor.block_id}",
+            text=context_text,
+            location=anchor.location,
+        )
+    )
+    anchor_index = document.blocks.index(anchor)
+    for previous in reversed(document.blocks[max(0, anchor_index - 3) : anchor_index]):
+        if previous.type in {"HEADER", "PARAGRAPH"} and previous.raw_text.strip():
+            context.append(
+                _context_unit(
+                    context_id=f"context_{previous.block_id}",
+                    text=previous.raw_text,
+                    location=previous.location,
+                )
+            )
+            if len(context) >= 3:
+                break
+    if anchor.table is not None and target_location.row is not None:
+        header_row = next(
+            (row for row in anchor.table.rows if row.row < target_location.row),
+            None,
+        )
+        if header_row is not None:
+            context.append(
+                _context_unit(
+                    context_id=(
+                        f"context_table_{anchor.table.table_index}_row_{header_row.row}"
+                    ),
+                    text="\t".join(cell.raw_text for cell in header_row.cells),
+                    location=DocumentLocation(
+                        table_index=anchor.table.table_index,
+                        row=header_row.row,
+                    ),
+                )
+            )
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for item in context:
+        deduplicated.setdefault(str(item["context_id"]), item)
+    return tuple(deduplicated.values())
+
+
+def _grounded_template_candidate_text(
+    document: ParsedDocument,
+    location: DocumentLocation,
+    preferred_text: str,
+    fallback_text: str,
+) -> str | None:
+    """Return a candidate fragment that is already grounded in the target.
+
+    Template diff segments can be normalized, split, or otherwise non-contiguous
+    even when the target-side location is valid.  Such a segment must not be
+    sent to the text extractor as if it were source text.  Prefer the segment
+    when it uniquely maps to the declared location, then fall back to the
+    target-side text.  The matcher returns the original source slice, so later
+    evidence rehydration remains deterministic.
+    """
+
+    sources = _evidence_at(document).get(location_key(location), [])
+    for candidate in (preferred_text, fallback_text):
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        grounded = _unique_grounded_quote(sources, candidate)
+        if grounded is not None:
+            return grounded
+    return None
+
+
+def build_template_text_candidates(
+    template_review: Any,
+    target: ParsedDocument,
+) -> list[TextExtractionCandidate]:
+    """Convert target-side template deltas into bounded text candidates.
+
+    This function consumes only deterministic comparison output.  Deleted
+    template content has no target evidence and is intentionally excluded.
+    Duplicate locations/texts are merged while retaining their diff IDs.
+    """
+
+    diffs: list[Any] = list(getattr(template_review, "diff_items", []))
+    diagnostics = getattr(template_review, "diagnostics", None)
+    diffs.extend(
+        item.diff
+        for item in getattr(diagnostics, "filtered_diff_items", [])
+        if getattr(item, "diff", None) is not None
+    )
+    candidates: dict[tuple[tuple[object, ...], str], TextExtractionCandidate] = {}
+    for diff in diffs:
+        target_side = getattr(diff, "target", None)
+        if target_side is None or getattr(diff, "diff_type", None) == "DELETED":
+            continue
+        segments = [
+            segment.text
+            for segment in getattr(diff, "segments", [])
+            if getattr(segment, "operation", None) == "INSERT" and segment.text.strip()
+            and getattr(diff, "diff_type", None) != "TABLE_STRUCTURE_EXPANDED"
+        ]
+        fallback_text = (
+            target_side.text
+            if target_side.text.strip()
+            and getattr(diff, "diff_type", None) != "TABLE_STRUCTURE_EXPANDED"
+            else ""
+        )
+        grounded_segments = [
+            grounded
+            for segment in segments
+            if (
+                grounded := _grounded_template_candidate_text(
+                    target,
+                    target_side.location,
+                    segment,
+                    "",
+                )
+            )
+            is not None
+        ]
+        texts = grounded_segments or [
+            grounded
+            for grounded in [
+                _grounded_template_candidate_text(
+                    target,
+                    target_side.location,
+                    fallback_text,
+                    "",
+                )
+            ]
+            if grounded is not None
+        ]
+        anchor = _target_block_for_location(target, target_side.location)
+        for segment_index, text in enumerate(texts):
+            context = _template_candidate_context(
+                target,
+                anchor,
+                target_side.location,
+                text,
+            )
+            normalized = normalize_text(text)
+            key = (location_key(target_side.location), normalized)
+            digest = hashlib.sha256(
+                json.dumps(
+                    [diff.diff_id, segment_index, location_key(target_side.location), normalized],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:20]
+            candidate_block = DocumentBlock(
+                block_id=f"candidate_{digest}",
+                type=anchor.type if anchor is not None else (
+                    "TABLE" if target_side.location.table_index is not None else "PARAGRAPH"
+                ),
+                order=anchor.order if anchor is not None else len(target.blocks),
+                raw_text=text,
+                normalized_text=normalize_text(text),
+                location=target_side.location,
+            )
+            existing = candidates.get(key)
+            if existing is None:
+                candidates[key] = TextExtractionCandidate(
+                    block=candidate_block,
+                    diff_ids=(diff.diff_id,),
+                    context_units=context,
+                )
+            else:
+                candidates[key] = TextExtractionCandidate(
+                    block=existing.block,
+                    diff_ids=tuple(dict.fromkeys([*existing.diff_ids, diff.diff_id])),
+                    context_units=tuple(
+                        {
+                            str(item["context_id"]): item
+                            for item in [*existing.context_units, *context]
+                        }.values()
+                    ),
+                )
+    return list(candidates.values())
 
 
 _ZERO_WIDTH_CHARS = frozenset(
@@ -668,6 +968,93 @@ def match_quote_to_source(source: str, quote: str) -> str | None:
     return unique_slice(normalized_source, normalized_quote, source_spans)
 
 
+def _unique_grounded_quote(sources: list[str], quote: str) -> str | None:
+    matches = [match_quote_to_source(source, quote) for source in sources]
+    matches = [match for match in matches if match is not None]
+    return next(iter(set(matches))) if len(set(matches)) == 1 else None
+
+
+def rehydrate_fact_evidence(
+    document: ParsedDocument,
+    facts: list[FactCandidate],
+) -> list[FactCandidate]:
+    """Re-anchor compact facts to the complete parsed document.
+
+    Candidate-based target batches may contain a diff fragment rather than the
+    complete paragraph.  Before Reduce or checkpoint reuse, resolve the
+    program-owned location against the full document and retain only a unique
+    exact/format-equivalent source slice.
+    """
+
+    evidence = _evidence_at(document)
+    rehydrated: list[FactCandidate] = []
+    for fact in facts:
+        sources = evidence.get(location_key(fact.location), [])
+        grounded_raw = _unique_grounded_quote(sources, fact.raw_value)
+        grounded_evidence = _unique_grounded_quote(sources, fact.evidence_text)
+        if grounded_raw is None:
+            raise EvidenceValidationError(
+                "fact evidence is not present at the declared document location",
+                code="FACT_VALUE_NOT_GROUNDED",
+            )
+        # A legacy candidate checkpoint can contain a fragment that was valid
+        # in the diff slice but not in the complete paragraph.  The raw value
+        # is independently grounded above, so it is the only safe fallback
+        # evidence fragment; never synthesize surrounding text.
+        grounded_evidence = grounded_evidence or grounded_raw
+        rehydrated.append(
+            fact.model_copy(
+                update={
+                    "raw_value": grounded_raw,
+                    "normalized_hint": normalize_text(grounded_raw),
+                    "evidence_text": grounded_evidence,
+                }
+            )
+        )
+    return rehydrated
+
+
+def rehydrate_numeric_fact_evidence(
+    document: ParsedDocument,
+    facts: list[FactCandidate],
+) -> list[FactCandidate]:
+    """Re-anchor numeric facts by their program-owned declared location.
+
+    Numeric raw values originate from the program scanner, which retains the
+    candidate span.  A short value may occur more than once in that same
+    paragraph or row, so requiring a unique substring match here would reject
+    a valid candidate.  The location and raw value remain unchanged; only the
+    evidence container is rehydrated from that exact location.
+    """
+
+    evidence = _evidence_at(document)
+    rehydrated: list[FactCandidate] = []
+    for fact in facts:
+        sources = evidence.get(location_key(fact.location), [])
+        source = next(
+            (
+                item
+                for item in sources
+                if normalize_text(fact.raw_value) in normalize_text(item)
+            ),
+            None,
+        )
+        if source is None:
+            raise EvidenceValidationError(
+                "numeric fact value is not present at the declared document location",
+                code="FACT_VALUE_NOT_GROUNDED",
+            )
+        rehydrated.append(
+            fact.model_copy(
+                update={
+                    "normalized_hint": normalize_text(fact.raw_value),
+                    "evidence_text": source,
+                }
+            )
+        )
+    return rehydrated
+
+
 def expand_numeric_candidate_response(
     payload: dict[str, Any], value: Any
 ) -> tuple[list[FactCandidate], set[int]]:
@@ -713,6 +1100,20 @@ def expand_text_fact_response(
     payload: dict[str, Any], value: Any
 ) -> list[FactCandidate]:
     response = TextFactExtraction.model_validate(value)
+    # Numeric/date/identifier values are owned by numeric-v2.  The text model
+    # can still emit one defensively, especially when a target-side fallback
+    # contains a number, but it must not create a second fact identity at the
+    # same location.  Numeric-v2 has already classified the program-scanned
+    # candidate and remains the sole source for those values.
+    response = response.model_copy(
+        update={
+            "items": [
+                item
+                for item in response.items
+                if item.value_type in TEXT_FACT_VALUE_TYPES
+            ]
+        }
+    )
     if len(response.items) >= 12:
         raise EvidenceValidationError(
             "text fact batch reached its saturation limit",
@@ -1045,6 +1446,8 @@ def _plan_independent_batches(
     max_numeric_candidates: int,
     max_text_units: int,
     estimated_output_token_limit: int,
+    units_override: list[DocumentBlock] | None = None,
+    text_context_by_block_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Plan one independently checkpointed numeric or text chain.
 
@@ -1054,7 +1457,18 @@ def _plan_independent_batches(
     12,000-character/24-candidate policy unchanged.
     """
 
-    units = extraction_units(document, max_unit_chars=max(1000, max_payload_chars - 1800))
+    # An explicitly supplied empty override is meaningful: a target document
+    # with no template-side text deltas must not fall back to a full-document
+    # text scan.
+    units = (
+        units_override
+        if units_override is not None
+        else extraction_units(
+            document,
+            max_unit_chars=max(1000, max_payload_chars - 1800),
+        )
+    )
+    text_context_by_block_id = text_context_by_block_id or {}
     planned: list[dict[str, Any]] = []
 
     def describe(blocks: list[DocumentBlock]) -> dict[str, Any]:
@@ -1067,7 +1481,20 @@ def _plan_independent_batches(
             )
             count = len(payload["numeric_candidates"])
         else:
-            payload = build_text_fact_payload(document, blocks, batch_id=batch_id)
+            context_units: list[dict[str, Any]] = []
+            seen_context_ids: set[str] = set()
+            for block in blocks:
+                for item in text_context_by_block_id.get(block.block_id, []):
+                    context_id = str(item.get("context_id", ""))
+                    if context_id and context_id not in seen_context_ids:
+                        seen_context_ids.add(context_id)
+                        context_units.append(item)
+            payload = build_text_fact_payload(
+                document,
+                blocks,
+                batch_id=batch_id,
+                context_units=context_units,
+            )
             # The response is capped by facts, not by unit count.  Unit count
             # remains a separate safety guard; using it in the token estimate
             # would fragment a document into needless calls.
@@ -1089,6 +1516,11 @@ def _plan_independent_batches(
             "depth": 0,
             "parent_batch_id": None,
             "extraction_version": extraction_version,
+            "context_units_by_block_id": {
+                block.block_id: text_context_by_block_id.get(block.block_id, [])
+                for block in blocks
+                if text_context_by_block_id.get(block.block_id)
+            },
         }
 
     def exceeds(plan: dict[str, Any]) -> bool:
@@ -1136,7 +1568,7 @@ def plan_text_document_batches(
     document: ParsedDocument,
     *,
     max_payload_chars: int = 12000,
-    max_text_units: int = 32,
+    max_text_units: int = 16,
     estimated_output_token_limit: int = 2000,
 ) -> list[dict[str, Any]]:
     return _plan_independent_batches(
@@ -1147,6 +1579,32 @@ def plan_text_document_batches(
         max_numeric_candidates=10**9,
         max_text_units=max_text_units,
         estimated_output_token_limit=estimated_output_token_limit,
+    )
+
+
+def plan_text_candidate_batches(
+    document: ParsedDocument,
+    candidates: list[TextExtractionCandidate],
+    *,
+    max_payload_chars: int = 12000,
+    max_candidates: int = 8,
+    estimated_output_token_limit: int = 2000,
+) -> list[dict[str, Any]]:
+    blocks = [candidate.block for candidate in candidates]
+    contexts = {
+        candidate.block.block_id: list(candidate.context_units)
+        for candidate in candidates
+    }
+    return _plan_independent_batches(
+        document,
+        chain="text",
+        extraction_version=TEXT_EXTRACTION_VERSION,
+        max_payload_chars=max_payload_chars,
+        max_numeric_candidates=10**9,
+        max_text_units=max_candidates,
+        estimated_output_token_limit=estimated_output_token_limit,
+        units_override=blocks,
+        text_context_by_block_id=contexts,
     )
 
 
@@ -1305,6 +1763,26 @@ def _table_row_unit(
         location=row_location,
         table=row_table,
     )
+
+
+def split_table_text_unit(block: DocumentBlock) -> list[DocumentBlock]:
+    """Split one failed table-row text unit into independently grounded cells.
+
+    Rows remain the normal planning unit.  This narrow recovery path is only
+    used after a row-level quote/identity failure, where repeated merged-cell
+    text can make an otherwise valid quote ambiguous.  Each child retains the
+    original table, row and column coordinates.
+    """
+
+    if block.table is None or len(block.table.rows) != 1:
+        return []
+    row = block.table.rows[0]
+    if len(row.cells) < 2:
+        return []
+    return [
+        _table_row_unit(block, row, cells=[cell], group_index=column)
+        for column, cell in enumerate(row.cells)
+    ]
 
 
 def extraction_units(
@@ -1584,6 +2062,69 @@ def _review_payload(
     }
 
 
+def _compact_review_blocks(
+    document: ParsedDocument,
+    facts: list[FactCandidate],
+    concepts: list[SemanticConcept],
+    specs: list[ValidationSpec],
+) -> list[dict[str, Any]]:
+    """Build bounded, exact evidence blocks for oversized review contexts."""
+
+    evidence = _evidence_at(document)
+    blocks: dict[tuple[tuple[object, ...], str], dict[str, Any]] = {}
+
+    def add(location: DocumentLocation, text: str) -> None:
+        if not text:
+            return
+        key = (location_key(location), text)
+        digest = hashlib.sha256(
+            json.dumps(key, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:20]
+        blocks.setdefault(
+            key,
+            {
+                "block_id": f"review_evidence_{digest}",
+                "type": "EVIDENCE",
+                "text": text,
+                "location": location.model_dump(mode="json", exclude_none=True),
+            },
+        )
+
+    for fact in facts:
+        # Fact evidence has already passed strict source rehydration and is
+        # therefore the smallest safe representation for a review batch.
+        add(fact.location, fact.evidence_text)
+    for item in [*concepts, *specs]:
+        for location in item.evidence_locations:
+            source = next(iter(evidence.get(location_key(location), [])), None)
+            if source is not None:
+                add(location, source)
+    return list(blocks.values())
+
+
+def _compact_review_payload(
+    document: ParsedDocument,
+    facts: list[FactCandidate],
+    concepts: list[SemanticConcept],
+    specs: list[ValidationSpec],
+) -> dict[str, Any]:
+    """Keep review evidence exact while excluding oversized neighboring blocks."""
+
+    return {
+        "file_id": document.file_id,
+        "role": document.role,
+        "blocks": _compact_review_blocks(document, facts, concepts, specs),
+        "facts": [fact.model_dump(mode="json") for fact in facts],
+        "semantic_concepts": [concept.model_dump(mode="json") for concept in concepts],
+        "validation_specs": [spec.model_dump(mode="json") for spec in specs],
+        "review_requirements": {
+            "required_decision_count": len(facts),
+            "one_decision_per_fact": True,
+            "evaluate_each_fact_independently": True,
+        },
+    }
+
+
 def _payload_chars(payload: dict[str, Any]) -> int:
     import json
 
@@ -1642,6 +2183,35 @@ def build_fact_review_batches(
     current_facts: list[FactCandidate] = []
     current_concepts: list[SemanticConcept] = []
     current_specs: list[ValidationSpec] = []
+    current_compact = False
+
+    def flush_current() -> None:
+        nonlocal current_blocks, current_facts, current_concepts, current_specs
+        nonlocal current_compact
+        if not (current_facts or current_concepts or current_specs):
+            return
+        batches.append(
+            _compact_review_payload(
+                document,
+                current_facts,
+                current_concepts,
+                current_specs,
+            )
+            if current_compact
+            else _review_payload(
+                document,
+                current_blocks,
+                current_facts,
+                current_concepts,
+                current_specs,
+            )
+        )
+        current_blocks = set()
+        current_facts = []
+        current_concepts = []
+        current_specs = []
+        current_compact = False
+
     for block_indexes, facts, concepts, specs in units:
         proposed = _review_payload(
             document,
@@ -1650,6 +2220,13 @@ def build_fact_review_batches(
             [*current_concepts, *concepts],
             [*current_specs, *specs],
         )
+        if current_compact:
+            proposed = _compact_review_payload(
+                document,
+                [*current_facts, *facts],
+                [*current_concepts, *concepts],
+                [*current_specs, *specs],
+            )
         if _payload_chars(proposed) <= max_chars:
             current_blocks |= block_indexes
             current_facts.extend(facts)
@@ -1657,32 +2234,31 @@ def build_fact_review_batches(
             current_specs.extend(specs)
             continue
         if current_facts or current_concepts or current_specs:
-            batches.append(
-                _review_payload(
-                    document,
-                    current_blocks,
-                    current_facts,
-                    current_concepts,
-                    current_specs,
-                )
+            compact_proposed = _compact_review_payload(
+                document,
+                [*current_facts, *facts],
+                [*current_concepts, *concepts],
+                [*current_specs, *specs],
             )
+            if _payload_chars(compact_proposed) <= max_chars:
+                current_compact = True
+                current_blocks |= block_indexes
+                current_facts.extend(facts)
+                current_concepts.extend(concepts)
+                current_specs.extend(specs)
+                continue
+            flush_current()
         single = _review_payload(document, block_indexes, facts, concepts, specs)
         if _payload_chars(single) > max_chars:
-            raise EvidenceValidationError("single review unit exceeds review batch limit")
+            single = _compact_review_payload(document, facts, concepts, specs)
+            if _payload_chars(single) > max_chars:
+                raise EvidenceValidationError("single review unit exceeds review batch limit")
+            current_compact = True
         current_blocks = set(block_indexes)
         current_facts = list(facts)
         current_concepts = list(concepts)
         current_specs = list(specs)
-    if current_facts or current_concepts or current_specs:
-        batches.append(
-            _review_payload(
-                document,
-                current_blocks,
-                current_facts,
-                current_concepts,
-                current_specs,
-            )
-        )
+    flush_current()
     return batches
 
 
@@ -2480,7 +3056,10 @@ def fact_matrix_result_items(
     *,
     include_conflicts: bool = True,
     include_uncertain: bool = True,
+    include_required_missing: bool | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if include_required_missing is None:
+        include_required_missing = include_uncertain
     risks: list[dict[str, Any]] = []
     reviews: list[dict[str, Any]] = []
     passed: list[dict[str, Any]] = []
@@ -2541,7 +3120,7 @@ def fact_matrix_result_items(
                     "requires_manual_action": True,
                 }
             )
-        if include_uncertain and required_missing_relations:
+        if include_required_missing and required_missing_relations:
             risks.append(
                 {
                     "risk_id": f"risk_fact_missing_{item_suffix}",

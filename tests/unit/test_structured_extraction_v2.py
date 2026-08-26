@@ -1,26 +1,42 @@
+from types import SimpleNamespace
+
 import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.adapters.llm.base import LlmResult
 from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
-from app.adapters.llm.schemas import NumericCandidateExtraction, TextFactExtraction
+from app.adapters.llm.schemas import FactCandidate, NumericCandidateExtraction, TextFactExtraction
+from app.comparison.models import DiffItem, DiffSegment, DiffSide
 from app.core.config import Settings
 from app.core.errors import WorkflowError
-from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
+from app.documents.models import (
+    DocumentBlock,
+    DocumentLocation,
+    ParsedDocument,
+    ParsedTable,
+    TableCell,
+    TableRow,
+)
 from app.draft_review.checkpoints import InMemoryExtractionCheckpointStore
 from app.draft_review.extraction import (
+    _validate_fact_identity_set,
     extract_documents_with_independent_map_reduce,
     extract_documents_with_wave_map_reduce,
 )
 from app.draft_review.facts import (
     EvidenceValidationError,
     build_numeric_candidate_payload,
+    build_template_text_candidates,
     build_text_fact_payload,
     expand_numeric_candidate_response,
     expand_text_fact_response,
     match_quote_to_source,
     plan_simplified_document_batches,
+    plan_text_candidate_batches,
+    rehydrate_fact_evidence,
+    rehydrate_numeric_fact_evidence,
+    split_table_text_unit,
     stable_batch_id,
 )
 
@@ -170,6 +186,250 @@ def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
         expand_text_fact_response(payload, saturated)
 
 
+def test_failed_table_row_can_split_to_column_units_without_losing_location() -> None:
+    cells = [
+        TableCell(
+            raw_text=value,
+            normalized_text=value,
+            location=DocumentLocation(table_index=2, row=4, column=column),
+        )
+        for column, value in enumerate(("字段", "甲方", "甲方", "备注"))
+    ]
+    table = ParsedTable(table_index=2, rows=[TableRow(row=4, cells=cells)])
+    block = DocumentBlock(
+        block_id="table_row",
+        type="TABLE",
+        order=0,
+        raw_text="\t".join(cell.raw_text for cell in cells),
+        normalized_text="\t".join(cell.raw_text for cell in cells),
+        location=DocumentLocation(table_index=2, row=4),
+        table=table,
+    )
+
+    children = split_table_text_unit(block)
+
+    assert [child.location.column for child in children] == [0, 1, 2, 3]
+    assert [child.raw_text for child in children] == ["字段", "甲方", "甲方", "备注"]
+    assert all(child.location.table_index == 2 for child in children)
+
+
+def test_reduce_rejects_conflicting_fact_identity() -> None:
+    facts = [
+        FactCandidate(
+            field_key="rate",
+            display_name="利率",
+            value_type="NUMBER",
+            raw_value=value,
+            source_file_id="file_a",
+            evidence_text=value,
+            location=DocumentLocation(paragraph_index=0),
+            confidence=0.9,
+        )
+        for value in ("6", "7")
+    ]
+
+    with pytest.raises(EvidenceValidationError) as raised:
+        _validate_fact_identity_set(facts)
+
+    assert raised.value.code == "FACT_IDENTITY_CONFLICT"
+
+
+def test_candidate_fact_evidence_is_rehydrated_from_full_document_location() -> None:
+    fact = FactCandidate(
+        field_key="party",
+        display_name="主体",
+        value_type="ENTITY",
+        raw_value="甲方",
+        source_file_id="file_a",
+        evidence_text="甲方",
+        location=DocumentLocation(paragraph_index=0),
+        confidence=0.9,
+    )
+
+    rehydrated = rehydrate_fact_evidence(document(), [fact])
+
+    assert rehydrated[0].evidence_text == "甲方"
+
+
+def test_numeric_rehydration_allows_repeated_short_value_at_program_location() -> None:
+    doc = document().model_copy(
+        update={
+            "blocks": [
+                DocumentBlock(
+                    block_id="numeric",
+                    type="PARAGRAPH",
+                    order=0,
+                    raw_text="编号1和1",
+                    normalized_text="编号1和1",
+                    location=DocumentLocation(paragraph_index=0),
+                )
+            ]
+        }
+    )
+    fact = FactCandidate(
+        field_key="number",
+        display_name="编号",
+        value_type="NUMBER",
+        raw_value="1",
+        source_file_id="file_a",
+        evidence_text="编号1和1",
+        location=DocumentLocation(paragraph_index=0),
+        confidence=0.9,
+    )
+
+    rehydrated = rehydrate_numeric_fact_evidence(doc, [fact])
+
+    assert rehydrated[0].raw_value == "1"
+    assert rehydrated[0].evidence_text == "编号1和1"
+
+
+@pytest.mark.asyncio
+async def test_independent_reduce_recovers_ambiguous_table_row_by_columns() -> None:
+    cells = [
+        TableCell(
+            raw_text=value,
+            normalized_text=value,
+            location=DocumentLocation(table_index=0, row=0, column=column),
+        )
+        for column, value in enumerate(("字段", "甲方", "甲方"))
+    ]
+    table = ParsedTable(table_index=0, rows=[TableRow(row=0, cells=cells)])
+    doc = ParsedDocument(
+        file_id="table_file",
+        role="REFERENCE",
+        file_name="table.docx",
+        sha256="c" * 64,
+        page_count=None,
+        parser_name="fixture",
+        blocks=[
+            DocumentBlock(
+                block_id="table",
+                type="TABLE",
+                order=0,
+                raw_text="\t".join(cell.raw_text for cell in cells),
+                normalized_text="\t".join(cell.raw_text for cell in cells),
+                location=DocumentLocation(table_index=0),
+                table=table,
+            )
+        ],
+    )
+
+    class TableRowRetryLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.row_failed = False
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            if not self.row_failed and "\t" in payload["units"][0]["text"]:
+                self.row_failed = True
+                raise LlmClientError(
+                    "LLM_EXTRACTION_EVIDENCE_INVALID",
+                    "synthetic evidence failure",
+                    failure_code="FACT_QUOTE_NOT_GROUNDED",
+                )
+            return LlmResult(
+                value={"items": []},
+                configured_model="table-retry",
+                actual_model="table-retry",
+                mock=False,
+            )
+
+    llm = TableRowRetryLlm()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(_env_file=None, LLM_ENABLED=False),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.text_calls == 4
+    assert result["table_file"]["text_batch_count"] == 3
+    assert result["table_file"]["recovery_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_independent_reduce_reuses_completed_table_children_before_parent_retry() -> None:
+    cells = [
+        TableCell(
+            raw_text=value,
+            normalized_text=value,
+            location=DocumentLocation(table_index=0, row=0, column=column),
+        )
+        for column, value in enumerate(("字段", "甲方", "甲方"))
+    ]
+    table = ParsedTable(table_index=0, rows=[TableRow(row=0, cells=cells)])
+    doc = ParsedDocument(
+        file_id="checkpoint_table_file",
+        role="REFERENCE",
+        file_name="checkpoint-table.docx",
+        sha256="d" * 64,
+        page_count=None,
+        parser_name="fixture",
+        blocks=[
+            DocumentBlock(
+                block_id="checkpoint_table",
+                type="TABLE",
+                order=0,
+                raw_text="\t".join(cell.raw_text for cell in cells),
+                normalized_text="\t".join(cell.raw_text for cell in cells),
+                location=DocumentLocation(table_index=0),
+                table=table,
+            )
+        ],
+    )
+    store = InMemoryExtractionCheckpointStore()
+
+    class TableRowRetryLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.row_failed = False
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            if not self.row_failed and "\t" in payload["units"][0]["text"]:
+                self.row_failed = True
+                raise LlmClientError(
+                    "LLM_EXTRACTION_EVIDENCE_INVALID",
+                    "synthetic evidence failure",
+                    failure_code="FACT_QUOTE_NOT_GROUNDED",
+                )
+            return LlmResult(
+                value={"items": []},
+                configured_model="table-retry",
+                actual_model="table-retry",
+                mock=False,
+            )
+
+    first = TableRowRetryLlm()
+    settings = Settings(_env_file=None, LLM_ENABLED=False)
+
+    await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[doc],
+        llm=first,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="checkpoint_source",
+    )
+    assert first.text_calls == 4
+
+    class NoParentRetry(TableRowRetryLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            raise AssertionError("completed table children should be reused")
+
+    retry = NoParentRetry()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[doc],
+        llm=retry,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="checkpoint_retry",
+        source_task_id="checkpoint_source",
+    )
+
+    assert retry.text_calls == 0
+    assert result["checkpoint_table_file"]["text_batch_count"] == 3
+
+
 def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None:
     doc = document().model_copy(
         update={
@@ -244,6 +504,221 @@ def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None
             },
         )
     assert rewrite.value.code == "FACT_QUOTE_NOT_GROUNDED"
+
+
+def test_template_candidates_are_delta_scoped_deduplicated_and_table_aware() -> None:
+    doc = document().model_copy(
+        update={
+            "blocks": [
+                *document().blocks,
+                DocumentBlock(
+                    block_id="table0",
+                    type="TABLE",
+                    order=2,
+                    raw_text="项目\t金额\n租赁物\t100万元",
+                    normalized_text="项目 金额 租赁物 100万元",
+                    location=DocumentLocation(table_index=0),
+                    table=ParsedTable(
+                        table_index=0,
+                        rows=[
+                            TableRow(
+                                row=0,
+                                cells=[
+                                    TableCell(
+                                        raw_text="项目",
+                                        normalized_text="项目",
+                                        location=DocumentLocation(
+                                            table_index=0, row=0, column=0
+                                        ),
+                                    ),
+                                    TableCell(
+                                        raw_text="金额",
+                                        normalized_text="金额",
+                                        location=DocumentLocation(
+                                            table_index=0, row=0, column=1
+                                        ),
+                                    ),
+                                ],
+                            ),
+                            TableRow(
+                                row=1,
+                                cells=[
+                                    TableCell(
+                                        raw_text="租赁物",
+                                        normalized_text="租赁物",
+                                        location=DocumentLocation(
+                                            table_index=0, row=1, column=0
+                                        ),
+                                    ),
+                                    TableCell(
+                                        raw_text="100万元",
+                                        normalized_text="100万元",
+                                        location=DocumentLocation(
+                                            table_index=0, row=1, column=1
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                ),
+            ]
+        }
+    )
+    paragraph_location = doc.blocks[0].location
+    table_location = DocumentLocation(table_index=0, row=1, column=1)
+
+    def diff(diff_id: str, location: DocumentLocation, text: str, diff_type: str) -> DiffItem:
+        return DiffItem(
+            diff_id=diff_id,
+            diff_type=diff_type,
+            title=diff_id,
+            baseline=DiffSide(file_id="template", location=location, text="待填"),
+            target=DiffSide(file_id=doc.file_id, location=location, text=text),
+            segments=[DiffSegment(operation="INSERT", text=text)],
+            confidence=1,
+        )
+
+    duplicate = diff("duplicate", paragraph_location, "甲方", "MODIFIED")
+    review = SimpleNamespace(
+        diff_items=[
+            diff("paragraph", paragraph_location, "甲方", "MODIFIED"),
+            diff("table", table_location, "100万元", "TABLE_CELL_CHANGED"),
+            DiffItem(
+                diff_id="deleted",
+                diff_type="DELETED",
+                title="deleted",
+                baseline=DiffSide(
+                    file_id="template", location=paragraph_location, text="删除"
+                ),
+                target=None,
+                confidence=1,
+            ),
+        ],
+        diagnostics=SimpleNamespace(
+            filtered_diff_items=[SimpleNamespace(diff=duplicate)]
+        ),
+    )
+
+    candidates = build_template_text_candidates(review, doc)
+    assert len(candidates) == 2
+    assert {candidate.block.raw_text for candidate in candidates} == {"甲方", "100万元"}
+    table_candidate = next(
+        candidate for candidate in candidates if candidate.block.raw_text == "100万元"
+    )
+    assert table_candidate.block.location == table_location
+    assert table_candidate.context_units
+    plans = plan_text_candidate_batches(doc, candidates, max_candidates=1)
+    assert len(plans) == 2
+    assert all(plan["extraction_version"] == "text-v4" for plan in plans)
+    assert all(len(plan["blocks"]) == 1 for plan in plans)
+    payload = next(
+        plan["payload"] for plan in plans if plan["blocks"][0].raw_text == "100万元"
+    )
+    facts = expand_text_fact_response(
+        payload,
+        {
+            "items": [
+                {
+                    "unit_id": payload["units"][0]["unit_id"],
+                    "semantic_key": "lease_amount",
+                    "display_name": "金额",
+                    "value_type": "TEXT",
+                    "quote": "100万元",
+                    "confidence": 0.9,
+                }
+            ]
+        },
+    )
+    assert facts[0].location == table_location
+    assert facts[0].evidence_text == "100万元"
+
+
+def test_text_response_drops_numeric_categories_owned_by_numeric_chain() -> None:
+    doc = document()
+    payload = build_text_fact_payload(doc, [doc.blocks[0]], batch_id="batch_numeric_overlap")
+
+    facts = expand_text_fact_response(
+        payload,
+        {
+            "items": [
+                {
+                    "unit_id": payload["units"][0]["unit_id"],
+                    "semantic_key": "lease_term",
+                    "display_name": "期限",
+                    "value_type": "DURATION",
+                    "quote": "12个月",
+                    "confidence": 0.9,
+                },
+                {
+                    "unit_id": payload["units"][0]["unit_id"],
+                    "semantic_key": "guarantor",
+                    "display_name": "保证人",
+                    "value_type": "ENTITY",
+                    "quote": "甲方",
+                    "confidence": 0.9,
+                },
+            ]
+        },
+    )
+
+    assert [fact.field_key for fact in facts] == ["guarantor"]
+
+
+def test_empty_target_candidate_override_does_not_fall_back_to_full_document() -> None:
+    assert plan_text_candidate_batches(document(), []) == []
+
+
+def test_template_candidate_falls_back_when_insert_segment_is_not_source_grounded() -> None:
+    doc = document()
+    location = doc.blocks[0].location
+    review = SimpleNamespace(
+        diff_items=[
+            DiffItem(
+                diff_id="normalized_insert",
+                diff_type="MODIFIED",
+                title="normalized insert",
+                baseline=DiffSide(file_id="template", location=location, text="旧文本"),
+                target=DiffSide(
+                    file_id=doc.file_id,
+                    location=location,
+                    text=doc.blocks[0].raw_text,
+                ),
+                segments=[DiffSegment(operation="INSERT", text="非连续差异片段")],
+                confidence=1,
+            )
+        ],
+        diagnostics=SimpleNamespace(filtered_diff_items=[]),
+    )
+
+    candidates = build_template_text_candidates(review, doc)
+
+    assert [candidate.block.raw_text for candidate in candidates] == [
+        doc.blocks[0].raw_text
+    ]
+
+
+def test_table_structure_insert_stays_with_deterministic_diff() -> None:
+    location = DocumentLocation(table_index=9)
+    review = SimpleNamespace(
+        diff_items=[
+            DiffItem(
+                diff_id="expanded_table",
+                diff_type="TABLE_STRUCTURE_EXPANDED",
+                title="expanded table",
+                baseline=DiffSide(file_id="template", location=location, text="old"),
+                target=DiffSide(file_id="file_a", location=location, text="new"),
+                segments=[
+                    DiffSegment(operation="INSERT", text="x" * 201),
+                    DiffSegment(operation="INSERT", text="新增字段"),
+                ],
+                confidence=1,
+            )
+        ],
+        diagnostics=SimpleNamespace(filtered_diff_items=[]),
+    )
+    candidates = build_template_text_candidates(review, document())
+    assert candidates == []
 
 
 def test_v2_batch_id_is_file_content_and_version_addressed() -> None:
@@ -403,6 +878,19 @@ async def test_independent_text_failure_does_not_invalidate_numeric_checkpoint()
     assert retry.profile_calls == 0
     assert retry.numeric_calls == 0
     assert retry.text_calls >= 1
+
+    chained = CheckpointLlm(fail_text=True)
+    await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[document()],
+        llm=chained,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="task_chained_retry",
+        source_task_id="task_retry",
+    )
+    assert chained.profile_calls == 0
+    assert chained.numeric_calls == 0
+    assert chained.text_calls == 0
 
 
 @pytest.mark.asyncio

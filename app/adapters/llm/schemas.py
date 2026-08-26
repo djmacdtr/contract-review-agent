@@ -79,8 +79,8 @@ class SemanticConceptPlan(StrictLlmSchema):
     display_name: str = Field(min_length=1, max_length=80)
     value_type: ValueType
     aliases: list[str] = Field(default_factory=list, max_length=8)
-    fact_refs: list[SemanticFactRef] = Field(min_length=1, max_length=32)
-    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=8)
+    fact_refs: list[SemanticFactRef] = Field(min_length=1, max_length=512)
+    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=512)
     confidence: float = Field(ge=0, le=1)
 
 
@@ -90,7 +90,7 @@ class SemanticValidationSpec(StrictLlmSchema):
     validation_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     display_name: str = Field(min_length=1, max_length=80)
     expression: dict[str, Any]
-    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=8)
+    evidence_refs: list[SemanticEvidenceRef] = Field(min_length=1, max_length=512)
     confidence: float = Field(ge=0, le=1)
 
     @field_validator("expression")
@@ -238,8 +238,40 @@ class SemanticPlanResponse(StrictLlmSchema):
     """Internal second-phase response for concepts and declarative numeric rules."""
 
     file_id: str = Field(min_length=1, max_length=160)
-    semantic_concepts: list[SemanticConceptPlan] = Field(default_factory=list, max_length=32)
-    validation_specs: list[SemanticValidationSpec] = Field(default_factory=list, max_length=16)
+    semantic_concepts: list[SemanticConceptPlan] = Field(default_factory=list, max_length=512)
+    validation_specs: list[SemanticValidationSpec] = Field(default_factory=list, max_length=512)
+
+
+class CompactSemanticConceptPlan(StrictLlmSchema):
+    """Wire-only semantic concept; evidence is rehydrated from verified facts."""
+
+    concept_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    value_type: ValueType
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    fact_ids: list[str] = Field(min_length=1, max_length=512)
+    confidence: float = Field(ge=0, le=1)
+
+
+class CompactSemanticValidationSpec(StrictLlmSchema):
+    """Wire-only numeric rule; evidence is derived from qualified AST facts."""
+
+    validation_id: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=80)
+    expression: dict[str, Any]
+    confidence: float = Field(ge=0, le=1)
+
+
+class CompactSemanticPlanResponse(StrictLlmSchema):
+    """Wire response that keeps model output small and program-owned."""
+
+    file_id: str = Field(min_length=1, max_length=160)
+    semantic_concepts: list[CompactSemanticConceptPlan] = Field(
+        default_factory=list, max_length=512
+    )
+    validation_specs: list[CompactSemanticValidationSpec] = Field(
+        default_factory=list, max_length=512
+    )
 
 
 class FactCandidate(StrictLlmSchema):
@@ -285,6 +317,23 @@ class FactReview(StrictLlmSchema):
     decisions: list[FactReviewDecision] = Field(min_length=1)
     semantic_concepts: list[SemanticConcept] = Field(default_factory=list)
     validation_specs: list[ValidationSpec] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    evidence_complete: bool
+
+
+class CompactFactReviewDecision(StrictLlmSchema):
+    """Wire-only review decision addressed by the program-owned fact index."""
+
+    fact_index: int = Field(ge=1, le=512)
+    decision: Literal["ACCEPT", "REJECT", "UNCERTAIN"]
+    confidence: float = Field(ge=0, le=1)
+    reason_code: str = Field(min_length=1, max_length=80)
+
+
+class CompactFactReview(StrictLlmSchema):
+    """Small review response; identity and evidence are rehydrated in code."""
+
+    decisions: list[CompactFactReviewDecision] = Field(min_length=1, max_length=512)
     confidence: float = Field(ge=0, le=1)
     evidence_complete: bool
 
