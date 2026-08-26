@@ -2,6 +2,8 @@ from typing import Any
 
 from app.core.config import Settings
 from app.core.enums import TaskType
+from app.db.session import SessionFactory
+from app.draft_review.checkpoints import SqlAlchemyExtractionCheckpointStore
 from app.workflows.draft_review import DraftReviewWorkflowExecutor
 from app.workflows.final_compare import FinalCompareWorkflowExecutor
 from app.workflows.mock_graphs import ProgressCallback
@@ -16,7 +18,10 @@ class WorkflowRouter:
         draft_review: DraftReviewWorkflowExecutor | None = None,
         final_compare: FinalCompareWorkflowExecutor | None = None,
     ) -> None:
-        self.draft_review = draft_review or DraftReviewWorkflowExecutor(settings)
+        self.draft_review = draft_review or DraftReviewWorkflowExecutor(
+            settings,
+            checkpoint_store=SqlAlchemyExtractionCheckpointStore(SessionFactory),
+        )
         self.final_compare = final_compare or FinalCompareWorkflowExecutor(settings)
 
     async def run(

@@ -8,13 +8,18 @@ from app.adapters.llm.schemas import NumericCandidateExtraction, TextFactExtract
 from app.core.config import Settings
 from app.core.errors import WorkflowError
 from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
-from app.draft_review.extraction import extract_documents_with_wave_map_reduce
+from app.draft_review.checkpoints import InMemoryExtractionCheckpointStore
+from app.draft_review.extraction import (
+    extract_documents_with_independent_map_reduce,
+    extract_documents_with_wave_map_reduce,
+)
 from app.draft_review.facts import (
     EvidenceValidationError,
     build_numeric_candidate_payload,
     build_text_fact_payload,
     expand_numeric_candidate_response,
     expand_text_fact_response,
+    match_quote_to_source,
     plan_simplified_document_batches,
     stable_batch_id,
 )
@@ -165,6 +170,82 @@ def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
         expand_text_fact_response(payload, saturated)
 
 
+def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None:
+    doc = document().model_copy(
+        update={
+            "blocks": [
+                DocumentBlock(
+                    block_id="format",
+                    type="PARAGRAPH",
+                    order=0,
+                    raw_text="主体：ＡＢ\u200b<br>保证人",
+                    normalized_text="主体：ＡＢ 保证人",
+                    location=DocumentLocation(paragraph_index=4),
+                )
+            ]
+        }
+    )
+    payload = build_text_fact_payload(doc, doc.blocks, batch_id="batch_format")
+    unit_id = payload["units"][0]["unit_id"]
+    facts = expand_text_fact_response(
+        payload,
+        {
+            "items": [
+                {
+                    "unit_id": unit_id,
+                    "semantic_key": "party",
+                    "display_name": "主体",
+                    "value_type": "ENTITY",
+                    "quote": "AB",
+                    "confidence": 0.8,
+                }
+            ]
+        },
+    )
+    assert facts[0].raw_value == "ＡＢ"
+    assert facts[0].evidence_text == "ＡＢ"
+    assert match_quote_to_source("租\n赁\u200b期限", "租 赁 期限") == "租\n赁\u200b期限"
+    assert match_quote_to_source("甲方和甲方", "甲 方") is None
+    assert match_quote_to_source("甲方公司", "甲方") == "甲方"
+    assert match_quote_to_source("甲方公司", "甲方主体") is None
+
+    with pytest.raises(EvidenceValidationError) as unknown:
+        expand_text_fact_response(
+            payload,
+            {
+                "items": [
+                    {
+                        "unit_id": "unit_aaaaaaaa",
+                        "semantic_key": "party",
+                        "display_name": "主体",
+                        "value_type": "ENTITY",
+                        "quote": "ＡＢ",
+                        "confidence": 0.8,
+                    }
+                ]
+            },
+        )
+    assert unknown.value.code == "FACT_UNIT_NOT_FOUND"
+
+    with pytest.raises(EvidenceValidationError) as rewrite:
+        expand_text_fact_response(
+            payload,
+            {
+                "items": [
+                    {
+                        "unit_id": unit_id,
+                        "semantic_key": "party",
+                        "display_name": "主体",
+                        "value_type": "ENTITY",
+                        "quote": "ＡＢ主体",
+                        "confidence": 0.8,
+                    }
+                ]
+            },
+        )
+    assert rewrite.value.code == "FACT_QUOTE_NOT_GROUNDED"
+
+
 def test_v2_batch_id_is_file_content_and_version_addressed() -> None:
     doc = document()
     first = stable_batch_id("a" * 64, [doc.blocks[0]])
@@ -233,6 +314,23 @@ class WaveLlm:
         )
 
 
+class CheckpointLlm(WaveLlm):
+    def __init__(self, *, fail_text: bool = False) -> None:
+        super().__init__()
+        self.fail_text = fail_text
+
+    async def extract_text_facts(self, payload: dict) -> LlmResult:
+        self.text_calls += 1
+        if self.fail_text:
+            raise LlmClientError("LLM_INVALID_JSON", "synthetic text failure")
+        return LlmResult(
+            value={"items": []},
+            configured_model="checkpoint",
+            actual_model="checkpoint",
+            mock=False,
+        )
+
+
 @pytest.mark.asyncio
 async def test_wave_controller_profiles_once_and_completes_reduce() -> None:
     llm = WaveLlm()
@@ -277,6 +375,34 @@ async def test_wave_controller_fuses_when_first_wave_is_below_ninety_percent() -
             documents=[doc],
             llm=FailingText(),  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_independent_text_failure_does_not_invalidate_numeric_checkpoint() -> None:
+    store = InMemoryExtractionCheckpointStore()
+    settings = Settings(_env_file=None, LLM_ENABLED=False)
+    with pytest.raises(WorkflowError):
+        await extract_documents_with_independent_map_reduce(
+            settings=settings,
+            documents=[document()],
+            llm=CheckpointLlm(fail_text=True),  # type: ignore[arg-type]
+            checkpoint_store=store,
+            task_id="task_source",
+        )
+
+    retry = CheckpointLlm()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[document()],
+        llm=retry,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="task_retry",
+        source_task_id="task_source",
+    )
+    assert result["file_a"]["numeric_batch_count"] >= 1
+    assert retry.profile_calls == 0
+    assert retry.numeric_calls == 0
+    assert retry.text_calls >= 1
 
 
 @pytest.mark.asyncio

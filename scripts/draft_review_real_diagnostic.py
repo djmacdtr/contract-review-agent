@@ -27,12 +27,12 @@ from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.documents.parsers import DocxParser
 from app.draft_review.facts import (
-    build_numeric_candidate_payload,
+    TEXT_EXTRACTION_VERSION,
     build_text_fact_payload,
-    expand_numeric_candidate_response,
     expand_text_fact_response,
     extraction_units,
     numeric_candidates,
+    plan_text_document_batches,
     stable_batch_id,
     stable_unit_id,
 )
@@ -60,6 +60,14 @@ def safe_error_code(exc: BaseException) -> str:
     if isinstance(exc, TimeoutError):
         return "TIMEOUT"
     return type(exc).__name__
+
+
+def safe_failure_code(exc: BaseException) -> str:
+    """Return the most specific internal code without exposing model data."""
+
+    if isinstance(exc, LlmClientError):
+        return exc.failure_code or exc.code
+    return safe_error_code(exc)
 
 
 class SafeMetricWriter:
@@ -148,6 +156,16 @@ class SafeMetrics:
             "logical_call_started",
             operation=operation,
             file_name=self.file_names.get(file_id, "任务级"),
+            batch_depth=(
+                payload.get("batch_depth")
+                if isinstance(payload, dict) and isinstance(payload.get("batch_depth"), int)
+                else None
+            ),
+            unit_count=(
+                len(payload.get("units", []))
+                if isinstance(payload, dict) and isinstance(payload.get("units"), list)
+                else None
+            ),
         )
 
     def end_logical(
@@ -173,9 +191,16 @@ class SafeMetrics:
             fields.update(
                 request_attempts=result.request_attempts,
                 structure_retries=result.structure_retries,
+                response_item_count=(
+                    len(result.value.get("items", []))
+                    if isinstance(result.value, dict)
+                    and isinstance(result.value.get("items"), list)
+                    else None
+                ),
             )
         if error is not None:
             fields["error_code"] = safe_error_code(error)
+            fields["failure_code"] = safe_failure_code(error)
             if self.first_failure_stage is None:
                 self.first_failure_stage = operation
         self.writer.emit("logical_call_finished", **fields)
@@ -207,6 +232,13 @@ class SafeMetrics:
         self.response_chars += len(content)
         operation, file_id, _batch_id = self.call_context.get()
         finish_reason: str | None = None
+        content_chars = 0
+        reasoning_content_chars = 0
+        content_empty = None
+        content_has_code_fence = None
+        json_boundary_type = None
+        json_error_type = None
+        json_error_position_ratio = None
         usage: dict[str, int] = {}
         if response.status_code < 400:
             try:
@@ -216,6 +248,30 @@ class SafeMetrics:
                     candidate = choices[0].get("finish_reason")
                     if isinstance(candidate, str):
                         finish_reason = candidate
+                    message = choices[0].get("message")
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            content_chars = len(content)
+                            content_empty = not bool(content.strip())
+                            content_has_code_fence = "```" in content
+                            stripped = content.strip()
+                            if stripped.startswith("{") and stripped.endswith("}"):
+                                json_boundary_type = "object"
+                            elif stripped.startswith("[") and stripped.endswith("]"):
+                                json_boundary_type = "array"
+                            else:
+                                json_boundary_type = "other"
+                            try:
+                                json.loads(stripped)
+                            except json.JSONDecodeError as exc:
+                                json_error_type = exc.msg[:80]
+                                json_error_position_ratio = round(
+                                    exc.pos / max(len(stripped), 1), 6
+                                )
+                        reasoning = message.get("reasoning_content")
+                        if isinstance(reasoning, str):
+                            reasoning_content_chars = len(reasoning)
                 raw_usage = body.get("usage") if isinstance(body, dict) else None
                 if isinstance(raw_usage, dict):
                     usage = {
@@ -233,6 +289,13 @@ class SafeMetrics:
             status_code=response.status_code,
             request_chars=len(request.content),
             response_chars=len(content),
+            content_chars=content_chars,
+            reasoning_content_chars=reasoning_content_chars,
+            content_empty=content_empty,
+            content_has_code_fence=content_has_code_fence,
+            json_boundary_type=json_boundary_type,
+            json_error_type=json_error_type,
+            json_error_position_ratio=json_error_position_ratio,
             finish_reason=finish_reason,
             usage=usage,
         )
@@ -349,11 +412,19 @@ class RecordingLlm:
             file_id=payload.get("file_id"),
         )
 
-    async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult:
+    async def extract_text_facts(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_structure_correction: bool = True,
+    ) -> LlmResult:
         return await self._call(
             "TEXT_FACT_EXTRACTION",
             payload,
-            self.client.extract_text_facts,
+            lambda value: self.client.extract_text_facts(
+                value,
+                allow_structure_correction=allow_structure_correction,
+            ),
             file_id=payload.get("file_id"),
         )
 
@@ -556,6 +627,7 @@ async def run_canary_once(
     output_path: Path,
     lock_path: Path,
     sample_dir: Path = SAMPLE_DIR,
+    force_probe: bool = False,
 ) -> int:
     """Run the one-shot five-batch business canary; no structure retries."""
 
@@ -563,18 +635,27 @@ async def run_canary_once(
     writer = SafeMetricWriter(output_path)
     try:
         settings = diagnostic_settings()
-        probe = await run_production_probe(settings)
-        writer.emit(
-            "structured_output_probe",
-            production_gate_passed=probe.get("production_gate_passed"),
-            selected_response_format=probe.get("selected_response_format"),
-            probe_http_calls=probe.get("total_http_calls", 0),
-        )
-        if not probe.get("production_gate_passed"):
-            writer.emit("canary_finished", status="BLOCKED", reason_code="PROBE_GATE_FAILED")
-            return 2
-        settings.LLM_RESPONSE_FORMAT = probe["selected_response_format"]
-        settings.LLM_NATIVE_STRUCTURED_OUTPUT = probe["selected_response_format"] == "json_schema"
+        if force_probe:
+            probe = await run_production_probe(settings)
+            writer.emit(
+                "structured_output_probe",
+                production_gate_passed=probe.get("production_gate_passed"),
+                selected_response_format=probe.get("selected_response_format"),
+                probe_http_calls=probe.get("total_http_calls", 0),
+            )
+            if not probe.get("production_gate_passed"):
+                writer.emit("canary_finished", status="BLOCKED", reason_code="PROBE_GATE_FAILED")
+                return 2
+            selected_format = probe["selected_response_format"]
+        else:
+            selected_format = "json_schema"
+            writer.emit(
+                "structured_output_probe_skipped",
+                selected_response_format=selected_format,
+                reason_code="VALIDATED_DEPLOYMENT_CONFIGURATION",
+            )
+        settings.LLM_RESPONSE_FORMAT = selected_format
+        settings.LLM_NATIVE_STRUCTURED_OUTPUT = selected_format == "json_schema"
         target_path = sample_dir / REAL_FILES[0][0]
         content = target_path.read_bytes()
         local_file = LocalFile(
@@ -595,23 +676,14 @@ async def run_canary_once(
         client = OpenAIContractLlmClient(settings)
         results: list[dict[str, Any]] = []
         for index, unit in enumerate(units, start=1):
-            batch_id = stable_batch_id(document.sha256, [unit])
-            candidates = numeric_candidates([unit])
+            batch_id = stable_batch_id(document.sha256, [unit], TEXT_EXTRACTION_VERSION)
             try:
-                if candidates:
-                    payload = build_numeric_candidate_payload(document, [unit], batch_id=batch_id)
-                    result = await client.extract_numeric_candidates(
-                        payload, allow_structure_correction=False
-                    )
-                    expand_numeric_candidate_response(payload, result.value)
-                    chain = "numeric"
-                else:
-                    payload = build_text_fact_payload(document, [unit], batch_id=batch_id)
-                    result = await client.extract_text_facts(
-                        payload, allow_structure_correction=False
-                    )
-                    expand_text_fact_response(payload, result.value)
-                    chain = "text"
+                payload = build_text_fact_payload(document, [unit], batch_id=batch_id)
+                result = await client.extract_text_facts(
+                    payload, allow_structure_correction=False
+                )
+                expand_text_fact_response(payload, result.value)
+                chain = "text"
                 results.append(
                     {
                         "sample_index": index,
@@ -619,6 +691,7 @@ async def run_canary_once(
                         "chain": chain,
                         "status": "SUCCEEDED",
                         "finish_reason": result.finish_reason,
+                        "response_item_count": len(result.value.get("items", [])),
                     }
                 )
             except BaseException as exc:
@@ -653,11 +726,148 @@ async def run_canary_once(
         writer.close()
 
 
+async def run_text_diagnosis_once(
+    *,
+    output_path: Path,
+    lock_path: Path,
+    sample_dir: Path = SAMPLE_DIR,
+) -> int:
+    """Diagnose one dense text batch with at most two logical calls."""
+
+    claim_once(lock_path)
+    writer = SafeMetricWriter(output_path)
+    metrics = SafeMetrics(writer=writer, file_names={})
+    transport: RecordingTransport | None = None
+    observed: list[dict[str, Any]] = []
+    failure: str | None = None
+    try:
+        settings = diagnostic_settings()
+        settings.LLM_RESPONSE_FORMAT = "json_schema"
+        settings.LLM_NATIVE_STRUCTURED_OUTPUT = True
+        target_path = sample_dir / REAL_FILES[0][0]
+        content = target_path.read_bytes()
+        metrics.file_names["diagnostic_target"] = target_path.name
+        local_file = LocalFile(
+            file_id="diagnostic_target",
+            role="TARGET",
+            file_name=target_path.name,
+            safe_url="local-diagnostic://redacted",
+            path=target_path,
+            file_size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            detected_mime_type=DOCX_MIME,
+        )
+        document = await DocxParser().parse(local_file)
+        plans = plan_text_document_batches(
+            document,
+            max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+            max_text_units=settings.LLM_EXTRACTION_MAX_TEXT_UNITS,
+            estimated_output_token_limit=settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS,
+        )
+        if not plans:
+            raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "没有可诊断的文本批次")
+        # The largest unit-count batch is the safest deterministic proxy for
+        # the previously failed dense first-wave batches.
+        selected = max(plans, key=lambda item: (len(item["blocks"]), len(item["payload"]["units"])))
+        payload = selected["payload"]
+        payload.update(
+            {
+                "batch_depth": 0,
+                "parent_batch_id": None,
+                "planned_batch_count": len(plans),
+            }
+        )
+        transport = RecordingTransport(
+            httpx.AsyncHTTPTransport(retries=0),
+            metrics,
+            read_timeout=settings.LLM_TIMEOUT_SECONDS,
+        )
+        client = OpenAIContractLlmClient(settings, transport=transport)
+        recorder = RecordingLlm(client, metrics)
+        for attempt in range(1, 3):
+            try:
+                result = await recorder.extract_text_facts(
+                    payload,
+                    allow_structure_correction=False,
+                )
+                facts = expand_text_fact_response(payload, result.value)
+                observed.append(
+                    {
+                        "attempt": attempt,
+                        "status": "SUCCEEDED",
+                        "response_item_count": len(result.value.get("items", [])),
+                        "validated_fact_count": len(facts),
+                        "finish_reason": result.finish_reason,
+                    }
+                )
+                break
+            except BaseException as exc:
+                code = safe_failure_code(exc)
+                observed.append(
+                    {
+                        "attempt": attempt,
+                        "status": "FAILED",
+                        "error_code": safe_error_code(exc),
+                        "failure_code": code,
+                        "batch_depth": payload.get("batch_depth", 0),
+                        "unit_count": len(payload.get("units", [])),
+                    }
+                )
+                if attempt == 1 and len(selected["blocks"]) > 1 and code in {
+                    "FACT_BATCH_SATURATED",
+                    "FACT_UNIT_NOT_FOUND",
+                    "FACT_QUOTE_NOT_GROUNDED",
+                    "FACT_IDENTITY_DUPLICATED",
+                }:
+                    midpoint = len(selected["blocks"]) // 2
+                    child_blocks = selected["blocks"][:midpoint]
+                    child_id = stable_batch_id(
+                        document.sha256,
+                        child_blocks,
+                        TEXT_EXTRACTION_VERSION,
+                    )
+                    payload = build_text_fact_payload(
+                        document,
+                        child_blocks,
+                        batch_id=child_id,
+                    )
+                    payload.update(
+                        {
+                            "batch_depth": 1,
+                            "parent_batch_id": selected["batch_id"],
+                            "planned_batch_count": len(plans),
+                        }
+                    )
+                    continue
+                break
+        status = "SUCCEEDED" if observed and observed[-1]["status"] == "SUCCEEDED" else "FAILED"
+        writer.emit(
+            "text_diagnosis_finished",
+            status=status,
+            planned_text_batch_count=len(plans),
+            selected_unit_count=len(selected["blocks"]),
+            calls=len(observed),
+            observed=observed,
+            http_calls=metrics.http_calls,
+            logical_calls=metrics.logical_calls,
+        )
+        return 0 if status == "SUCCEEDED" else 2
+    except BaseException as exc:
+        failure = safe_error_code(exc)
+        writer.emit("text_diagnosis_finished", status="FAILED", error_code=failure)
+        return 2
+    finally:
+        if transport is not None:
+            await transport.close_all()
+        writer.close()
+
+
 async def run_once(
     *,
     output_path: Path = DEFAULT_OUTPUT,
     lock_path: Path = DEFAULT_LOCK,
     sample_dir: Path = SAMPLE_DIR,
+    force_probe: bool = False,
 ) -> int:
     claim_once(lock_path)
 
@@ -670,30 +880,37 @@ async def run_once(
         settings = diagnostic_settings()
         if not settings.llm_configured:
             raise RuntimeError("LLM gateway is not configured")
-        probe = await run_production_probe(settings)
-        metrics.probe_http_calls = int(probe.get("total_http_calls", 0))
-        if not probe.get("production_gate_passed"):
+        if force_probe:
+            probe = await run_production_probe(settings)
+            metrics.probe_http_calls = int(probe.get("total_http_calls", 0))
+            if not probe.get("production_gate_passed"):
+                writer.emit(
+                    "structured_output_probe_gate_failed",
+                    selected_response_format=probe.get("selected_response_format"),
+                    probe_http_calls=metrics.probe_http_calls,
+                )
+                raise WorkflowError(
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "复杂结构化输出探测未达到两个 Schema 各 3/3 成功门槛",
+                )
+            selected_format = probe["selected_response_format"]
             writer.emit(
-                "structured_output_probe_gate_failed",
-                selected_response_format=probe.get("selected_response_format"),
+                "structured_output_probe",
+                json_schema=probe["json_schema"],
+                json_object=probe["json_object"],
+                selected_response_format=selected_format,
+                production_gate_passed=probe["production_gate_passed"],
                 probe_http_calls=metrics.probe_http_calls,
             )
-            raise WorkflowError(
-                "DYNAMIC_CHECK_INCOMPLETE",
-                "复杂结构化输出探测未达到两个 Schema 各 3/3 成功门槛",
+        else:
+            selected_format = "json_schema"
+            writer.emit(
+                "structured_output_probe_skipped",
+                selected_response_format=selected_format,
+                reason_code="VALIDATED_DEPLOYMENT_CONFIGURATION",
             )
-        settings.LLM_RESPONSE_FORMAT = probe["selected_response_format"]
-        settings.LLM_NATIVE_STRUCTURED_OUTPUT = (
-            probe["selected_response_format"] == "json_schema"
-        )
-        writer.emit(
-            "structured_output_probe",
-            json_schema=probe["json_schema"],
-            json_object=probe["json_object"],
-            selected_response_format=probe["selected_response_format"],
-            production_gate_passed=probe["production_gate_passed"],
-            probe_http_calls=metrics.probe_http_calls,
-        )
+        settings.LLM_RESPONSE_FORMAT = selected_format
+        settings.LLM_NATIVE_STRUCTURED_OUTPUT = selected_format == "json_schema"
         source_by_name = {file_name: sample_dir / file_name for file_name, _role in REAL_FILES}
         missing = [file_name for file_name, path in source_by_name.items() if not path.is_file()]
         if missing:
@@ -796,6 +1013,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     parser.add_argument("--sample-dir", type=Path, default=SAMPLE_DIR)
     parser.add_argument("--canary", action="store_true")
+    parser.add_argument("--text-diagnosis", action="store_true")
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="显式执行部署级结构化输出探测；普通合同任务不重复探测",
+    )
     return parser.parse_args()
 
 
@@ -803,16 +1026,24 @@ if __name__ == "__main__":
     arguments = parse_args()
     raise SystemExit(
         asyncio.run(
-            run_canary_once(
+            run_text_diagnosis_once(
                 output_path=arguments.output,
                 lock_path=arguments.lock,
                 sample_dir=arguments.sample_dir,
+            )
+            if arguments.text_diagnosis
+            else run_canary_once(
+                output_path=arguments.output,
+                lock_path=arguments.lock,
+                sample_dir=arguments.sample_dir,
+                force_probe=arguments.probe,
             )
             if arguments.canary
             else run_once(
                 output_path=arguments.output,
                 lock_path=arguments.lock,
                 sample_dir=arguments.sample_dir,
+                force_probe=arguments.probe,
             )
         )
     )

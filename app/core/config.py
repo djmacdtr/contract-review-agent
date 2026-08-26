@@ -69,6 +69,10 @@ class Settings(BaseSettings):
         default=2000, ge=256, le=4096
     )
     LLM_EXTRACTION_MAX_TEXT_FACTS: int = Field(default=12, ge=1, le=12)
+    # Text facts use a smaller structural-unit ceiling than numeric batches so
+    # a dense response can be split before it reaches the 12-item saturation
+    # boundary.
+    LLM_EXTRACTION_MAX_TEXT_UNITS: int = Field(default=32, ge=1, le=128)
     LLM_EXTRACTION_WAVE_SIZE: int = Field(default=6, ge=1, le=8)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET: int = Field(default=40, ge=1, le=128)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=50, ge=1, le=256)

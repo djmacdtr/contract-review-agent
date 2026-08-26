@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -472,6 +473,9 @@ def stable_unit_id(block: DocumentBlock) -> str:
 
 
 EXTRACTION_VERSION = "structured-map-reduce-v2"
+PROFILE_EXTRACTION_VERSION = "profile-v2"
+NUMERIC_EXTRACTION_VERSION = "numeric-v2"
+TEXT_EXTRACTION_VERSION = "text-v3"
 
 
 def stable_batch_id(
@@ -574,10 +578,94 @@ def build_text_fact_payload(
         "units": _simplified_units(blocks),
         "requirements": {
             "max_items": 12,
-            "quote_must_be_exact_substring": True,
+            "quote_must_be_exact_or_format_equivalent_substring": True,
             "identity_and_location_are_program_owned": True,
         },
     }
+
+
+_ZERO_WIDTH_CHARS = frozenset(
+    {
+        "\u200b",
+        "\u200c",
+        "\u200d",
+        "\u2060",
+        "\ufeff",
+    }
+)
+_BREAK_TAG = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
+
+
+def _normalised_text_with_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """Normalize only presentation differences and retain source spans.
+
+    This is deliberately not a fuzzy matcher.  Every emitted normalized
+    character points to the original character(s), so a unique hit can be
+    returned as an exact source slice and all ambiguous hits are rejected.
+    """
+
+    chars: list[str] = []
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        tag = _BREAK_TAG.match(text, index)
+        if tag:
+            chars.append(" ")
+            spans.append((index, tag.end()))
+            index = tag.end()
+            continue
+        source_char = text[index]
+        if source_char in _ZERO_WIDTH_CHARS or source_char.isspace():
+            normalized = " "
+        else:
+            normalized = unicodedata.normalize("NFKC", source_char)
+        for char in normalized:
+            chars.append(char)
+            spans.append((index, index + 1))
+        index += 1
+
+    collapsed_chars: list[str] = []
+    collapsed_spans: list[tuple[int, int]] = []
+    for char, span in zip(chars, spans, strict=True):
+        if char == " " and collapsed_chars and collapsed_chars[-1] == " ":
+            start, _end = collapsed_spans[-1]
+            collapsed_spans[-1] = (start, span[1])
+            continue
+        collapsed_chars.append(char)
+        collapsed_spans.append(span)
+    return "".join(collapsed_chars), collapsed_spans
+
+
+def match_quote_to_source(source: str, quote: str) -> str | None:
+    """Return a uniquely grounded original slice, or ``None``.
+
+    Exact matching is attempted first.  The fallback permits only NFKC and
+    presentation whitespace/``<br>``/zero-width normalization.  Rewritten
+    text and ambiguous matches never pass this function.
+    """
+
+    def unique_slice(haystack: str, needle: str, spans: list[tuple[int, int]] | None) -> str | None:
+        if not needle:
+            return None
+        positions: list[int] = []
+        cursor = haystack.find(needle)
+        while cursor >= 0:
+            positions.append(cursor)
+            cursor = haystack.find(needle, cursor + 1)
+        if len(positions) != 1:
+            return None
+        start = positions[0]
+        if spans is None:
+            return source[start : start + len(needle)]
+        end = start + len(needle)
+        return source[spans[start][0] : spans[end - 1][1]]
+
+    exact = unique_slice(source, quote, None)
+    if exact is not None:
+        return exact
+    normalized_source, source_spans = _normalised_text_with_spans(source)
+    normalized_quote, _quote_spans = _normalised_text_with_spans(quote)
+    return unique_slice(normalized_source, normalized_quote, source_spans)
 
 
 def expand_numeric_candidate_response(
@@ -634,7 +722,7 @@ def expand_text_fact_response(
         item["unit_id"]: item for item in payload.get("units", []) if isinstance(item, dict)
     }
     facts: list[FactCandidate] = []
-    identities: set[tuple[str, str, str]] = set()
+    identities: set[tuple[str, str]] = set()
     for item in response.items:
         unit = units.get(item.unit_id)
         if unit is None:
@@ -642,13 +730,19 @@ def expand_text_fact_response(
                 "text fact references an unknown unit", code="FACT_UNIT_NOT_FOUND"
             )
         text = unit.get("text", "")
-        if not isinstance(text, str) or item.quote not in text:
+        if not isinstance(text, str):
             raise EvidenceValidationError(
                 "text fact quote is not an exact substring",
                 code="FACT_QUOTE_NOT_GROUNDED",
             )
         location = DocumentLocation.model_validate(unit["location"])
-        identity = (item.semantic_key, item.unit_id, item.quote)
+        grounded_quote = match_quote_to_source(text, item.quote)
+        if grounded_quote is None:
+            raise EvidenceValidationError(
+                "text fact quote is not an exact substring or uniquely grounded",
+                code="FACT_QUOTE_NOT_GROUNDED",
+            )
+        identity = (item.semantic_key, item.unit_id)
         if identity in identities:
             raise EvidenceValidationError(
                 "text fact identity is duplicated", code="FACT_IDENTITY_DUPLICATED"
@@ -659,10 +753,10 @@ def expand_text_fact_response(
                 field_key=item.semantic_key,
                 display_name=item.display_name,
                 value_type=item.value_type,
-                raw_value=item.quote,
-                normalized_hint=normalize_text(item.quote),
+                raw_value=grounded_quote,
+                normalized_hint=normalize_text(grounded_quote),
                 source_file_id=str(payload.get("file_id", "")),
-                evidence_text=text,
+                evidence_text=grounded_quote,
                 location=location,
                 confidence=item.confidence,
             )
@@ -940,6 +1034,120 @@ def plan_simplified_document_batches(
     if current:
         planned.append(describe(current))
     return planned
+
+
+def _plan_independent_batches(
+    document: ParsedDocument,
+    *,
+    chain: str,
+    extraction_version: str,
+    max_payload_chars: int,
+    max_numeric_candidates: int,
+    max_text_units: int,
+    estimated_output_token_limit: int,
+) -> list[dict[str, Any]]:
+    """Plan one independently checkpointed numeric or text chain.
+
+    Text batches intentionally have a structural-unit ceiling in addition to
+    the payload ceiling.  This keeps a dense text response away from the
+    twelve-item saturation boundary while leaving the numeric planner's
+    12,000-character/24-candidate policy unchanged.
+    """
+
+    units = extraction_units(document, max_unit_chars=max(1000, max_payload_chars - 1800))
+    planned: list[dict[str, Any]] = []
+
+    def describe(blocks: list[DocumentBlock]) -> dict[str, Any]:
+        batch_id = stable_batch_id(document.sha256, blocks, extraction_version)
+        if chain == "numeric":
+            payload = build_numeric_candidate_payload(document, blocks, batch_id=batch_id)
+            estimated = estimate_simplified_output_tokens(
+                numeric_candidate_count=len(payload["numeric_candidates"]),
+                max_text_facts=0,
+            )
+            count = len(payload["numeric_candidates"])
+        else:
+            payload = build_text_fact_payload(document, blocks, batch_id=batch_id)
+            # The response is capped by facts, not by unit count.  Unit count
+            # remains a separate safety guard; using it in the token estimate
+            # would fragment a document into needless calls.
+            estimated = estimate_simplified_output_tokens(
+                numeric_candidate_count=0,
+                max_text_facts=12,
+            )
+            count = 0
+        return {
+            "batch_id": batch_id,
+            "document_id": document.file_id,
+            "file_sha256": document.sha256,
+            "blocks": blocks,
+            "unit_ids": [stable_unit_id(block) for block in blocks],
+            "payload": payload,
+            "chain": chain,
+            "numeric_candidate_count": count,
+            "estimated_output_tokens": estimated,
+            "depth": 0,
+            "parent_batch_id": None,
+            "extraction_version": extraction_version,
+        }
+
+    def exceeds(plan: dict[str, Any]) -> bool:
+        return (
+            extraction_payload_chars(plan["payload"]) > max_payload_chars
+            or plan["numeric_candidate_count"] > max_numeric_candidates
+            or plan["estimated_output_tokens"] > estimated_output_token_limit
+            or (chain == "text" and len(plan["blocks"]) > max_text_units)
+        )
+
+    current: list[DocumentBlock] = []
+    for unit in units:
+        candidate = describe([*current, unit])
+        if current and exceeds(candidate):
+            planned.append(describe(current))
+            current = []
+            candidate = describe([unit])
+        if exceeds(candidate):
+            raise EvidenceValidationError("single independent extraction unit exceeds batch limits")
+        current.append(unit)
+    if current:
+        planned.append(describe(current))
+    return planned
+
+
+def plan_numeric_document_batches(
+    document: ParsedDocument,
+    *,
+    max_payload_chars: int = 12000,
+    max_numeric_candidates: int = 24,
+    estimated_output_token_limit: int = 2000,
+) -> list[dict[str, Any]]:
+    return _plan_independent_batches(
+        document,
+        chain="numeric",
+        extraction_version=NUMERIC_EXTRACTION_VERSION,
+        max_payload_chars=max_payload_chars,
+        max_numeric_candidates=max_numeric_candidates,
+        max_text_units=10**9,
+        estimated_output_token_limit=estimated_output_token_limit,
+    )
+
+
+def plan_text_document_batches(
+    document: ParsedDocument,
+    *,
+    max_payload_chars: int = 12000,
+    max_text_units: int = 32,
+    estimated_output_token_limit: int = 2000,
+) -> list[dict[str, Any]]:
+    return _plan_independent_batches(
+        document,
+        chain="text",
+        extraction_version=TEXT_EXTRACTION_VERSION,
+        max_payload_chars=max_payload_chars,
+        max_numeric_candidates=10**9,
+        max_text_units=max_text_units,
+        estimated_output_token_limit=estimated_output_token_limit,
+    )
 
 
 def expand_document_overview(

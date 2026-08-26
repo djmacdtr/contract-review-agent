@@ -620,6 +620,7 @@ class OpenAIContractLlmClient:
             validator=lambda value: _validate_text_facts(value, payload),
             schema=TextFactExtraction,
             max_structure_retries=1 if allow_structure_correction else 0,
+            allow_evidence_correction=allow_structure_correction,
             invalid_json_structure_correction=False,
         )
 
@@ -698,6 +699,7 @@ class OpenAIContractLlmClient:
         response_schema: dict[str, Any] | None = None,
         max_structure_retries: int | None = None,
         allow_structure_correction: bool = True,
+        allow_evidence_correction: bool = True,
         invalid_json_structure_correction: bool = True,
     ) -> LlmResult:
         started = time.perf_counter()
@@ -783,6 +785,7 @@ class OpenAIContractLlmClient:
                         finish_reason=finish_reason,
                         structure_attempt=structure_attempt,
                         retry_limit=retry_limit,
+                        allow_evidence_correction=allow_evidence_correction,
                         invalid_json_structure_correction=invalid_json_structure_correction,
                     ):
                         raise exc
@@ -805,6 +808,7 @@ class OpenAIContractLlmClient:
         finish_reason: str | None,
         structure_attempt: int,
         retry_limit: int,
+        allow_evidence_correction: bool = True,
         invalid_json_structure_correction: bool = True,
     ) -> bool:
         if structure_attempt >= retry_limit:
@@ -812,6 +816,8 @@ class OpenAIContractLlmClient:
         if error.code == "LLM_INVALID_JSON":
             return invalid_json_structure_correction and finish_reason in {None, "stop"}
         if error.failure_code == "FACT_BATCH_SATURATED":
+            return False
+        if error.code == "LLM_EXTRACTION_EVIDENCE_INVALID" and not allow_evidence_correction:
             return False
         return error.code in {
             "LLM_SCHEMA_INVALID",

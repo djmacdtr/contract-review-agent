@@ -29,8 +29,8 @@ from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarnin
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.draft_review.extraction import (
+    extract_documents_with_independent_map_reduce,
     extract_documents_with_map_reduce,
-    extract_documents_with_wave_map_reduce,
 )
 from app.draft_review.facts import (
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
@@ -221,13 +221,15 @@ class DraftReviewWorkflowExecutor:
                 )
             ):
                 try:
-                    extractions, _profile_meta = await extract_documents_with_wave_map_reduce(
-                        settings=self.settings,
-                        documents=state["parsed_documents"],
-                        llm=self.llm,
-                        checkpoint_store=self.checkpoint_store,
-                        task_id=state.get("task_id"),
-                        source_task_id=state.get("options", {}).get("source_task_id"),
+                    extractions, _profile_meta = await (
+                        extract_documents_with_independent_map_reduce(
+                            settings=self.settings,
+                            documents=state["parsed_documents"],
+                            llm=self.llm,
+                            checkpoint_store=self.checkpoint_store,
+                            task_id=state.get("task_id"),
+                            source_task_id=state.get("options", {}).get("source_task_id"),
+                        )
                     )
                     # The remainder of this node (fact review and its
                     # deterministic merge) is shared with the compatibility
