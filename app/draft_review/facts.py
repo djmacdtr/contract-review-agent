@@ -770,6 +770,7 @@ def build_text_fact_payload(
     *,
     batch_id: str,
     context_units: list[dict[str, Any]] | None = None,
+    max_items: int = 12,
 ) -> dict[str, Any]:
     return {
         "file_id": document.file_id,
@@ -778,7 +779,7 @@ def build_text_fact_payload(
         "units": _simplified_units(blocks),
         "readonly_context": context_units or [],
         "requirements": {
-            "max_items": 12,
+            "max_items": max_items,
             "quote_must_be_exact_or_format_equivalent_substring": True,
             "facts_must_reference_candidate_units_only": True,
             "readonly_context_cannot_be_used_as_evidence": True,
@@ -1254,7 +1255,12 @@ def expand_text_fact_response(
             ]
         }
     )
-    if len(response.items) >= 12:
+    try:
+        max_items = int(payload.get("requirements", {}).get("max_items", 12))
+    except (AttributeError, TypeError, ValueError):
+        max_items = 12
+    max_items = max(1, min(max_items, 12))
+    if len(response.items) >= max_items:
         raise EvidenceValidationError(
             "text fact batch reached its saturation limit",
             code="FACT_BATCH_SATURATED",
@@ -1303,6 +1309,115 @@ def expand_text_fact_response(
             )
         )
     return facts
+
+
+def filter_text_fact_evidence(
+    document: ParsedDocument,
+    payload: dict[str, Any],
+    value: Any,
+) -> tuple[list[FactCandidate], dict[str, int]]:
+    """Keep only text candidates that survive deterministic evidence checks.
+
+    Text extraction is a candidate generator. A valid response may still
+    contain one hallucinated quote or a location that cannot be rehydrated
+    against the complete document. Those candidates are discarded
+    independently; the remaining candidates, including an empty set, remain
+    a valid result for the structural unit. Response-level schema and
+    saturation failures stay strict because they do not identify an
+    independently safe candidate set.
+    """
+
+    response = TextFactExtraction.model_validate(value)
+    response = response.model_copy(
+        update={
+            "items": [
+                item
+                for item in response.items
+                if item.value_type in TEXT_FACT_VALUE_TYPES
+            ]
+        }
+    )
+    try:
+        max_items = int(payload.get("requirements", {}).get("max_items", 12))
+    except (AttributeError, TypeError, ValueError):
+        max_items = 12
+    max_items = max(1, min(max_items, 12))
+    if len(response.items) >= max_items:
+        raise EvidenceValidationError(
+            "text fact batch reached its saturation limit",
+            code="FACT_BATCH_SATURATED",
+        )
+
+    units = {
+        item["unit_id"]: item
+        for item in payload.get("units", [])
+        if isinstance(item, dict)
+    }
+    discarded: dict[str, int] = {}
+    accepted: list[FactCandidate] = []
+    seen_model_identities: set[tuple[str, str]] = set()
+    seen_fact_values: dict[tuple[Any, ...], str] = {}
+
+    def discard(code: str) -> None:
+        discarded[code] = discarded.get(code, 0) + 1
+
+    for item in response.items:
+        model_identity = (item.semantic_key, item.unit_id)
+        if model_identity in seen_model_identities:
+            discard("FACT_IDENTITY_DUPLICATED")
+            continue
+
+        unit = units.get(item.unit_id)
+        if unit is None:
+            discard("FACT_UNIT_NOT_FOUND")
+            continue
+        source_text = unit.get("text", "")
+        if not isinstance(source_text, str):
+            discard("FACT_QUOTE_NOT_GROUNDED")
+            continue
+        grounded_quote = match_quote_to_source(source_text, item.quote)
+        if grounded_quote is None:
+            discard("FACT_QUOTE_NOT_GROUNDED")
+            continue
+        try:
+            location = DocumentLocation.model_validate(unit["location"])
+            fact = FactCandidate(
+                field_key=item.semantic_key,
+                display_name=item.display_name,
+                value_type=item.value_type,
+                raw_value=grounded_quote,
+                normalized_hint=normalize_text(grounded_quote),
+                source_file_id=str(payload.get("file_id", "")),
+                evidence_text=grounded_quote,
+                location=location,
+                confidence=item.confidence,
+            )
+            fact = rehydrate_fact_evidence(document, [fact])[0]
+        except EvidenceValidationError as exc:
+            discard(exc.code)
+            continue
+        except (TypeError, ValueError):
+            discard("LLM_RESPONSE_SCHEMA_INVALID")
+            continue
+
+        identity = (
+            fact.field_key,
+            fact.source_file_id,
+            fact.value_type,
+            location_key(fact.location),
+        )
+        previous = seen_fact_values.get(identity)
+        if previous is not None:
+            if previous != fact.raw_value:
+                discard("FACT_IDENTITY_CONFLICT")
+            else:
+                discard("FACT_IDENTITY_DUPLICATED")
+            continue
+        seen_fact_values[identity] = fact.raw_value
+        seen_model_identities.add(model_identity)
+        accepted.append(fact)
+
+    return accepted, discarded
 
 
 def build_document_overview_payload(document: ParsedDocument) -> dict[str, Any]:
@@ -1586,6 +1701,8 @@ def _plan_independent_batches(
     max_numeric_candidates: int,
     max_text_units: int,
     estimated_output_token_limit: int,
+    max_text_facts: int = 12,
+    max_numeric_units: int | None = None,
     units_override: list[DocumentBlock] | None = None,
     text_context_by_block_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1634,13 +1751,14 @@ def _plan_independent_batches(
                 blocks,
                 batch_id=batch_id,
                 context_units=context_units,
+                max_items=max_text_facts,
             )
             # The response is capped by facts, not by unit count.  Unit count
             # remains a separate safety guard; using it in the token estimate
             # would fragment a document into needless calls.
             estimated = estimate_simplified_output_tokens(
                 numeric_candidate_count=0,
-                max_text_facts=12,
+                max_text_facts=max_text_facts,
             )
             count = 0
         return {
@@ -1668,6 +1786,11 @@ def _plan_independent_batches(
             extraction_payload_chars(plan["payload"]) > max_payload_chars
             or plan["numeric_candidate_count"] > max_numeric_candidates
             or plan["estimated_output_tokens"] > estimated_output_token_limit
+            or (
+                chain == "numeric"
+                and max_numeric_units is not None
+                and len(plan["blocks"]) > max_numeric_units
+            )
             or (chain == "text" and len(plan["blocks"]) > max_text_units)
         )
 
@@ -1691,8 +1814,14 @@ def plan_numeric_document_batches(
     *,
     max_payload_chars: int = 12000,
     max_numeric_candidates: int = 24,
+    max_numeric_units: int = 6,
     estimated_output_token_limit: int = 2000,
 ) -> list[dict[str, Any]]:
+    units = _numeric_planning_units(
+        document,
+        max_unit_chars=max(1000, max_payload_chars - 1800),
+        max_numeric_candidates=max_numeric_candidates,
+    )
     return _plan_independent_batches(
         document,
         chain="numeric",
@@ -1700,7 +1829,9 @@ def plan_numeric_document_batches(
         max_payload_chars=max_payload_chars,
         max_numeric_candidates=max_numeric_candidates,
         max_text_units=10**9,
+        max_numeric_units=max_numeric_units,
         estimated_output_token_limit=estimated_output_token_limit,
+        units_override=units,
     )
 
 
@@ -1710,6 +1841,7 @@ def plan_text_document_batches(
     max_payload_chars: int = 12000,
     max_text_units: int = 16,
     estimated_output_token_limit: int = 2000,
+    max_text_facts: int = 12,
 ) -> list[dict[str, Any]]:
     return _plan_independent_batches(
         document,
@@ -1719,6 +1851,7 @@ def plan_text_document_batches(
         max_numeric_candidates=10**9,
         max_text_units=max_text_units,
         estimated_output_token_limit=estimated_output_token_limit,
+        max_text_facts=max_text_facts,
     )
 
 
@@ -1729,6 +1862,7 @@ def plan_text_candidate_batches(
     max_payload_chars: int = 12000,
     max_candidates: int = 8,
     estimated_output_token_limit: int = 2000,
+    max_text_facts: int = 12,
 ) -> list[dict[str, Any]]:
     blocks = [candidate.block for candidate in candidates]
     contexts = {
@@ -1743,6 +1877,7 @@ def plan_text_candidate_batches(
         max_numeric_candidates=10**9,
         max_text_units=max_candidates,
         estimated_output_token_limit=estimated_output_token_limit,
+        max_text_facts=max_text_facts,
         units_override=blocks,
         text_context_by_block_id=contexts,
     )
@@ -1923,6 +2058,119 @@ def split_table_text_unit(block: DocumentBlock) -> list[DocumentBlock]:
         _table_row_unit(block, row, cells=[cell], group_index=column)
         for column, cell in enumerate(row.cells)
     ]
+
+
+_NUMERIC_STRUCTURE_SPLIT_CHARS = frozenset("。！？；!?;\n\r")
+_NUMERIC_CLAUSE_SPLIT_CHARS = frozenset("，,、")
+
+
+def _split_text_fragments(text: str, separators: frozenset[str]) -> list[str]:
+    fragments: list[str] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char not in separators:
+            continue
+        fragment = text[start : index + 1].strip()
+        if fragment:
+            fragments.append(fragment)
+        start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        fragments.append(tail)
+    return fragments if len(fragments) > 1 else []
+
+
+def _split_numeric_text_fragments(text: str) -> list[str]:
+    fragments = _split_text_fragments(text, _NUMERIC_STRUCTURE_SPLIT_CHARS)
+    if not fragments:
+        fragments = _split_text_fragments(text, _NUMERIC_CLAUSE_SPLIT_CHARS)
+    if len(fragments) > 1:
+        return fragments
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return []
+
+    # Preserve every character while preferring a safe lexical boundary.  If
+    # the nearest boundary falls inside a number, move to the closest safe
+    # boundary instead of manufacturing a new numeric candidate.
+    midpoint = len(text) // 2
+    boundaries = [
+        index
+        for index, char in enumerate(text, start=1)
+        if char.isspace() or char in _NUMERIC_CLAUSE_SPLIT_CHARS
+    ]
+    boundary = min(boundaries, key=lambda index: abs(index - midpoint)) if boundaries else midpoint
+    boundary = max(1, min(boundary, len(text) - 1))
+    if boundary < len(text) and text[boundary - 1].isdigit() and text[boundary].isdigit():
+        safe = [
+            index
+            for index in boundaries
+            if not (text[index - 1].isdigit() and index < len(text) and text[index].isdigit())
+        ]
+        if not safe:
+            return []
+        boundary = min(safe, key=lambda index: abs(index - midpoint))
+    left = text[:boundary].strip()
+    right = text[boundary:].strip()
+    return [left, right] if left and right else []
+
+
+def split_numeric_structure_unit(block: DocumentBlock) -> list[DocumentBlock]:
+    """Split one numeric input without dropping source text or candidates."""
+
+    if block.table is not None:
+        if len(block.table.rows) > 1:
+            return [_table_row_unit(block, row) for row in block.table.rows]
+        if len(block.table.rows) == 1 and len(block.table.rows[0].cells) > 1:
+            return split_table_text_unit(block)
+
+    fragments = _split_numeric_text_fragments(block.raw_text)
+    return [
+        block.model_copy(
+            update={
+                "block_id": f"{block.block_id}_n{index:04d}",
+                "raw_text": fragment,
+                "normalized_text": normalize_text(fragment),
+            }
+        )
+        for index, fragment in enumerate(fragments)
+    ]
+
+
+def _numeric_planning_units(
+    document: ParsedDocument,
+    *,
+    max_unit_chars: int,
+    max_numeric_candidates: int,
+) -> list[DocumentBlock]:
+    """Expand dense structures before the numeric batch planner runs.
+
+    The candidate ceiling is a safety limit, not a licence to omit values. A
+    row or paragraph that is too dense is recursively partitioned using the
+    same table/row/cell and text-boundary rules used by truncation recovery.
+    If the source has no safe boundary, fail before dispatching an oversized
+    request.
+    """
+
+    def expand(block: DocumentBlock) -> list[DocumentBlock]:
+        if len(numeric_candidates([block])) <= max_numeric_candidates:
+            return [block]
+        children = split_numeric_structure_unit(block)
+        if not children or (
+            len(children) == 1
+            and children[0].raw_text.strip() == block.raw_text.strip()
+        ):
+            raise EvidenceValidationError(
+                "single numeric structure exceeds candidate limit",
+                code="NUMERIC_BATCH_TOO_LARGE",
+            )
+        expanded: list[DocumentBlock] = []
+        for child in children:
+            expanded.extend(expand(child))
+        return expanded
+
+    units = extraction_units(document, max_unit_chars=max_unit_chars)
+    return [child for unit in units for child in expand(unit)]
 
 
 def extraction_units(

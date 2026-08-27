@@ -15,6 +15,10 @@ class DocumentLocation(BaseModel):
     bbox: list[float] | None = None
     source: Literal["LOCAL", "OCR"] | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
+    # Internal pagination bindings are consumed before public result
+    # serialization and are deliberately excluded from API responses.
+    structure_id: str | None = Field(default=None, exclude=True)
+    physical_pages: tuple[int, ...] = Field(default_factory=tuple, exclude=True)
 
 
 class TableCell(BaseModel):
@@ -53,6 +57,12 @@ class ProcessingWarning(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class ParsedStampImage(BaseModel):
+    page: int = Field(ge=1)
+    bbox: list[float] = Field(min_length=8, max_length=8)
+    data_uri: str
+
+
 class ParsedDocument(BaseModel):
     file_id: str
     role: str
@@ -63,3 +73,4 @@ class ParsedDocument(BaseModel):
     parser_name: str
     parser_metadata: dict[str, Any] = Field(default_factory=dict)
     warnings: list[ProcessingWarning] = Field(default_factory=list)
+    stamp_images: list[ParsedStampImage] = Field(default_factory=list)

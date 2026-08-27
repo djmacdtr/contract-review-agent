@@ -83,6 +83,17 @@ def test_schema_v2_has_ungraded_risk_review_and_pass_contract() -> None:
     }
     assert "severity" not in dumped["diff_items"][0]
     assert dumped["risk_items"][0]["risk_type"] == "ADDITION_OR_CHANGE"
+    assert dumped["stamp_images"] == []
+
+
+def test_stamp_image_schema_rejects_external_urls() -> None:
+    payload = base_result()
+    payload["stamp_images"] = [{"file_name": "盖章.pdf", "page": 1, "data_uri": "https://ocr.invalid/stamp.png"}]
+    try:
+        TaskResultData.model_validate(payload)
+    except ValueError:
+        return
+    raise AssertionError("external stamp image URL must not pass result validation")
 
 
 def test_legacy_result_is_readable_without_exposing_risk_levels() -> None:

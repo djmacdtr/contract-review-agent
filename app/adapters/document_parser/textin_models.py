@@ -9,13 +9,22 @@ class TextInModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class TextInImageData(TextInModel):
+    base64: str | None = None
+    path: str | None = None
+    region: list[float] | None = None
+
+
 class TextInContentNode(TextInModel):
+    id: int | str | None = None
     type: str | None = None
     sub_type: str | None = None
     text: str | None = None
     score: float | None = None
     pos: list[float] | None = None
     position: list[float] | None = None
+    size: list[float] | None = None
+    data: TextInImageData | None = None
     content: list[TextInContentNode] = Field(default_factory=list)
 
 
@@ -40,6 +49,7 @@ class TextInCell(TextInModel):
 
 
 class TextInDetail(TextInModel):
+    id: int | str | None = None
     page_id: int
     paragraph_id: int
     outline_level: int = -1
@@ -47,8 +57,11 @@ class TextInDetail(TextInModel):
     type: str
     content: int | str = 0
     position: list[float] = Field(default_factory=list)
+    pos: list[float] | None = None
     origin_position: list[float] | None = None
     sub_type: str | None = None
+    size: list[float] | None = None
+    data: TextInImageData | None = None
     cells: list[TextInCell] = Field(default_factory=list)
 
 

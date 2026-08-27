@@ -69,6 +69,21 @@ async def test_client_sends_binary_auth_and_fixed_parameters(tmp_path: Path) -> 
     assert query["char_details"] == "0"
 
 
+async def test_client_requests_stamp_images_only_when_explicitly_enabled(tmp_path: Path) -> None:
+    observed: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed["query"] = dict(request.url.params)
+        return httpx.Response(200, json=success_payload())
+
+    client = TextInDocumentParserClient(settings(), transport=httpx.MockTransport(handler))
+    await client.parse(make_file(tmp_path), mode="scan", include_stamp_images=True)
+
+    query = observed["query"]
+    assert query["get_image"] == "objects"
+    assert query["image_output_type"] == "base64str"
+
+
 @pytest.mark.parametrize(
     ("status", "business_code", "expected"),
     [

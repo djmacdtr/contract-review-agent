@@ -94,7 +94,8 @@ TEXT_FACT_SYSTEM_PROMPT = (
     "不得返回文件身份、位置、证据副本、稳定事实 ID 或原文外的推测。"
     "没有可可靠识别的非数值事实时，必须返回 JSON {\"items\":[]}，不得返回解释、拒绝语或自然语言。"
     "无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {\"items\":[]}，不得猜测或改写。"
-    "一次最多返回 12 项；如果可能还有更多事实，不要遗漏，程序会继续拆分。"
+    "一次最多返回输入 requirements.max_items 指定的项目数；如果可能还有更多事实，"
+    "不要遗漏，程序会继续拆分。"
     "严格遵守 TextFactExtraction。"
 )
 SEMANTIC_PLAN_SYSTEM_PROMPT = (
@@ -416,6 +417,21 @@ def _validate_text_facts(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             validation_summary=summary,
         ) from exc
     return response.model_dump(mode="json")
+
+
+def _text_fact_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply the controller's per-unit fact limit to the wire schema."""
+
+    try:
+        max_items = int(payload.get("requirements", {}).get("max_items", 12))
+    except (AttributeError, TypeError, ValueError):
+        max_items = 12
+    max_items = max(1, min(max_items, 12))
+    schema = TextFactExtraction.model_json_schema()
+    items_schema = schema.get("properties", {}).get("items")
+    if isinstance(items_schema, dict):
+        items_schema["maxItems"] = max_items
+    return schema
 
 
 def _text_evidence_correction_message(failure_code: str | None) -> str:
@@ -862,14 +878,24 @@ def _validate_mapping(value: Any) -> dict[str, Any]:
     try:
         return FactMappingResponse.model_validate(value).model_dump(mode="json")
     except ValidationError as exc:
-        raise LlmClientError("LLM_SCHEMA_INVALID", "模型事实映射不符合结构约束") from exc
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型事实映射不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=_safe_validation_summary(exc),
+        ) from exc
 
 
 def _validate_mapping_review(value: Any) -> dict[str, Any]:
     try:
         return FactMappingReview.model_validate(value).model_dump(mode="json")
     except ValidationError as exc:
-        raise LlmClientError("LLM_SCHEMA_INVALID", "模型映射评审不符合结构约束") from exc
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "模型映射评审不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=_safe_validation_summary(exc),
+        ) from exc
 
 
 class OpenAIContractLlmClient:
@@ -951,6 +977,7 @@ class OpenAIContractLlmClient:
             payload=payload,
             validator=lambda value: _validate_text_facts(value, payload),
             schema=TextFactExtraction,
+            response_schema=_text_fact_response_schema(payload),
             max_structure_retries=1 if allow_structure_correction else 0,
             allow_evidence_correction=allow_structure_correction,
             invalid_json_structure_correction=False,

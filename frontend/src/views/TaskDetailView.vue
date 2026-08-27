@@ -58,7 +58,7 @@
               · 表格：{{ file.content_structure.table_count }}
             </div>
             <div v-if="file.content_structure?.sample_locations?.length" class="muted">
-              位置示例：{{ formatLocations(file.content_structure.sample_locations) }}
+              位置示例：{{ formatLocations(file.content_structure.sample_locations, undefined, file.file_id) }}
             </div>
           </el-descriptions-item>
         </el-descriptions>
@@ -75,8 +75,8 @@
             <div class="diff-header"><span>{{ item.title }}</span><el-tag>{{ displayLabel(item.diff_type) }}</el-tag></div>
           </template>
           <div class="diff-columns">
-            <div><strong>{{ detail?.task_type === 'DRAFT_REVIEW' ? '合同模板' : '基准文件' }}</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
-            <div><strong>目标文件</strong><p class="location">{{ formatLocations(item.target?.locations, item.target?.location) }}</p><p>{{ item.target?.text || '—' }}</p></div>
+            <div><p class="location">{{ diffLocation(item, 'baseline') }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
+            <div><p class="location">{{ diffLocation(item, 'target') }}</p><p>{{ item.target?.text || '—' }}</p></div>
           </div>
           <p class="muted">置信度：{{ item.confidence }} · 需要人工复核：{{ item.requires_manual_review ? '是' : '否' }}</p>
         </el-card>
@@ -96,8 +96,8 @@
                 <div class="diff-header"><span>{{ item.title }}</span><el-tag type="warning">{{ displayLabel(item.review_reason) }}</el-tag></div>
               </template>
               <div class="diff-columns">
-                <div><strong>{{ detail?.task_type === 'DRAFT_REVIEW' ? '合同模板' : '基准文件' }}</strong><p class="location">{{ formatLocations(item.baseline?.locations, item.baseline?.location) }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
-                <div><strong>目标文件</strong><p class="location">{{ formatLocations(item.target?.locations, item.target?.location) }}</p><p>{{ item.target?.text || '—' }}</p></div>
+                <div><p class="location">{{ diffLocation(item, 'baseline') }}</p><p>{{ item.baseline?.text || '—' }}</p></div>
+                <div><p class="location">{{ diffLocation(item, 'target') }}</p><p>{{ item.target?.text || '—' }}</p></div>
               </div>
               <p class="muted">复核原因：{{ displayLabel(item.review_reason) }} · 置信度：{{ item.confidence }}</p>
             </el-card>
@@ -138,6 +138,7 @@ import { api } from '../api/client'
 import type { TaskDetail, TaskResult } from '../api/types'
 import type { DocumentLocation } from '../api/types'
 import { displayLabel } from '../utils/labels'
+import { fileNameMap, formatBusinessLocations, formatDiffLocation } from '../utils/reportEvidence'
 import { reportPath } from '../utils/routes'
 const route = useRoute(); const router = useRouter(); const taskId = String(route.params.taskId)
 const detail = ref<TaskDetail>(); const result = ref<TaskResult>(); let timer: number | undefined
@@ -150,8 +151,12 @@ const pagedBusinessDiffs = computed(() => { const start = (diffPage.value - 1) *
 async function load() { try { detail.value = await api.detail(taskId); if (detail.value.status === 'SUCCEEDED') { result.value = await api.result(taskId); stop() } else if (['FAILED', 'CANCELLED'].includes(detail.value.status)) stop() } catch (e) { ElMessage.error(String(e)); stop() } }
 function stop() { if (timer) window.clearInterval(timer); timer = undefined }
 async function retry() { try { const next = await api.retry(taskId); await router.push(reportPath(next)) } catch (e) { ElMessage.error(String(e)) } }
-function formatLocation(location?: DocumentLocation) { if (!location) return '无对应位置'; const parts = []; if (location.page != null) parts.push(`第 ${location.page} 页`); if (location.paragraph_index != null) parts.push(`段落 ${location.paragraph_index}`); if (location.table_index != null) parts.push(`表格 ${location.table_index}`); if (location.row != null) parts.push(`行 ${location.row}`); if (location.column != null) parts.push(`列 ${location.column}`); if (location.section) parts.push(location.section); if (location.source === 'OCR') parts.push('OCR'); if (location.confidence != null) parts.push(`置信度 ${location.confidence}`); return parts.join(' · ') || '结构位置未知' }
-function formatLocations(locations?: DocumentLocation[], primary?: DocumentLocation) { const values = locations?.length ? locations : (primary ? [primary] : []); if (!values.length) return '无对应位置'; if (values.length === 1) return formatLocation(values[0]); return `${formatLocation(values[0])} → ${formatLocation(values[values.length - 1])}（共 ${values.length} 处）` }
+function locationNames() { return fileNameMap(result.value?.files ?? []) }
+function formatLocation(location?: DocumentLocation, fileId?: string) { return formatBusinessLocations(location ? [location] : [], fileId, locationNames()) }
+function formatLocations(locations?: DocumentLocation[], primary?: DocumentLocation, fileId?: string) { const values = locations?.length ? locations : (primary ? [primary] : []); return formatBusinessLocations(values, fileId, locationNames()) }
+function diffLocation(item: TaskResult['diff_items'][number], sideName: 'baseline' | 'target') {
+  return formatDiffLocation(item, sideName, result.value?.files ?? [], locationNames())
+}
 function percent(value: number) { return `${(value * 100).toFixed(1)}%` }
 onMounted(async () => { await load(); if (!result.value && detail.value?.status !== 'FAILED') timer = window.setInterval(load, 2000) }); onBeforeUnmount(stop)
 </script>

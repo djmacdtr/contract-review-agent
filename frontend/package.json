@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "test:format": "node --experimental-strip-types tests/reportEvidence.test.ts && node --experimental-strip-types tests/passedCheckDescription.test.ts && node --experimental-strip-types tests/stampImages.test.ts",
     "typecheck": "vue-tsc --noEmit",
     "build": "vue-tsc --noEmit && vite build"
   },
@@ -21,4 +22,3 @@
     "vue-tsc": "3.0.6"
   }
 }
-

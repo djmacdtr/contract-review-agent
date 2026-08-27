@@ -56,7 +56,9 @@ class DocxParser:
                             raw_text=raw,
                             normalized_text=normalize_text(raw),
                             location=DocumentLocation(
-                                paragraph_index=paragraph_index, section=section
+                                paragraph_index=paragraph_index,
+                                section=section,
+                                structure_id=f"paragraph:{paragraph_index}",
                             ),
                         )
                     )
@@ -82,6 +84,9 @@ class DocxParser:
                                         table_index=table_index,
                                         row=row_index,
                                         column=column,
+                                        structure_id=(
+                                            f"table_cell:{table_index}:{row_index}:{column}"
+                                        ),
                                     ),
                                 )
                             )
@@ -97,7 +102,10 @@ class DocxParser:
                             order=order,
                             raw_text=raw_table,
                             normalized_text=normalize_text(raw_table),
-                            location=DocumentLocation(table_index=table_index),
+                            location=DocumentLocation(
+                                table_index=table_index,
+                                structure_id=f"table:{table_index}",
+                            ),
                             table=parsed_table,
                         )
                     )

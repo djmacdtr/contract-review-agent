@@ -10,6 +10,7 @@ from app.adapters.llm.schemas import SemanticPlanResponse
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
+from app.draft_review.facts import EvidenceValidationError
 from app.schemas.results import TaskResultData
 from app.services.downloader import SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
@@ -469,6 +470,15 @@ class RejectedFactsLlm(ConsensusFixtureLlm):
         return await super().map_facts(payload)
 
 
+class MappingFailureLlm(ConsensusFixtureLlm):
+    def __init__(self, error_factory) -> None:
+        super().__init__()
+        self.error_factory = error_factory
+
+    async def map_facts(self, payload: dict) -> LlmResult:
+        raise self.error_factory()
+
+
 class IncompleteMappingReviewLlm(ConsensusFixtureLlm):
     async def review_mappings(self, payload: dict) -> LlmResult:
         result = await super().review_mappings(payload)
@@ -706,6 +716,7 @@ async def run_consensus_fixture(
     reference_body: str = "金额100",
     expanded_table: bool = False,
     settings_overrides: dict | None = None,
+    progress_updates: list[tuple[TaskStage, int, str]] | None = None,
 ) -> dict:
     target_bytes = (
         build_table_docx(
@@ -730,8 +741,9 @@ async def run_consensus_fixture(
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=bodies[request.url.path], request=request)
 
-    async def no_progress(*_args) -> None:
-        return None
+    async def no_progress(stage: TaskStage, value: int, message: str) -> None:
+        if progress_updates is not None:
+            progress_updates.append((stage, value, message))
 
     settings_values = {
         "TEMP_ROOT": str(tmp_path / "workspaces"),
@@ -1279,6 +1291,105 @@ async def test_mapping_cannot_reference_an_unknown_target_fact(
         await run_consensus_fixture(tmp_path, UnknownTargetMappingLlm())
 
     assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert error.value.details["failure_stage"] == "FACT_MAPPING"
+    assert error.value.details["failure_code"] == "FACT_MAPPING_TARGET_NOT_FOUND"
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_code", "expected_attempts", "expected_retries"),
+    [
+        (
+            lambda: LlmClientError(
+                "LLM_INVALID_JSON",
+                "unsafe response body",
+                request_attempts=1,
+            ),
+            "LLM_INVALID_JSON",
+            1,
+            0,
+        ),
+        (
+            lambda: LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "unsafe schema response",
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+                request_attempts=1,
+                structure_retries=1,
+            ),
+            "LLM_RESPONSE_SCHEMA_INVALID",
+            1,
+            1,
+        ),
+        (
+            lambda: EvidenceValidationError(
+                "unsafe contract evidence",
+                code="FACT_QUOTE_NOT_GROUNDED",
+            ),
+            "FACT_QUOTE_NOT_GROUNDED",
+            0,
+            0,
+        ),
+        (lambda: TimeoutError("https://secret.invalid/api-key=hidden"), "LLM_TIMEOUT", 0, 0),
+        (
+            lambda: LlmClientError(
+                "LLM_UPSTREAM_ERROR",
+                "unsafe upstream response",
+                request_attempts=1,
+            ),
+            "LLM_UPSTREAM_ERROR",
+            1,
+            0,
+        ),
+    ],
+)
+async def test_mapping_failure_preserves_safe_context_and_stage(
+    tmp_path: Path,
+    error_factory,
+    expected_code: str,
+    expected_attempts: int,
+    expected_retries: int,
+) -> None:
+    updates: list[tuple[TaskStage, int, str]] = []
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(
+            tmp_path,
+            MappingFailureLlm(error_factory),  # type: ignore[arg-type]
+            progress_updates=updates,
+        )
+
+    assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert error.value.details == {
+        "failure_stage": "FACT_MAPPING",
+        "chain": "mapping",
+        "file": "fil_reference",
+        "file_id": "fil_reference",
+        "batch_depth": 0,
+        "unit_count": 1,
+        "failure_code": expected_code,
+        "request_attempts": expected_attempts,
+        "structure_retries": expected_retries,
+    }
+    assert "unsafe" not in str(error.value.details)
+    assert "secret.invalid" not in str(error.value.details)
+    assert any(stage == TaskStage.CROSS_VALIDATE and value == 80 for stage, value, _ in updates)
+
+
+async def test_mapping_failure_preserves_nested_workflow_failure_code(tmp_path: Path) -> None:
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(
+            tmp_path,
+            MappingFailureLlm(
+                lambda: WorkflowError(
+                    "LLM_MAPPING_FAILED",
+                    "unsafe nested error",
+                    details={"failure_code": "FACT_QUOTE_NOT_GROUNDED"},
+                )
+            ),  # type: ignore[arg-type]
+        )
+
+    assert error.value.details["failure_code"] == "FACT_QUOTE_NOT_GROUNDED"
+    assert "unsafe nested error" not in str(error.value.details)
 
 
 async def test_rejected_facts_are_not_sent_to_mapping_and_do_not_formalize_result(

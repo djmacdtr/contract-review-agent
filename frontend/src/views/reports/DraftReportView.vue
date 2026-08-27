@@ -17,7 +17,6 @@
         :diff-items="result.diff_items"
         :files="result.files"
         :module-order="moduleOrder"
-        left-label="合同模板"
         :show-passed-checks="true"
       />
     </template>

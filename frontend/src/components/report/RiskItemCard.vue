@@ -1,12 +1,12 @@
 <template>
-  <article class="risk-card"><div class="card-head"><strong>{{ item.title }}</strong><el-tag type="danger">{{ displayLabel(item.risk_type) }}</el-tag></div><p>{{ item.description }}</p><SourceEvidence v-if="!evidence?.length" :items="item.source_evidence" :files="files" /><DiffEvidence v-for="diff in evidence" :key="diff.diff_id" :item="diff" :files="files" :left-label="leftLabel" compact /><div v-if="item.analysis_advice" class="analysis-advice"><strong>AI 分析建议：</strong>{{ item.analysis_advice }}</div></article>
+  <article class="risk-card"><div class="card-head"><strong>{{ item.title }}</strong><el-tag type="danger">{{ displayLabel(item.risk_type) }}</el-tag></div><p>{{ item.description }}</p><SourceEvidence v-if="!evidence?.length" :items="item.source_evidence" :files="files" /><DiffEvidence v-for="diff in evidence" :key="diff.diff_id" :item="diff" :files="files" compact /><div v-if="item.analysis_advice" class="analysis-advice"><strong>AI 分析建议：</strong>{{ item.analysis_advice }}</div></article>
 </template>
 <script setup lang="ts">
 import type { DiffItem, ResultFile, RiskItem } from '../../api/types'
 import { displayLabel } from '../../utils/labels'
 import DiffEvidence from './DiffEvidence.vue'
 import SourceEvidence from './SourceEvidence.vue'
-defineProps<{ item: RiskItem; evidence?: DiffItem[]; files: ResultFile[]; leftLabel?: string }>()
+defineProps<{ item: RiskItem; evidence?: DiffItem[]; files: ResultFile[] }>()
 </script>
 <style scoped>.risk-card{border-left:4px solid var(--report-danger);background:var(--report-danger-soft);padding:16px;margin:10px 0;border-radius:8px}.card-head{display:flex;justify-content:space-between;gap:12px}.risk-card p{color:var(--report-text-2);margin:8px 0}.analysis-advice{margin-top:12px;padding:11px 13px;border-left:3px solid var(--report-primary);border-radius:0 7px 7px 0;background:#fff;color:var(--report-text-2);line-height:1.65}.analysis-advice strong{color:var(--report-primary)}@media(max-width:650px){.card-head{flex-direction:column}}
 </style>

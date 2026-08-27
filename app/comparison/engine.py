@@ -26,7 +26,20 @@ class CompareOptions:
 
 
 def _side(document: ParsedDocument, block: DocumentBlock) -> DiffSide:
-    return DiffSide(file_id=document.file_id, location=block.location, text=block.raw_text)
+    location = block.location
+    pages = location.physical_pages
+    if pages:
+        locations = [
+            location.model_copy(update={"page": page, "physical_pages": ()})
+            for page in pages
+        ]
+        return DiffSide(
+            file_id=document.file_id,
+            location=locations[0],
+            locations=locations if len(locations) > 1 else [],
+            text=block.raw_text,
+        )
+    return DiffSide(file_id=document.file_id, location=location, text=block.raw_text)
 
 
 def _segments(before: str, after: str) -> list[DiffSegment]:

@@ -91,6 +91,34 @@ async def test_worker_failure_then_retry_creates_new_task() -> None:
         assert retried["status"] == "PENDING"
 
 
+async def test_worker_passes_retry_source_task_id_to_workflow() -> None:
+    source_task_id = await create("/api/v1/draft-reviews", DRAFT_PAYLOAD)
+    settings = get_settings()
+    await WorkerRunner(
+        settings,
+        workflow=MockWorkflowExecutor(settings, fail_stage=TaskStage.PARSING),
+    ).run_once()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/v1/tasks/{source_task_id}/retry")
+        assert response.status_code == 202, response.text
+        retry_task_id = response.json()["data"]["task_id"]
+
+    captured: dict = {}
+
+    class CaptureWorkflow:
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            raise WorkflowError("CAPTURED_RETRY", "safe test failure")
+
+    assert await WorkerRunner(settings, workflow=CaptureWorkflow()).run_once() is True
+    assert captured["options"]["source_task_id"] == source_task_id
+    assert set(captured["options"]["_checkpoint_source_file_ids"]) == {"0", "1", "2"}
+    assert retry_task_id != source_task_id
+
+
 async def test_worker_persists_and_returns_safe_workflow_error_details(capsys) -> None:
     class SafeFailureWorkflow:
         async def run(self, **kwargs):

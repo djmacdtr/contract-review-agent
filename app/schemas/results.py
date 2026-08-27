@@ -54,6 +54,14 @@ class ResultFile(BaseModel):
     parser_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResultStampImage(BaseModel):
+    file_name: str
+    page: int = Field(ge=1)
+    data_uri: str = Field(
+        pattern=r"^data:image/(?:png|jpeg);base64,[A-Za-z0-9+/]+={0,2}$"
+    )
+
+
 class ResultMetadata(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -156,6 +164,7 @@ class TaskResultData(BaseModel):
     conclusion: Conclusion
     summary: ResultSummary
     files: list[ResultFile]
+    stamp_images: list[ResultStampImage] = Field(default_factory=list)
     risk_items: list[RiskItem]
     review_items: list[ReviewItem] = Field(default_factory=list)
     passed_checks: list[PassedCheck] = Field(default_factory=list)

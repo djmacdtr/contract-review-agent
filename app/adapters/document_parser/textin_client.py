@@ -63,7 +63,12 @@ class TextInDocumentParserClient:
         valid_header = (
             bool(HEADER_NAME.fullmatch(header)) and header.lower() not in FORBIDDEN_HEADERS
         )
-        if not self.settings.OCR_ENABLED or not valid_url or not key or not valid_header:
+        if (
+            not (self.settings.OCR_ENABLED or self.settings.DOCX_PAGE_LOCATION_ENABLED)
+            or not valid_url
+            or not key
+            or not valid_header
+        ):
             raise WorkflowError("OCR_NOT_CONFIGURED", "OCR 文档解析服务未完整配置")
         return base_url, header, key
 
@@ -141,7 +146,13 @@ class TextInDocumentParserClient:
         code_and_message = mapping.get(code, ("OCR_PARSE_FAILED", "OCR 服务解析文档失败"))
         raise WorkflowError(*code_and_message, retryable=code == 500)
 
-    async def parse(self, file: LocalFile, *, mode: ParseMode) -> TextInParseResponse:
+    async def parse(
+        self,
+        file: LocalFile,
+        *,
+        mode: ParseMode,
+        include_stamp_images: bool = False,
+    ) -> TextInParseResponse:
         base_url, header, key = self._configuration()
         started = time.monotonic()
         timeout = httpx.Timeout(
@@ -149,6 +160,11 @@ class TextInDocumentParserClient:
             connect=min(30.0, self.settings.OCR_TIMEOUT_SECONDS),
         )
         attempts = self.settings.OCR_HTTP_RETRY_ATTEMPTS + 1
+        request_parameters = {**FIXED_PARAMETERS, "parse_mode": mode}
+        if include_stamp_images:
+            request_parameters.update(
+                {"get_image": "objects", "image_output_type": "base64str"}
+            )
         for attempt in range(attempts):
             try:
                 async with httpx.AsyncClient(
@@ -160,7 +176,7 @@ class TextInDocumentParserClient:
                     async with client.stream(
                         "POST",
                         f"{base_url}{TEXTIN_ENGINE_PATH}",
-                        params={**FIXED_PARAMETERS, "parse_mode": mode},
+                        params=request_parameters,
                         headers={header: key, "Content-Type": "application/octet-stream"},
                         content=self._body(file),
                     ) as response:

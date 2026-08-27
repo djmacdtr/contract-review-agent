@@ -1,7 +1,6 @@
 <template>
   <div v-if="items.length" class="source-evidence">
     <div v-for="(item, index) in items" :key="index">
-      <span>{{ evidenceHeading(item) }}</span>
       <small>{{ evidenceLocation(item) }}</small>
       <p v-if="evidenceText(item)">{{ evidenceText(item) }}</p>
     </div>
@@ -18,9 +17,6 @@ const names = computed(() => fileNameMap(props.files))
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
-}
-function evidenceHeading(item: Record<string, unknown>) {
-  return item.side === 'BASELINE' ? '基准证据' : item.side === 'TARGET' ? '当前证据' : '来源证据'
 }
 function evidenceText(item: Record<string, unknown>) { return typeof item.text === 'string' ? item.text : '' }
 function evidenceLocation(item: Record<string, unknown>) {

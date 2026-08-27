@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -18,22 +19,34 @@ from app.documents.models import (
     TableCell,
     TableRow,
 )
-from app.draft_review.checkpoints import InMemoryExtractionCheckpointStore
+from app.draft_review.checkpoints import (
+    ExtractionCheckpoint,
+    InMemoryExtractionCheckpointStore,
+)
 from app.draft_review.extraction import (
+    DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
+    _checkpoint_payload_digest,
+    _document_checkpoint_identity_values,
+    _payload_digest,
+    _split_text_structure_unit,
     _validate_fact_identity_set,
     extract_documents_with_independent_map_reduce,
     extract_documents_with_wave_map_reduce,
+    numeric_recovery_blocks,
 )
 from app.draft_review.facts import (
     EvidenceValidationError,
+    build_document_overview_payload,
     build_numeric_candidate_payload,
     build_template_text_candidates,
     build_text_fact_payload,
     expand_numeric_candidate_response,
     expand_text_fact_response,
     match_quote_to_source,
+    plan_numeric_document_batches,
     plan_simplified_document_batches,
     plan_text_candidate_batches,
+    plan_text_document_batches,
     rehydrate_fact_evidence,
     rehydrate_numeric_fact_evidence,
     split_table_text_unit,
@@ -427,7 +440,8 @@ async def test_independent_reduce_reuses_completed_table_children_before_parent_
     )
 
     assert retry.text_calls == 0
-    assert result["checkpoint_table_file"]["text_batch_count"] == 3
+    assert result["checkpoint_table_file"]["text_batch_count"] == 0
+    assert result["checkpoint_table_file"]["document_checkpoint_reused"] is True
 
 
 def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None:
@@ -737,6 +751,74 @@ def test_v2_batch_id_is_file_content_and_version_addressed() -> None:
     assert all("file_id" not in item for item in plans[0]["numeric_payload"]["numeric_candidates"])
 
 
+def test_numeric_planner_limits_structure_units_without_dropping_candidates() -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"numeric_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"租赁金额为{index + 1}万元，租赁期限为{index + 1}个月。",
+            normalized_text=f"租赁金额为{index + 1}万元，租赁期限为{index + 1}个月。",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(8)
+    ]
+    doc = document().model_copy(update={"blocks": blocks})
+    plans = plan_numeric_document_batches(doc, max_numeric_units=6)
+
+    assert [len(plan["blocks"]) for plan in plans] == [6, 2]
+    assert sum(plan["numeric_candidate_count"] for plan in plans) == 16
+    assert all(len(plan["blocks"]) <= 6 for plan in plans)
+
+
+def test_numeric_planner_splits_dense_table_cells_before_candidate_limit() -> None:
+    cells = [
+        TableCell(
+            raw_text=f"金额{index + 1}万元",
+            normalized_text=f"金额{index + 1}万元",
+            location=DocumentLocation(table_index=3, row=0, column=index),
+        )
+        for index in range(30)
+    ]
+    table = ParsedTable(table_index=3, rows=[TableRow(row=0, cells=cells)])
+    block = DocumentBlock(
+        block_id="dense_numeric_table",
+        type="TABLE",
+        order=0,
+        raw_text="\t".join(cell.raw_text for cell in cells),
+        normalized_text="\t".join(cell.normalized_text for cell in cells),
+        location=DocumentLocation(table_index=3),
+        table=table,
+    )
+    doc = document().model_copy(update={"blocks": [block]})
+    plans = plan_numeric_document_batches(doc, max_numeric_units=6)
+
+    assert all(len(plan["blocks"]) <= 6 for plan in plans)
+    assert all(plan["numeric_candidate_count"] <= 24 for plan in plans)
+    assert sum(plan["numeric_candidate_count"] for plan in plans) == 30
+
+
+def test_numeric_truncation_recovery_is_fixed_6_to_3_to_1() -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"recovery_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"金额为{index + 1}万元。",
+            normalized_text=f"金额为{index + 1}万元。",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(6)
+    ]
+
+    first = numeric_recovery_blocks(blocks, "LLM_OUTPUT_TRUNCATED")
+    second = numeric_recovery_blocks(first[0], "LLM_OUTPUT_TRUNCATED")
+
+    assert [len(group) for group in first] == [3, 3]
+    assert [len(group) for group in second] == [1, 1, 1]
+    assert numeric_recovery_blocks(blocks, "LLM_INVALID_JSON") == []
+
+
 class WaveLlm:
     def __init__(self) -> None:
         self.profile_calls = 0
@@ -891,6 +973,587 @@ async def test_independent_text_failure_does_not_invalidate_numeric_checkpoint()
     assert chained.profile_calls == 0
     assert chained.numeric_calls == 0
     assert chained.text_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_independent_checkpoint_recovery_ignores_task_file_ids() -> None:
+    source = document()
+    retry = source.model_copy(
+        update={
+            "file_id": "file_retry",
+            "blocks": [
+                block.model_copy(update={"block_id": f"retry_{block.block_id}"})
+                for block in source.blocks
+            ],
+        }
+    )
+    store = InMemoryExtractionCheckpointStore()
+
+    class SourceFactLlm(CheckpointLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            items = []
+            if "甲方" in payload["units"][0]["text"]:
+                items = [
+                    {
+                        "unit_id": payload["units"][0]["unit_id"],
+                        "semantic_key": "guarantor",
+                        "display_name": "保证人",
+                        "value_type": "ENTITY",
+                        "quote": "甲方",
+                        "confidence": 0.9,
+                    }
+                ]
+            return LlmResult(
+                value={"items": items},
+                configured_model="checkpoint",
+                actual_model="checkpoint",
+                mock=False,
+            )
+
+    source_llm = SourceFactLlm()
+
+    await extract_documents_with_independent_map_reduce(
+        settings=Settings(_env_file=None, LLM_ENABLED=False),
+        documents=[source],
+        llm=source_llm,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="task_source_ids",
+    )
+
+    retry_llm = CheckpointLlm(fail_text=True)
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(_env_file=None, LLM_ENABLED=False),
+        documents=[retry],
+        llm=retry_llm,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="task_retry_ids",
+        source_task_id="task_source_ids",
+    )
+
+    assert retry_llm.profile_calls == 0
+    assert retry_llm.numeric_calls == 0
+    assert retry_llm.text_calls == 0
+    assert result["file_retry"]["value"]["profile"]["file_id"] == "file_retry"
+    assert result["file_retry"]["value"]["facts"][0]["source_file_id"] == "file_retry"
+
+
+def test_checkpoint_digest_excludes_task_and_display_identity() -> None:
+    first = {
+        "file_id": "file_source",
+        "batch_id": "batch_source",
+        "units": [
+            {
+                "unit_id": "unit_source",
+                "text": "同一结构",
+                "location": {"page": 1, "paragraph_index": 4},
+            }
+        ],
+        "page_count": 46,
+    }
+    second = {
+        "file_id": "file_retry",
+        "batch_id": "batch_retry",
+        "units": [
+            {
+                "unit_id": "unit_retry",
+                "text": "同一结构",
+                "location": {"page": 9, "paragraph_index": 4},
+            }
+        ],
+        "page_count": 52,
+    }
+
+    assert _checkpoint_payload_digest(first) == _checkpoint_payload_digest(second)
+
+
+def test_document_checkpoint_identity_excludes_page_and_file_id() -> None:
+    source = document()
+    retry = source.model_copy(
+        update={
+            "file_id": "file_retry",
+            "blocks": [
+                block.model_copy(
+                    update={
+                        "block_id": f"retry_{block.block_id}",
+                        "location": block.location.model_copy(update={"page": 9}),
+                    }
+                )
+                for block in source.blocks
+            ],
+        }
+    )
+
+    assert _document_checkpoint_identity_values(source, None) == (
+        _document_checkpoint_identity_values(retry, None)
+    )
+
+
+def test_text_structure_split_prefers_sentence_and_clause_boundaries() -> None:
+    block = document().blocks[0].model_copy(
+        update={"raw_text": "第一句。第二句。", "normalized_text": "第一句。第二句。"}
+    )
+
+    children = _split_text_structure_unit(block)
+
+    assert [child.raw_text for child in children] == ["第一句。", "第二句。"]
+
+
+@pytest.mark.asyncio
+async def test_document_checkpoint_reuse_skips_all_extraction_for_new_file_ids() -> None:
+    source = document()
+    retry = source.model_copy(
+        update={
+            "file_id": "file_retry_snapshot",
+            "blocks": [
+                block.model_copy(update={"block_id": f"retry_{block.block_id}"})
+                for block in source.blocks
+            ],
+        }
+    )
+    store = InMemoryExtractionCheckpointStore()
+
+    class SnapshotSourceLlm(WaveLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            items = []
+            if "甲方" in payload["units"][0]["text"]:
+                items = [
+                    {
+                        "unit_id": payload["units"][0]["unit_id"],
+                        "semantic_key": "guarantor",
+                        "display_name": "保证人",
+                        "value_type": "ENTITY",
+                        "quote": "甲方",
+                        "confidence": 0.9,
+                    }
+                ]
+            return LlmResult(
+                value={"items": items},
+                configured_model="snapshot-source",
+                actual_model="snapshot-source",
+                mock=False,
+            )
+
+    source_llm = SnapshotSourceLlm()
+    settings = Settings(_env_file=None, LLM_ENABLED=False)
+    await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[source],
+        llm=source_llm,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="snapshot_source",
+    )
+
+    assert any(
+        item.extraction_version == DOCUMENT_EXTRACTION_CHECKPOINT_VERSION
+        for item in store._records.values()
+    )
+
+    retry_llm = CheckpointLlm(fail_text=True)
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[retry],
+        llm=retry_llm,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="snapshot_retry",
+        source_task_id="snapshot_source",
+        source_file_ids_by_file_id={"file_retry_snapshot": source.file_id},
+    )
+
+    assert retry_llm.profile_calls == 0
+    assert retry_llm.numeric_calls == 0
+    assert retry_llm.text_calls == 0
+    assert result["file_retry_snapshot"]["document_checkpoint_reused"] is True
+    assert result["file_retry_snapshot"]["value"]["profile"]["file_id"] == (
+        "file_retry_snapshot"
+    )
+    assert result["file_retry_snapshot"]["value"]["facts"][0]["source_file_id"] == (
+        "file_retry_snapshot"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_reduce_does_not_save_document_checkpoint() -> None:
+    store = InMemoryExtractionCheckpointStore()
+
+    with pytest.raises(WorkflowError):
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[document()],
+            llm=CheckpointLlm(fail_text=True),  # type: ignore[arg-type]
+            checkpoint_store=store,
+            task_id="snapshot_failed",
+        )
+
+    assert not any(
+        item.extraction_version == DOCUMENT_EXTRACTION_CHECKPOINT_VERSION
+        for item in store._records.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_singleton_truncation_reduces_text_limit_without_same_payload_retry() -> None:
+    block = document().blocks[1].model_copy(
+        update={"raw_text": "项目名称为测试项目", "normalized_text": "项目名称为测试项目"}
+    )
+    doc = document().model_copy(update={"blocks": [block]})
+
+    class LimitAwareTruncationLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.limits: list[int] = []
+            self.payloads: list[str] = []
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            self.limits.append(payload["requirements"]["max_items"])
+            self.payloads.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            if payload["requirements"]["max_items"] > 3:
+                raise LlmClientError(
+                    "LLM_OUTPUT_TRUNCATED",
+                    "synthetic truncation",
+                    finish_reason="length",
+                )
+            return LlmResult(
+                value={"items": []},
+                configured_model="truncation",
+                actual_model="truncation",
+                mock=False,
+            )
+
+    llm = LimitAwareTruncationLlm()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(_env_file=None, LLM_ENABLED=False),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.limits == [12, 6, 3]
+    assert len(set(llm.payloads)) == len(llm.payloads)
+    assert result["file_a"]["text_batch_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_singleton_truncation_at_three_is_safe_terminal_failure() -> None:
+    block = document().blocks[1].model_copy(
+        update={"raw_text": "项目名称为测试项目", "normalized_text": "项目名称为测试项目"}
+    )
+    doc = document().model_copy(update={"blocks": [block]})
+    limits: list[int] = []
+
+    class AlwaysTruncated(WaveLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            limits.append(payload["requirements"]["max_items"])
+            raise LlmClientError(
+                "LLM_OUTPUT_TRUNCATED",
+                "synthetic truncation",
+                finish_reason="length",
+            )
+
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[doc],
+            llm=AlwaysTruncated(),  # type: ignore[arg-type]
+        )
+
+    assert limits == [12, 6, 3]
+    assert 1 not in limits
+    assert caught.value.details["failure_code"] == "LLM_OUTPUT_TRUNCATED"
+
+
+@pytest.mark.asyncio
+async def test_table_truncation_splits_cells_before_reducing_fact_limit() -> None:
+    cells = [
+        TableCell(
+            raw_text=value,
+            normalized_text=value,
+            location=DocumentLocation(table_index=0, row=0, column=column),
+        )
+        for column, value in enumerate(("字段", "甲方", "备注"))
+    ]
+    table = ParsedTable(table_index=0, rows=[TableRow(row=0, cells=cells)])
+    doc = document().model_copy(
+        update={
+            "blocks": [
+                DocumentBlock(
+                    block_id="truncated_table",
+                    type="TABLE",
+                    order=0,
+                    raw_text="\t".join(cell.raw_text for cell in cells),
+                    normalized_text="\t".join(cell.raw_text for cell in cells),
+                    location=DocumentLocation(table_index=0),
+                    table=table,
+                )
+            ]
+        }
+    )
+
+    class TableTruncationLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.payloads: list[dict] = []
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            self.payloads.append(payload)
+            if "\t" in payload["units"][0]["text"]:
+                raise LlmClientError(
+                    "LLM_OUTPUT_TRUNCATED",
+                    "synthetic truncation",
+                    finish_reason="length",
+                )
+            return LlmResult(
+                value={"items": []},
+                configured_model="table-truncation",
+                actual_model="table-truncation",
+                mock=False,
+            )
+
+    llm = TableTruncationLlm()
+    await extract_documents_with_independent_map_reduce(
+        settings=Settings(_env_file=None, LLM_ENABLED=False),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.text_calls == 4
+    assert "\t" in llm.payloads[0]["units"][0]["text"]
+    assert all("\t" not in payload["units"][0]["text"] for payload in llm.payloads[1:])
+
+
+@pytest.mark.asyncio
+async def test_independent_checkpoint_recovery_reads_legacy_source_identity() -> None:
+    def with_file_id(document: ParsedDocument, file_id: str) -> ParsedDocument:
+        return document.model_copy(
+            update={
+                "file_id": file_id,
+                "blocks": [
+                    block.model_copy(
+                        update={"block_id": f"{file_id}_{block.block_id}"}
+                    )
+                    for block in document.blocks
+                ],
+            }
+        )
+
+    source = with_file_id(document(), "file_source")
+    retry = with_file_id(document(), "file_retry")
+    settings = Settings(_env_file=None, LLM_ENABLED=False)
+    store = InMemoryExtractionCheckpointStore()
+    source_task_id = "task_legacy_source"
+
+    profile_payload = build_document_overview_payload(source)
+    profile_payload.update(
+        {
+            "batch_id": stable_batch_id(source.sha256, source.blocks, "profile-v2"),
+            "extraction_version": "profile-v2",
+        }
+    )
+    await store.save(
+        ExtractionCheckpoint(
+            task_id=source_task_id,
+            file_sha256=source.sha256,
+            batch_id=profile_payload["batch_id"],
+            extraction_version="profile-v2",
+            payload_digest=_payload_digest(profile_payload),
+            status="SUCCEEDED",
+            value={
+                "profile": {
+                    "file_id": source.file_id,
+                    "document_kind": "合成资料",
+                    "title": None,
+                    "confidence": 0.9,
+                    "evidence_locations": [{"paragraph_index": 0}],
+                },
+                "facts": [],
+                "missing_field_keys": [],
+            },
+        )
+    )
+
+    for _chain, plans in (
+        (
+            "numeric",
+            plan_numeric_document_batches(
+                source,
+                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                max_numeric_candidates=24,
+                estimated_output_token_limit=2000,
+            ),
+        ),
+        (
+            "text",
+            plan_text_document_batches(
+                source,
+                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                max_text_units=1,
+                estimated_output_token_limit=2000,
+            ),
+        ),
+    ):
+        for plan in plans:
+            plan["payload"].update(
+                {
+                    "batch_depth": 0,
+                    "parent_batch_id": None,
+                    "planned_batch_count": len(plans),
+                    "extraction_version": plan["extraction_version"],
+                }
+            )
+            await store.save(
+                ExtractionCheckpoint(
+                    task_id=source_task_id,
+                    file_sha256=source.sha256,
+                    batch_id=plan["batch_id"],
+                    extraction_version=plan["extraction_version"],
+                    payload_digest=_payload_digest(plan["payload"]),
+                    status="SUCCEEDED",
+                    value={"facts": []},
+                )
+            )
+
+    retry_llm = CheckpointLlm(fail_text=True)
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=settings,
+        documents=[retry],
+        llm=retry_llm,  # type: ignore[arg-type]
+        checkpoint_store=store,
+        task_id="task_legacy_retry",
+        source_task_id=source_task_id,
+        source_file_ids_by_file_id={"file_retry": "file_source"},
+    )
+
+    assert retry_llm.profile_calls == 0
+    assert retry_llm.numeric_calls == 0
+    assert retry_llm.text_calls == 0
+    assert result["file_retry"]["value"]["profile"]["file_id"] == "file_retry"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_factory", "expected_code"),
+    [
+        (
+            lambda: LlmClientError("LLM_INVALID_JSON", "safe failure"),
+            "LLM_INVALID_JSON",
+        ),
+        (
+            lambda: LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "safe failure",
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            ),
+            "LLM_RESPONSE_SCHEMA_INVALID",
+        ),
+        (
+            lambda: LlmClientError(
+                "LLM_EXTRACTION_EVIDENCE_INVALID",
+                "safe failure",
+                failure_code="FACT_QUOTE_NOT_GROUNDED",
+            ),
+            "FACT_QUOTE_NOT_GROUNDED",
+        ),
+        (
+            lambda: LlmClientError(
+                "LLM_EXTRACTION_EVIDENCE_INVALID",
+                "safe failure",
+                failure_code="FACT_VALUE_NOT_GROUNDED",
+            ),
+            "FACT_VALUE_NOT_GROUNDED",
+        ),
+        (
+            lambda: LlmClientError("LLM_TIMEOUT", "safe failure"),
+            "LLM_TIMEOUT",
+        ),
+        (
+            lambda: LlmClientError("LLM_UPSTREAM_ERROR", "safe failure"),
+            "LLM_UPSTREAM_ERROR",
+        ),
+        (
+            lambda: EvidenceValidationError(
+                "unsafe evidence body", code="FACT_QUOTE_NOT_GROUNDED"
+            ),
+            "FACT_QUOTE_NOT_GROUNDED",
+        ),
+        (
+            lambda: WorkflowError(
+                "LLM_EXTRACTION_FAILED",
+                "unsafe workflow body",
+                details={"failure_code": "LLM_UPSTREAM_ERROR"},
+            ),
+            "LLM_UPSTREAM_ERROR",
+        ),
+    ],
+)
+async def test_independent_text_terminal_failure_preserves_safe_context(
+    error_factory, expected_code: str
+) -> None:
+    class FailingText(CheckpointLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            raise error_factory()
+
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[document()],
+            llm=FailingText(),  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert caught.value.details == {
+        "failure_stage": "FACT_EXTRACTION",
+        "chain": "text",
+        "file": "file_a",
+        "file_id": "file_a",
+        "batch_depth": 0,
+        "unit_count": 1,
+        "batch_id": caught.value.details["batch_id"],
+        "failure_code": expected_code,
+    }
+    assert caught.value.details["batch_id"].startswith("batch_")
+    assert "safe failure" not in str(caught.value.details)
+    assert "保证人为甲方" not in str(caught.value.details)
+
+
+@pytest.mark.asyncio
+async def test_independent_checkpoint_failure_preserves_safe_context() -> None:
+    class BrokenCheckpointStore:
+        async def load(self, batch_id: str, **kwargs):
+            if kwargs.get("extraction_version") == "profile-v2":
+                return None
+            raise EvidenceValidationError(
+                "checkpoint evidence is not usable",
+                code="FACT_QUOTE_NOT_GROUNDED",
+            )
+
+        async def save(self, checkpoint) -> None:
+            return None
+
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[document()],
+            llm=CheckpointLlm(),  # type: ignore[arg-type]
+            checkpoint_store=BrokenCheckpointStore(),  # type: ignore[arg-type]
+            task_id="task_checkpoint_failure",
+        )
+
+    assert caught.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert caught.value.details == {
+        "failure_stage": "FACT_EXTRACTION",
+        "chain": "numeric",
+        "file": "file_a",
+        "file_id": "file_a",
+        "batch_depth": 1,
+        "unit_count": 1,
+        "batch_id": caught.value.details["batch_id"],
+        "failure_code": "FACT_QUOTE_NOT_GROUNDED",
+    }
+    assert caught.value.details["batch_id"].startswith("batch_")
 
 
 @pytest.mark.asyncio

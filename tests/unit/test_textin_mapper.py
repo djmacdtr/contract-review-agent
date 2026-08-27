@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 
@@ -111,13 +112,14 @@ def test_mapper_rejects_partial_pages_or_incomplete_tables(tmp_path: Path) -> No
     payload["data"]["result"]["total_page_number"] = 2
     payload["data"]["result"]["valid_page_number"] = 2
     payload["data"]["result"]["pages"].append(
-        {**payload["data"]["result"]["pages"][0], "page_id": 2}
+        {**payload["data"]["result"]["pages"][0], "page_id": 2, "content": [], "raw_ocr": []}
     )
-    with pytest.raises(WorkflowError) as caught:
-        map_textin_document(
-            TextInParseResponse.model_validate(payload), local_file(tmp_path), low_confidence=0.8
-        )
-    assert caught.value.code == "OCR_PARTIAL_FAILURE"
+    document = map_textin_document(
+        TextInParseResponse.model_validate(payload), local_file(tmp_path), low_confidence=0.8
+    )
+    assert document.page_count == 2
+    assert document.parser_metadata["page_ids"] == [1, 2]
+    assert document.parser_metadata["detail_page_count"] == 1
 
 
 def test_mapper_warns_when_merged_cells_are_simplified(tmp_path: Path) -> None:
@@ -135,3 +137,91 @@ def test_mapper_warns_when_merged_cells_are_simplified(tmp_path: Path) -> None:
             TextInParseResponse.model_validate(payload), local_file(tmp_path), low_confidence=0.8
         )
     assert caught.value.code == "OCR_PARTIAL_FAILURE"
+
+
+def stamp_payload(*, with_base64: bool = True, stamp_count: int = 1) -> dict:
+    payload = load_response().model_dump(mode="json")
+    page = payload["data"]["result"]["pages"][0]
+    page.update({"width": 1000, "height": 1000})
+    image_data = {
+        "base64": base64.b64encode(b"\x89PNG\r\n\x1a\nunit-test-image").decode()
+    } if with_base64 else {"path": "private/stamp.png"}
+    details = payload["data"]["result"]["detail"]
+    details.append(
+        {
+            "page_id": 1,
+            "paragraph_id": 2,
+            "outline_level": -1,
+            "text": "",
+            "type": "image",
+            "sub_type": "stamp",
+            "position": [100, 100, 300, 100, 300, 300, 100, 300],
+            "data": image_data,
+        }
+    )
+    page["content"].append(
+        {
+            "type": "image",
+            "sub_type": "stamp",
+            "pos": [100, 100, 300, 100, 300, 300, 100, 300],
+            "data": image_data,
+        }
+    )
+    for index in range(1, stamp_count):
+        position = [
+            400 + index * 10,
+            100,
+            500 + index * 10,
+            100,
+            500 + index * 10,
+            200,
+            400 + index * 10,
+            200,
+        ]
+        details.append(
+            {
+                "page_id": 1,
+                "paragraph_id": 2 + index,
+                "type": "image",
+                "sub_type": "stamp",
+                "position": position,
+                "data": image_data,
+            }
+        )
+    return payload
+
+
+def test_mapper_materializes_and_deduplicates_stamp_images(tmp_path: Path) -> None:
+    document = map_textin_document(
+        TextInParseResponse.model_validate(stamp_payload()),
+        local_file(tmp_path),
+        low_confidence=0.8,
+        include_stamp_images=True,
+    )
+
+    assert len(document.stamp_images) == 1
+    assert document.stamp_images[0].page == 1
+    assert document.stamp_images[0].data_uri.startswith("data:image/png;base64,")
+    assert document.parser_metadata["stamp_image_count"] == 1
+
+
+def test_mapper_rejects_stamp_url_or_excessive_stamp_count(tmp_path: Path) -> None:
+    with pytest.raises(WorkflowError) as caught:
+        map_textin_document(
+            TextInParseResponse.model_validate(stamp_payload(with_base64=False)),
+            local_file(tmp_path),
+            low_confidence=0.8,
+            include_stamp_images=True,
+        )
+    assert caught.value.code == "OCR_STAMP_IMAGE_UNAVAILABLE"
+    assert "private/stamp.png" not in str(caught.value)
+
+    with pytest.raises(WorkflowError) as caught:
+        map_textin_document(
+            TextInParseResponse.model_validate(stamp_payload(stamp_count=2)),
+            local_file(tmp_path),
+            low_confidence=0.8,
+            include_stamp_images=True,
+            stamp_max_count=1,
+        )
+    assert caught.value.code == "OCR_STAMP_IMAGE_LIMIT"

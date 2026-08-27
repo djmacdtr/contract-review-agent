@@ -31,7 +31,9 @@ from app.draft_review.facts import (
     expand_fact_batch,
     expand_numeric_candidate_response,
     expand_text_fact_response,
+    filter_text_fact_evidence,
     merge_chunk_extractions,
+    normalize_text,
     plan_document_batches,
     plan_numeric_document_batches,
     plan_simplified_document_batches,
@@ -39,11 +41,38 @@ from app.draft_review.facts import (
     plan_text_document_batches,
     rehydrate_fact_evidence,
     rehydrate_numeric_fact_evidence,
+    split_numeric_structure_unit,
     split_table_text_unit,
     stable_batch_id,
     stable_unit_id,
     validate_extraction_evidence,
 )
+
+DOCUMENT_EXTRACTION_CHECKPOINT_VERSION = "document-extraction-v1"
+
+
+def numeric_recovery_blocks(
+    blocks: list[DocumentBlock], failure_code: str
+) -> list[list[DocumentBlock]]:
+    """Return the deterministic numeric truncation recovery partition.
+
+    This helper deliberately returns no groups for non-truncation failures;
+    those failures retain the ordinary recovery policy.  Every returned
+    child contains source structures and is sent with a newly-built payload
+    and batch identity by the caller.
+    """
+
+    if failure_code != "LLM_OUTPUT_TRUNCATED":
+        return []
+    if len(blocks) > 3:
+        return [blocks[index : index + 3] for index in range(0, len(blocks), 3)]
+    if len(blocks) > 1:
+        return [[block] for block in blocks]
+    if len(blocks) == 1:
+        children = split_numeric_structure_unit(blocks[0])
+        if len(children) > 1:
+            return [[child] for child in children]
+    return []
 
 
 class _MapState(TypedDict, total=False):
@@ -68,6 +97,51 @@ def _error_code(error: BaseException) -> str:
     return type(error).__name__
 
 
+def _safe_failure_code(error: BaseException | None) -> str:
+    """Return a stable subcode without serializing exception content."""
+
+    current = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, LlmClientError):
+            return current.failure_code or current.code
+        if isinstance(current, EvidenceValidationError):
+            return current.code
+        if isinstance(current, WorkflowError):
+            details = current.details
+            if isinstance(details, dict) and isinstance(details.get("failure_code"), str):
+                return str(details["failure_code"])
+            if current.__cause__ is not None:
+                current = current.__cause__
+                continue
+            return current.code
+        if isinstance(current, TimeoutError):
+            return "LLM_TIMEOUT"
+        current = current.__cause__
+    return type(error).__name__ if error is not None else "DYNAMIC_CHECK_INCOMPLETE"
+
+
+def _failure_details(outcome: dict[str, Any]) -> dict[str, Any]:
+    """Build the only failure payload allowed to cross the workflow boundary."""
+
+    plan = outcome.get("plan") or {}
+    file_id = plan.get("document_id")
+    return {
+        "failure_stage": "FACT_EXTRACTION",
+        "chain": plan.get("chain", "unknown"),
+        # ``file`` is retained for compatibility with existing structured logs;
+        # ``file_id`` is the explicit diagnostic field used by new callers.
+        "file": file_id,
+        "file_id": file_id,
+        "batch_depth": int(plan.get("depth", 0)),
+        "unit_count": len(plan.get("unit_ids", [])),
+        "batch_id": plan.get("batch_id"),
+        "failure_code": outcome.get("failure_code")
+        or _safe_failure_code(outcome.get("error")),
+    }
+
+
 def _payload_digest(payload: dict[str, Any]) -> str:
     digest = hashlib.sha256(
         json.dumps(
@@ -78,6 +152,384 @@ def _payload_digest(payload: dict[str, Any]) -> str:
         ).encode("utf-8")
     ).hexdigest()[:24]
     return digest
+
+
+_TASK_LOCAL_PAYLOAD_KEYS = frozenset(
+    {
+        "batch_id",
+        "block_id",
+        "candidate_id",
+        "context_id",
+        "file_id",
+        "parent_batch_id",
+        "source_file_id",
+        "unit_id",
+    }
+)
+
+_DISPLAY_ONLY_PAYLOAD_KEYS = frozenset(
+    {"page", "page_count", "physical_pages", "structure_id", "bbox", "source", "confidence"}
+)
+
+
+def _checkpoint_payload_value(value: Any) -> Any:
+    """Remove task-local identities before hashing an extraction payload."""
+
+    if isinstance(value, dict):
+        return {
+            key: _checkpoint_payload_value(item)
+            for key, item in value.items()
+            if key not in _TASK_LOCAL_PAYLOAD_KEYS
+            and key not in _DISPLAY_ONLY_PAYLOAD_KEYS
+        }
+    if isinstance(value, list):
+        return [_checkpoint_payload_value(item) for item in value]
+    return value
+
+
+def _checkpoint_payload_digest(payload: dict[str, Any]) -> str:
+    return _payload_digest(_checkpoint_payload_value(payload))
+
+
+def _checkpoint_unit_identity(block: DocumentBlock) -> dict[str, Any]:
+    """Return a structure identity that excludes task-local block IDs."""
+
+    location = block.location
+    return {
+        "order": block.order,
+        "type": block.type,
+        "paragraph_index": location.paragraph_index,
+        "table_index": location.table_index,
+        "row": location.row,
+        "column": location.column,
+        "text": normalize_text(block.normalized_text or block.raw_text),
+    }
+
+
+def _checkpoint_location_identity(location: Any) -> dict[str, Any]:
+    values = getattr(location, "model_dump", lambda **_kwargs: dict(location))(
+        mode="json", exclude_none=True
+    )
+    return {
+        key: values[key]
+        for key in ("paragraph_index", "table_index", "row", "column", "section")
+        if key in values
+    }
+
+
+def _checkpoint_structure_identity(block: DocumentBlock) -> dict[str, Any]:
+    identity = {
+        "order": block.order,
+        "type": block.type,
+        "location": _checkpoint_location_identity(block.location),
+        "text": normalize_text(block.normalized_text or block.raw_text),
+    }
+    if block.table is not None:
+        identity["rows"] = [
+            {
+                "row": row.row,
+                "cells": [
+                    {
+                        "location": _checkpoint_location_identity(cell.location),
+                        "text": normalize_text(cell.normalized_text or cell.raw_text),
+                    }
+                    for cell in row.cells
+                ],
+            }
+            for row in block.table.rows
+        ]
+    return identity
+
+
+def _document_checkpoint_identity(
+    document: ParsedDocument,
+    text_candidates: list[TextExtractionCandidate] | None,
+) -> dict[str, Any]:
+    candidate_identity = []
+    for candidate in text_candidates or []:
+        candidate_identity.append(
+            {
+                "type": candidate.block.type,
+                "location": _checkpoint_location_identity(candidate.block.location),
+                "text": normalize_text(candidate.block.normalized_text or candidate.block.raw_text),
+                "context": _checkpoint_payload_value(list(candidate.context_units)),
+            }
+        )
+    candidate_identity.sort(
+        key=lambda item: (
+            json.dumps(item["location"], ensure_ascii=False, sort_keys=True),
+            item["text"],
+            item["type"],
+        )
+    )
+    return {
+        "file_sha256": document.sha256,
+        "parser_name": document.parser_name,
+        "role": document.role,
+        "extraction_versions": [
+            "profile-v2",
+            "numeric-v2",
+            TEXT_EXTRACTION_VERSION,
+        ],
+        "structure": [_checkpoint_structure_identity(block) for block in document.blocks],
+        "text_candidate_scope": candidate_identity,
+    }
+
+
+def _document_checkpoint_identity_values(
+    document: ParsedDocument,
+    text_candidates: list[TextExtractionCandidate] | None,
+) -> tuple[str, str]:
+    identity = _document_checkpoint_identity(document, text_candidates)
+    digest = _payload_digest(identity)
+    return f"document_{digest}", digest
+
+
+def _checkpoint_batch_id(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+    extraction_version: str,
+    variant: str | None = None,
+) -> str:
+    """Build a task-independent checkpoint identity for one logical shard."""
+
+    return "batch_" + _payload_digest(
+        {
+            "file_sha256": document.sha256,
+            "parser_version": document.parser_name,
+            "extraction_version": extraction_version,
+            "variant": variant,
+            "units": sorted(
+                (_checkpoint_unit_identity(block) for block in blocks),
+                key=lambda item: (
+                    item["paragraph_index"] is None,
+                    item["paragraph_index"] or -1,
+                    item["table_index"] is None,
+                    item["table_index"] or -1,
+                    item["row"] is None,
+                    item["row"] or -1,
+                    item["column"] is None,
+                    item["column"] or -1,
+                    item["type"],
+                ),
+            ),
+        }
+    )
+
+
+def _with_checkpoint_identity(
+    plan: dict[str, Any],
+    document: ParsedDocument,
+    *,
+    variant: str | None = None,
+) -> dict[str, Any]:
+    """Replace planner IDs with task-independent IDs for independent extraction."""
+
+    identity = _checkpoint_batch_id(
+        document,
+        plan["blocks"],
+        plan["extraction_version"],
+        variant=variant,
+    )
+    plan["batch_id"] = identity
+    plan["payload"] = {
+        **plan["payload"],
+        "batch_id": identity,
+        "extraction_version": plan["extraction_version"],
+    }
+    return plan
+
+
+def _replace_file_id(value: str, current_file_id: str, source_file_id: str) -> str:
+    if value == current_file_id:
+        return source_file_id
+    if value.startswith(f"{current_file_id}_"):
+        return f"{source_file_id}{value[len(current_file_id):]}"
+    return value
+
+
+def _replace_task_ids(value: Any, replacements: dict[str, str]) -> Any:
+    if isinstance(value, dict):
+        return {key: _replace_task_ids(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_task_ids(item, replacements) for item in value]
+    if isinstance(value, str):
+        result = value
+        for current, source in sorted(replacements.items(), key=lambda item: -len(item[0])):
+            result = result.replace(current, source)
+        return result
+    return value
+
+
+def _source_identity_document(
+    document: ParsedDocument,
+    blocks: list[DocumentBlock],
+    source_file_id: str,
+) -> ParsedDocument:
+    source_blocks = [
+        block.model_copy(
+            update={
+                "block_id": _replace_file_id(
+                    block.block_id, document.file_id, source_file_id
+                )
+            }
+        )
+        for block in blocks
+    ]
+    return document.model_copy(update={"file_id": source_file_id, "blocks": source_blocks})
+
+
+def _remap_checkpoint_facts(
+    value: dict[str, Any],
+    current_file_id: str,
+) -> dict[str, Any]:
+    facts = value.get("facts", [])
+    if not isinstance(facts, list):
+        return value
+    return {
+        **value,
+        "facts": [
+            {
+                **item,
+                "source_file_id": current_file_id,
+            }
+            if isinstance(item, dict)
+            else item
+            for item in facts
+        ],
+    }
+
+
+def _remap_profile_file_id(
+    extraction: DocumentFactExtraction,
+    current_file_id: str,
+) -> DocumentFactExtraction:
+    return extraction.model_copy(
+        update={
+            "profile": extraction.profile.model_copy(
+                update={"file_id": current_file_id}
+            ),
+            "facts": [
+                fact.model_copy(update={"source_file_id": current_file_id})
+                for fact in extraction.facts
+            ],
+        }
+    )
+
+
+def _validated_document_checkpoint(
+    document: ParsedDocument,
+    value: dict[str, Any],
+    *,
+    source_file_id: str | None = None,
+) -> DocumentFactExtraction | None:
+    """Validate and rebind one complete document checkpoint."""
+
+    try:
+        extraction = DocumentFactExtraction.model_validate(value)
+        allowed_file_ids = {document.file_id}
+        if source_file_id:
+            allowed_file_ids.add(source_file_id)
+        if extraction.profile.file_id not in allowed_file_ids or any(
+            fact.source_file_id not in allowed_file_ids for fact in extraction.facts
+        ):
+            return None
+        extraction = _remap_profile_file_id(extraction, document.file_id)
+        _validate_fact_identity_set(extraction.facts)
+        validate_extraction_evidence(document, extraction)
+    except (EvidenceValidationError, TypeError, ValueError):
+        return None
+    return extraction
+
+
+_STRUCTURE_SPLIT_CHARS = frozenset("。！？；!?;\n\r")
+_CLAUSE_SPLIT_CHARS = frozenset("，,、")
+
+
+def _split_text_fragments(text: str, separators: frozenset[str]) -> list[str]:
+    fragments: list[str] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char not in separators:
+            continue
+        fragment = text[start : index + 1].strip()
+        if fragment:
+            fragments.append(fragment)
+        start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        fragments.append(tail)
+    return fragments if len(fragments) > 1 else []
+
+
+def _split_text_structure_unit(block: DocumentBlock) -> list[DocumentBlock]:
+    """Split a non-table unit at conservative sentence/clause boundaries."""
+
+    fragments = _split_text_fragments(block.raw_text, _STRUCTURE_SPLIT_CHARS)
+    if not fragments:
+        fragments = _split_text_fragments(block.raw_text, _CLAUSE_SPLIT_CHARS)
+    return [
+        block.model_copy(
+            update={
+                "block_id": f"{block.block_id}_s{index:04d}",
+                "raw_text": fragment,
+                "normalized_text": normalize_text(fragment),
+            }
+        )
+        for index, fragment in enumerate(fragments)
+    ]
+
+
+def _legacy_checkpoint_payload(
+    plan: dict[str, Any],
+    document: ParsedDocument,
+    source_file_ids_by_file_id: dict[str, str],
+) -> tuple[str, dict[str, Any]] | None:
+    """Build the pre-stable-identity payload used by existing source rows."""
+
+    source_file_id = source_file_ids_by_file_id.get(document.file_id)
+    if not source_file_id:
+        return None
+    source_blocks_document = _source_identity_document(
+        document, plan["blocks"], source_file_id
+    )
+    legacy_batch_id = stable_batch_id(
+        document.sha256,
+        source_blocks_document.blocks,
+        plan["extraction_version"],
+    )
+    if plan["chain"] == "numeric":
+        payload = build_numeric_candidate_payload(
+            source_blocks_document,
+            source_blocks_document.blocks,
+            batch_id=legacy_batch_id,
+        )
+    else:
+        context_units: list[dict[str, Any]] = []
+        seen_context_ids: set[str] = set()
+        context_map = plan.get("context_units_by_block_id", {})
+        for block in plan["blocks"]:
+            for item in context_map.get(block.block_id, []):
+                transformed = _replace_task_ids(item, source_file_ids_by_file_id)
+                context_id = str(transformed.get("context_id", ""))
+                if context_id and context_id not in seen_context_ids:
+                    seen_context_ids.add(context_id)
+                    context_units.append(transformed)
+        payload = build_text_fact_payload(
+            source_blocks_document,
+            source_blocks_document.blocks,
+            batch_id=legacy_batch_id,
+            context_units=context_units,
+        )
+    payload.update(
+        {
+            "batch_depth": int(plan.get("depth", 0)),
+            "parent_batch_id": plan.get("legacy_parent_batch_id"),
+            "planned_batch_count": plan.get("planned_batch_count", 0),
+            "extraction_version": plan["extraction_version"],
+        }
+    )
+    return legacy_batch_id, payload
 
 
 def _validate_fact_identity_set(facts: list[FactCandidate]) -> None:
@@ -680,7 +1132,8 @@ async def extract_documents_with_wave_map_reduce(
     ) or planned_calls > total_cap:
         raise WorkflowError(
             "DYNAMIC_CHECK_INCOMPLETE",
-            "事实抽取初始计划已超过安全逻辑调用预算",
+            "事实抽取初始计划调用预算已耗尽",
+            details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
         )
 
     semaphore = asyncio.Semaphore(settings.LLM_EXTRACTION_TASK_CONCURRENCY)
@@ -819,7 +1272,11 @@ async def extract_documents_with_wave_map_reduce(
         wave = pending[: settings.LLM_EXTRACTION_WAVE_SIZE]
         pending = pending[settings.LLM_EXTRACTION_WAVE_SIZE :]
         if logical_calls + len(wave) * 2 > total_cap:
-            raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "事实抽取超过全任务逻辑调用上限")
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "事实抽取调用预算已耗尽",
+                details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
+            )
         wave_outcomes = await run_wave(wave)
         logical_calls += sum(
             0 if outcome.get("checkpoint_reused") else 2 for outcome in wave_outcomes
@@ -873,7 +1330,11 @@ async def extract_documents_with_wave_map_reduce(
             children.extend(parts)
         pending.extend(children)
         if logical_calls + len(pending) * 2 > total_cap:
-            raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "事实抽取恢复后超过逻辑调用上限")
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "事实抽取恢复调用预算已耗尽",
+                details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
+            )
 
     active = [
         item for batch_id, item in outcomes_by_batch.items()
@@ -938,6 +1399,7 @@ async def extract_documents_with_independent_map_reduce(
     checkpoint_store: ExtractionCheckpointStore | None = None,
     task_id: str | None = None,
     source_task_id: str | None = None,
+    source_file_ids_by_file_id: dict[str, str] | None = None,
     text_candidates_by_document: dict[str, list[TextExtractionCandidate]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Run profile, numeric and text extraction as independent Map–Reduce chains.
@@ -955,7 +1417,13 @@ async def extract_documents_with_independent_map_reduce(
     document_logical_calls: Counter[str] = Counter()
     wave_count = 0
 
-    async def materialize_checkpoint(checkpoint: ExtractionCheckpoint) -> None:
+    async def materialize_checkpoint(
+        checkpoint: ExtractionCheckpoint,
+        *,
+        plan: dict[str, Any],
+        value: dict[str, Any],
+        payload_digest: str,
+    ) -> None:
         """Copy an ancestor success into the current retry task."""
 
         if (
@@ -965,10 +1433,11 @@ async def extract_documents_with_independent_map_reduce(
             and checkpoint.task_id != task_id
         ):
             existing = await checkpoint_store.load(
-                checkpoint.batch_id,
+                plan["batch_id"],
                 task_id=task_id,
-                file_sha256=checkpoint.file_sha256,
-                extraction_version=checkpoint.extraction_version,
+                file_sha256=plan["file_sha256"],
+                extraction_version=plan["extraction_version"],
+                payload_digest=payload_digest,
             )
             if existing is not None:
                 # A failed attempt may have left a success under the same
@@ -979,30 +1448,106 @@ async def extract_documents_with_independent_map_reduce(
             await checkpoint_store.save(
                 ExtractionCheckpoint(
                     task_id=task_id,
-                    file_sha256=checkpoint.file_sha256,
-                    extraction_version=checkpoint.extraction_version,
-                    batch_id=checkpoint.batch_id,
-                    payload_digest=checkpoint.payload_digest,
-                    value=checkpoint.value,
+                    file_sha256=plan["file_sha256"],
+                    extraction_version=plan["extraction_version"],
+                    batch_id=plan["batch_id"],
+                    payload_digest=payload_digest,
+                    value=value,
                     status="SUCCEEDED",
                     model_name=checkpoint.model_name,
                     source_task_id=checkpoint.task_id,
                 )
             )
 
-    async def profile_once(
+    async def load_document_checkpoint(
+        document: ParsedDocument,
+    ) -> tuple[DocumentFactExtraction, dict[str, Any]] | None:
+        if checkpoint_store is None:
+            return None
+        text_candidates = (text_candidates_by_document or {}).get(document.file_id)
+        batch_id, digest = _document_checkpoint_identity_values(document, text_candidates)
+        try:
+            checkpoint = await checkpoint_store.load(
+                batch_id,
+                task_id=task_id,
+                file_sha256=document.sha256,
+                extraction_version=DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
+                payload_digest=digest,
+                source_task_id=source_task_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # The established shard path remains responsible for surfacing a
+            # checkpoint-store failure with its existing safe diagnostics.
+            return None
+        if checkpoint is None or checkpoint.value is None:
+            return None
+        source_file_id = (source_file_ids_by_file_id or {}).get(document.file_id)
+        extraction = _validated_document_checkpoint(
+            document,
+            checkpoint.value,
+            source_file_id=source_file_id,
+        )
+        if extraction is None:
+            return None
+        await materialize_checkpoint(
+            checkpoint,
+            plan={
+                "batch_id": batch_id,
+                "file_sha256": document.sha256,
+                "extraction_version": DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
+            },
+            payload_digest=digest,
+            value=extraction.model_dump(mode="json"),
+        )
+        return extraction, {
+            "status": "SUCCEEDED",
+            "checkpoint_reused": True,
+            "document_checkpoint_reused": True,
+            "configured_model": checkpoint.model_name,
+            "actual_model": None,
+            "duration_ms": 0,
+            "request_attempts": 0,
+            "structure_retries": 0,
+            "batch_id": batch_id,
+            "extraction_version": DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
+        }
+
+    async def save_document_checkpoint(
+        document: ParsedDocument,
+        extraction: DocumentFactExtraction,
+        model_name: str | None,
+    ) -> None:
+        if checkpoint_store is None or not task_id:
+            return
+        batch_id, digest = _document_checkpoint_identity_values(
+            document,
+            (text_candidates_by_document or {}).get(document.file_id),
+        )
+        await checkpoint_store.save(
+            ExtractionCheckpoint(
+                task_id=task_id,
+                file_sha256=document.sha256,
+                extraction_version=DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
+                batch_id=batch_id,
+                payload_digest=digest,
+                value=extraction.model_dump(mode="json"),
+                status="SUCCEEDED",
+                model_name=model_name,
+                source_task_id=source_task_id,
+            )
+        )
+
+    async def _profile_once(
         document: ParsedDocument,
     ) -> tuple[str, DocumentFactExtraction, dict[str, Any]]:
         nonlocal logical_calls
         payload = build_document_overview_payload(document)
-        batch_id = stable_batch_id(
-            document.sha256,
-            document.blocks,
-            "profile-v2",
-        )
+        batch_id = _checkpoint_batch_id(document, document.blocks, "profile-v2")
         payload["batch_id"] = batch_id
         payload["extraction_version"] = "profile-v2"
-        digest = _payload_digest(payload)
+        digest = _checkpoint_payload_digest(payload)
         if checkpoint_store is not None:
             checkpoint = await checkpoint_store.load(
                 batch_id,
@@ -1012,9 +1557,42 @@ async def extract_documents_with_independent_map_reduce(
                 payload_digest=digest,
                 source_task_id=source_task_id,
             )
+            source_file_id = (source_file_ids_by_file_id or {}).get(document.file_id)
+            if checkpoint is None and source_task_id and source_file_id:
+                legacy_document = _source_identity_document(
+                    document, document.blocks, source_file_id
+                )
+                legacy_payload = build_document_overview_payload(legacy_document)
+                legacy_payload["batch_id"] = stable_batch_id(
+                    document.sha256,
+                    legacy_document.blocks,
+                    "profile-v2",
+                )
+                legacy_payload["extraction_version"] = "profile-v2"
+                checkpoint = await checkpoint_store.load(
+                    legacy_payload["batch_id"],
+                    task_id=task_id,
+                    file_sha256=document.sha256,
+                    extraction_version="profile-v2",
+                    payload_digest=_payload_digest(legacy_payload),
+                    source_task_id=source_task_id,
+                )
             if checkpoint is not None and checkpoint.value is not None:
-                await materialize_checkpoint(checkpoint)
-                profile_value = DocumentFactExtraction.model_validate(checkpoint.value)
+                profile_value = _remap_profile_file_id(
+                    DocumentFactExtraction.model_validate(checkpoint.value),
+                    document.file_id,
+                )
+                profile_plan = {
+                    "batch_id": batch_id,
+                    "file_sha256": document.sha256,
+                    "extraction_version": "profile-v2",
+                }
+                await materialize_checkpoint(
+                    checkpoint,
+                    plan=profile_plan,
+                    payload_digest=digest,
+                    value=profile_value.model_dump(mode="json"),
+                )
                 return document.file_id, profile_value, {
                     "status": "SUCCEEDED",
                     "checkpoint_reused": True,
@@ -1031,7 +1609,11 @@ async def extract_documents_with_independent_map_reduce(
             or document_logical_calls[document.file_id]
             >= settings.LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT
         ):
-            raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "抽取超过全任务逻辑调用上限")
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "抽取调用预算已耗尽",
+                details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
+            )
         logical_calls += 1
         document_logical_calls[document.file_id] += 1
         async with semaphore:
@@ -1063,30 +1645,284 @@ async def extract_documents_with_independent_map_reduce(
             "extraction_version": "profile-v2",
         }
 
-    profile_results = await asyncio.gather(
-        *(profile_once(document) for document in documents)
+    async def profile_once(
+        document: ParsedDocument,
+    ) -> tuple[str, DocumentFactExtraction, dict[str, Any]]:
+        try:
+            return await _profile_once(document)
+        except asyncio.CancelledError:
+            raise
+        except WorkflowError as exc:
+            if exc.details:
+                raise
+            raise WorkflowError(
+                exc.code,
+                exc.safe_message,
+                retryable=exc.retryable,
+                details={
+                    "failure_stage": "FACT_EXTRACTION",
+                    "chain": "profile",
+                    "file": document.file_id,
+                    "file_id": document.file_id,
+                    "batch_depth": 0,
+                    "unit_count": len(document.blocks),
+                    "failure_code": _safe_failure_code(exc),
+                },
+            ) from exc
+        except BaseException as exc:
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "文档概览抽取未能可靠完成",
+                details={
+                    "failure_stage": "FACT_EXTRACTION",
+                    "chain": "profile",
+                    "file": document.file_id,
+                    "file_id": document.file_id,
+                    "batch_depth": 0,
+                    "unit_count": len(document.blocks),
+                    "failure_code": _safe_failure_code(exc),
+                },
+            ) from exc
+
+    document_checkpoint_results = await asyncio.gather(
+        *(load_document_checkpoint(document) for document in documents)
     )
-    profiles = {file_id: value for file_id, value, _meta in profile_results}
-    profile_meta = {file_id: meta for file_id, _value, meta in profile_results}
+    document_snapshots: dict[str, DocumentFactExtraction] = {}
+    document_snapshot_meta: dict[str, dict[str, Any]] = {}
+    for document, result in zip(documents, document_checkpoint_results, strict=True):
+        if result is not None:
+            document_snapshots[document.file_id], document_snapshot_meta[document.file_id] = result
+
+    documents_without_snapshot = [
+        document for document in documents if document.file_id not in document_snapshots
+    ]
+    default_text_fact_limit = min(
+        getattr(settings, "LLM_EXTRACTION_MAX_TEXT_FACTS", 12), 12
+    )
+
+    def build_initial_plans() -> tuple[
+        dict[str, list[dict[str, Any]]], dict[tuple[str, str], int]
+    ]:
+        initial_by_chain: dict[str, list[dict[str, Any]]] = {"numeric": [], "text": []}
+        per_document_chain_count: dict[tuple[str, str], int] = {}
+        for document in documents:
+            if document.role == "TEMPLATE" or document.file_id in document_snapshots:
+                continue
+            numeric_plans = plan_numeric_document_batches(
+                document,
+                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                max_numeric_candidates=min(settings.LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES, 24),
+                max_numeric_units=settings.LLM_EXTRACTION_MAX_NUMERIC_UNITS,
+                estimated_output_token_limit=min(
+                    settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+                ),
+            )
+            if text_candidates_by_document is not None and document.role == "TARGET":
+                text_plans = plan_text_candidate_batches(
+                    document,
+                    text_candidates_by_document.get(document.file_id, []),
+                    max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                    max_candidates=min(
+                        getattr(settings, "LLM_EXTRACTION_MAX_TEXT_CANDIDATES", 8), 4
+                    ),
+                    max_text_facts=default_text_fact_limit,
+                    estimated_output_token_limit=min(
+                        settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+                    ),
+                )
+            else:
+                # Auxiliary documents are open-ended and showed saturation and
+                # cross-unit quote failures at wider batches in the real runs.
+                effective_text_units = min(
+                    getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 16),
+                    1 if document.role != "TARGET" else 16,
+                )
+                text_plans = plan_text_document_batches(
+                    document,
+                    max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+                    max_text_units=effective_text_units,
+                    max_text_facts=min(
+                        getattr(settings, "LLM_EXTRACTION_MAX_TEXT_FACTS", 12), 12
+                    ),
+                    estimated_output_token_limit=min(
+                        settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+                    ),
+                )
+            for chain, plans in (("numeric", numeric_plans), ("text", text_plans)):
+                per_document_chain_count[(document.file_id, chain)] = len(plans)
+                for plan in plans:
+                    plan["planned_batch_count"] = len(plans)
+                    plan["payload"].update(
+                        {
+                            "batch_depth": 0,
+                            "parent_batch_id": None,
+                            "planned_batch_count": len(plans),
+                            "extraction_version": plan["extraction_version"],
+                        }
+                    )
+                    if chain == "text":
+                        plan["text_fact_limit"] = default_text_fact_limit
+                    _with_checkpoint_identity(plan, document)
+                    source_file_id = (source_file_ids_by_file_id or {}).get(document.file_id)
+                    if source_file_id:
+                        legacy_document = _source_identity_document(
+                            document, plan["blocks"], source_file_id
+                        )
+                        plan["legacy_batch_id"] = stable_batch_id(
+                            document.sha256,
+                            legacy_document.blocks,
+                            plan["extraction_version"],
+                        )
+                initial_by_chain[chain].extend(plans)
+        return initial_by_chain, per_document_chain_count
+
+    initial_by_chain, per_document_chain_count = build_initial_plans()
+
+    async def strict_checkpoint_hit(plan: dict[str, Any]) -> bool:
+        if checkpoint_store is None:
+            return False
+        checkpoint = await checkpoint_store.load(
+            plan["batch_id"],
+            task_id=task_id,
+            file_sha256=plan["file_sha256"],
+            extraction_version=plan["extraction_version"],
+            payload_digest=_checkpoint_payload_digest(plan["payload"]),
+            source_task_id=source_task_id,
+        )
+        return checkpoint is not None and checkpoint.status == "SUCCEEDED"
+
+    async def preflight_call_budget() -> None:
+        """Count exact cache misses before any profile or fact LLM call."""
+
+        profile_misses: dict[str, int] = {}
+        if checkpoint_store is None:
+            profile_misses = {
+                document.file_id: 1 for document in documents_without_snapshot
+            }
+        else:
+            for document in documents_without_snapshot:
+                payload = build_document_overview_payload(document)
+                payload.update(
+                    {
+                        "batch_id": _checkpoint_batch_id(
+                            document, document.blocks, "profile-v2"
+                        ),
+                        "extraction_version": "profile-v2",
+                    }
+                )
+                hit = await checkpoint_store.load(
+                    payload["batch_id"],
+                    task_id=task_id,
+                    file_sha256=document.sha256,
+                    extraction_version="profile-v2",
+                    payload_digest=_checkpoint_payload_digest(payload),
+                    source_task_id=source_task_id,
+                )
+                profile_misses[document.file_id] = int(hit is None)
+
+        numeric_miss_plans = [
+            plan
+            for plan in initial_by_chain["numeric"]
+            if not await strict_checkpoint_hit(plan)
+        ]
+        text_miss_plans = [
+            plan
+            for plan in initial_by_chain["text"]
+            if not await strict_checkpoint_hit(plan)
+        ]
+        miss_by_document: dict[str, dict[str, int]] = {
+            document.file_id: {
+                "profile": profile_misses.get(document.file_id, 0),
+                "numeric": 0,
+                "text": 0,
+            }
+            for document in documents
+        }
+        for plan in numeric_miss_plans:
+            miss_by_document[plan["document_id"]]["numeric"] += 1
+        for plan in text_miss_plans:
+            miss_by_document[plan["document_id"]]["text"] += 1
+        total_misses = sum(sum(item.values()) for item in miss_by_document.values())
+        max_document_misses = max(
+            (sum(item.values()) for item in miss_by_document.values()),
+            default=0,
+        )
+        if (
+            total_misses > settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL
+            or max_document_misses
+            > settings.LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT
+        ):
+            details = {
+                "failure_stage": "FACT_EXTRACTION",
+                "chain": "mixed",
+                "file": None,
+                "file_id": None,
+                "batch_depth": 0,
+                "unit_count": 0,
+                "batch_id": None,
+                "failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED",
+                "numeric_cache_miss_count": len(numeric_miss_plans),
+                "text_cache_miss_count": len(text_miss_plans),
+                "profile_cache_miss_count": sum(profile_misses.values()),
+                "total_cache_miss_count": total_misses,
+                "max_document_cache_miss_count": max_document_misses,
+                "total_call_budget": settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL,
+                "document_call_budget": (
+                    settings.LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT
+                ),
+            }
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "事实抽取预检发现调用预算不足",
+                details=details,
+            )
+
+    await preflight_call_budget()
+
+    profile_results = await asyncio.gather(
+        *(profile_once(document) for document in documents_without_snapshot)
+    )
+    profiles = {
+        **document_snapshots,
+        **{file_id: value for file_id, value, _meta in profile_results},
+    }
+    profile_meta = {
+        **document_snapshot_meta,
+        **{file_id: meta for file_id, _value, meta in profile_results},
+    }
 
     def make_child_plan(
         document: ParsedDocument,
         parent: dict[str, Any],
         blocks: list[DocumentBlock],
+        *,
+        text_fact_limit: int | None = None,
     ) -> dict[str, Any]:
         chain = parent["chain"]
         version = NUMERIC_EXTRACTION_VERSION if chain == "numeric" else TEXT_EXTRACTION_VERSION
         batch_id = stable_batch_id(document.sha256, blocks, version)
         context_map = parent.get("context_units_by_block_id", {})
+
+        def context_for(block: DocumentBlock) -> list[dict[str, Any]]:
+            if block.block_id in context_map:
+                return context_map[block.block_id]
+            for parent_block_id, items in context_map.items():
+                if block.block_id.startswith(f"{parent_block_id}_"):
+                    return items
+            return []
+
         if chain == "numeric":
             payload = build_numeric_candidate_payload(document, blocks, batch_id=batch_id)
             count = len(payload["numeric_candidates"])
             estimate = min(settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000)
         else:
+            text_fact_limit = text_fact_limit or int(
+                parent.get("text_fact_limit", default_text_fact_limit)
+            )
             context_units: list[dict[str, Any]] = []
             seen_context_ids: set[str] = set()
             for block in blocks:
-                for item in context_map.get(block.block_id, []):
+                for item in context_for(block):
                     context_id = str(item.get("context_id", ""))
                     if context_id and context_id not in seen_context_ids:
                         seen_context_ids.add(context_id)
@@ -1096,6 +1932,7 @@ async def extract_documents_with_independent_map_reduce(
                 blocks,
                 batch_id=batch_id,
                 context_units=context_units,
+                max_items=text_fact_limit,
             )
             count = 0
             estimate = min(settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000)
@@ -1107,7 +1944,7 @@ async def extract_documents_with_independent_map_reduce(
                 "extraction_version": version,
             }
         )
-        return {
+        child = {
             "batch_id": batch_id,
             "document_id": document.file_id,
             "file_sha256": document.sha256,
@@ -1122,69 +1959,32 @@ async def extract_documents_with_independent_map_reduce(
             "planned_batch_count": parent.get("planned_batch_count", 0),
             "extraction_version": version,
             "context_units_by_block_id": {
-                block.block_id: context_map.get(block.block_id, [])
+                block.block_id: context_for(block)
                 for block in blocks
-                if context_map.get(block.block_id)
+                if context_for(block)
             },
         }
-
-    initial_by_chain: dict[str, list[dict[str, Any]]] = {"numeric": [], "text": []}
-    per_document_chain_count: dict[tuple[str, str], int] = {}
-    for document in documents:
-        if document.role == "TEMPLATE":
-            continue
-        numeric_plans = plan_numeric_document_batches(
+        if chain == "text":
+            child["text_fact_limit"] = text_fact_limit
+        child = _with_checkpoint_identity(
+            child,
             document,
-            max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-            max_numeric_candidates=min(settings.LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES, 24),
-            estimated_output_token_limit=min(
-                settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
+            variant=(
+                f"text_max_items_{text_fact_limit}"
+                if chain == "text"
+                else None
             ),
         )
-        if text_candidates_by_document is not None and document.role == "TARGET":
-            text_plans = plan_text_candidate_batches(
-                document,
-                text_candidates_by_document.get(document.file_id, []),
-                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-                max_candidates=min(
-                    getattr(settings, "LLM_EXTRACTION_MAX_TEXT_CANDIDATES", 8), 4
-                ),
-                estimated_output_token_limit=min(
-                    settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
-                ),
+        source_file_id = (source_file_ids_by_file_id or {}).get(document.file_id)
+        if source_file_id:
+            legacy_document = _source_identity_document(document, blocks, source_file_id)
+            child["legacy_batch_id"] = stable_batch_id(
+                document.sha256,
+                legacy_document.blocks,
+                version,
             )
-        else:
-            # Auxiliary documents are open-ended and showed saturation and
-            # cross-unit quote failures at wider batches in the real runs.
-            # Keep the public planning ceiling at 16, but use a safer effective
-            # wave unit count for the
-            # independent text chain; target candidates remain governed by
-            # the separate candidate limit.
-            effective_text_units = min(
-                getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 16),
-                1 if document.role != "TARGET" else 16,
-            )
-            text_plans = plan_text_document_batches(
-                document,
-                max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-                max_text_units=effective_text_units,
-                estimated_output_token_limit=min(
-                    settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
-                ),
-            )
-        for chain, plans in (("numeric", numeric_plans), ("text", text_plans)):
-            per_document_chain_count[(document.file_id, chain)] = len(plans)
-            for plan in plans:
-                plan["planned_batch_count"] = len(plans)
-                plan["payload"].update(
-                    {
-                        "batch_depth": 0,
-                        "parent_batch_id": None,
-                        "planned_batch_count": len(plans),
-                        "extraction_version": plan["extraction_version"],
-                    }
-                )
-                initial_by_chain[chain].append(plan)
+            child["legacy_parent_batch_id"] = parent.get("legacy_batch_id")
+        return child
 
     async def load_checkpoint_outcome(
         plan: dict[str, Any],
@@ -1192,7 +1992,7 @@ async def extract_documents_with_independent_map_reduce(
         """Load and validate one successful checkpoint, if it is reusable."""
 
         payload = plan["payload"]
-        digest = _payload_digest(payload)
+        digest = _checkpoint_payload_digest(payload)
         if checkpoint_store is not None:
             checkpoint = await checkpoint_store.load(
                 plan["batch_id"],
@@ -1202,15 +2002,55 @@ async def extract_documents_with_independent_map_reduce(
                 payload_digest=digest,
                 source_task_id=source_task_id,
             )
+            document = documents_by_id[plan["document_id"]]
+            if checkpoint is None and source_task_id and source_file_ids_by_file_id:
+                legacy = _legacy_checkpoint_payload(
+                    plan,
+                    document,
+                    source_file_ids_by_file_id,
+                )
+                if legacy is not None:
+                    legacy_batch_id, legacy_payload = legacy
+                    checkpoint = await checkpoint_store.load(
+                        legacy_batch_id,
+                        task_id=task_id,
+                        file_sha256=plan["file_sha256"],
+                        extraction_version=plan["extraction_version"],
+                        payload_digest=_payload_digest(legacy_payload),
+                        source_task_id=source_task_id,
+                    )
             if checkpoint is not None and checkpoint.value is not None:
-                facts = _validated_checkpoint_facts(
-                    documents_by_id[plan["document_id"]],
-                    profiles[plan["document_id"]],
+                checkpoint_value = _remap_checkpoint_facts(
                     checkpoint.value,
+                    document.file_id,
+                )
+                facts = _validated_checkpoint_facts(
+                    document,
+                    profiles[plan["document_id"]],
+                    checkpoint_value,
                     plan["chain"],
                 )
                 if facts is not None:
-                    await materialize_checkpoint(checkpoint)
+                    discarded_fact_count = int(
+                        checkpoint_value.get("discarded_fact_count", 0)
+                    )
+                    discarded_fact_codes = checkpoint_value.get(
+                        "discarded_fact_codes", {}
+                    )
+                    if not isinstance(discarded_fact_codes, dict):
+                        discarded_fact_codes = {}
+                    await materialize_checkpoint(
+                        checkpoint,
+                        plan=plan,
+                        payload_digest=digest,
+                        value={
+                            "facts": [
+                                item.model_dump(mode="json") for item in facts
+                            ],
+                            "discarded_fact_count": discarded_fact_count,
+                            "discarded_fact_codes": discarded_fact_codes,
+                        },
+                    )
                     return {
                         "status": "SUCCEEDED",
                         "batch_id": plan["batch_id"],
@@ -1224,14 +2064,37 @@ async def extract_documents_with_independent_map_reduce(
                         "duration_ms": 0,
                         "request_attempts": 0,
                         "structure_retries": 0,
+                        "discarded_fact_count": discarded_fact_count,
+                        "discarded_fact_codes": discarded_fact_codes,
                     }
         return None
 
     async def invoke_plan(plan: dict[str, Any]) -> dict[str, Any]:
         nonlocal logical_calls
         payload = plan["payload"]
-        digest = _payload_digest(payload)
-        checkpoint_outcome = await load_checkpoint_outcome(plan)
+        digest = _checkpoint_payload_digest(payload)
+        try:
+            checkpoint_outcome = await load_checkpoint_outcome(plan)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            # Checkpoint reads and the required current-document evidence
+            # validation are part of the map unit.  Keep failures in the same
+            # safe outcome shape as an LLM failure so the controller never
+            # collapses the bottom code into a generic workflow error.
+            return {
+                "status": "FAILED",
+                "batch_id": plan["batch_id"],
+                "document_id": plan["document_id"],
+                "chain": plan["chain"],
+                "plan": plan,
+                "error_code": _error_code(exc),
+                "failure_code": _safe_failure_code(exc),
+                "error": exc,
+                "checkpoint_reused": False,
+                "request_attempts": 0,
+                "structure_retries": 0,
+            }
         if checkpoint_outcome is not None:
             return checkpoint_outcome
         if (
@@ -1245,7 +2108,8 @@ async def extract_documents_with_independent_map_reduce(
                 "document_id": plan["document_id"],
                 "chain": plan["chain"],
                 "plan": plan,
-                "error_code": "DYNAMIC_CHECK_INCOMPLETE",
+                "error_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED",
+                "failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED",
                 "checkpoint_reused": False,
             }
         try:
@@ -1269,11 +2133,16 @@ async def extract_documents_with_independent_map_reduce(
                         if "allow_structure_correction" not in str(exc):
                             raise
                         result = await llm.extract_text_facts(payload)
-                    facts = expand_text_fact_response(payload, result.value)
-                    facts = rehydrate_fact_evidence(
-                        documents_by_id[plan["document_id"]], facts
+                    facts, discarded_fact_codes = filter_text_fact_evidence(
+                        documents_by_id[plan["document_id"]],
+                        payload,
+                        result.value,
                     )
                     _validate_fact_identity_set(facts)
+                    discarded_fact_count = sum(discarded_fact_codes.values())
+                if plan["chain"] == "numeric":
+                    discarded_fact_codes = {}
+                    discarded_fact_count = 0
             if checkpoint_store is not None:
                 await checkpoint_store.save(
                     ExtractionCheckpoint(
@@ -1282,7 +2151,11 @@ async def extract_documents_with_independent_map_reduce(
                         extraction_version=plan["extraction_version"],
                         batch_id=plan["batch_id"],
                         payload_digest=digest,
-                        value={"facts": [item.model_dump(mode="json") for item in facts]},
+                        value={
+                            "facts": [item.model_dump(mode="json") for item in facts],
+                            "discarded_fact_count": discarded_fact_count,
+                            "discarded_fact_codes": discarded_fact_codes,
+                        },
                         status="SUCCEEDED",
                         model_name=result.configured_model,
                         source_task_id=source_task_id,
@@ -1301,6 +2174,8 @@ async def extract_documents_with_independent_map_reduce(
                 "duration_ms": result.duration_ms,
                 "request_attempts": result.request_attempts,
                 "structure_retries": result.structure_retries,
+                "discarded_fact_count": discarded_fact_count,
+                "discarded_fact_codes": discarded_fact_codes,
             }
         except asyncio.CancelledError:
             raise
@@ -1314,7 +2189,7 @@ async def extract_documents_with_independent_map_reduce(
                 "chain": plan["chain"],
                 "plan": plan,
                 "error_code": _error_code(exc),
-                "failure_code": getattr(exc, "failure_code", None),
+                "failure_code": _safe_failure_code(exc),
                 "error": exc,
                 "checkpoint_reused": False,
                 "request_attempts": getattr(exc, "request_attempts", 1) or 1,
@@ -1356,23 +2231,59 @@ async def extract_documents_with_independent_map_reduce(
         recovery_counts: Counter[str] = Counter()
         first_wave: list[dict[str, Any]] = []
         nonrecoverable_streak = 0
+        terminal_failure: dict[str, Any] | None = None
 
-        def recovery_groups(plan: dict[str, Any], failure_code: str) -> list[list[DocumentBlock]]:
+        def failure_details(
+            plan: dict[str, Any] | None = None,
+            failure_code: str = "DYNAMIC_CHECK_INCOMPLETE",
+        ) -> dict[str, Any]:
+            if terminal_failure is not None:
+                return _failure_details(terminal_failure)
+            fallback = plan or (initial[0] if initial else {})
+            return _failure_details(
+                {"plan": fallback, "failure_code": failure_code}
+            )
+
+        def recovery_groups(
+            plan: dict[str, Any], failure_code: str
+        ) -> list[tuple[list[DocumentBlock], int | None]]:
             blocks = plan["blocks"]
+            if chain == "numeric":
+                numeric_groups = numeric_recovery_blocks(blocks, failure_code)
+                if numeric_groups:
+                    return [(group, None) for group in numeric_groups]
             if len(blocks) > 1:
-                midpoint = len(blocks) // 2
-                return [blocks[:midpoint], blocks[midpoint:]]
-            if chain in {"numeric", "text"} and failure_code in {
+                return [([block], None) for block in blocks]
+            if chain == "text" and failure_code in {
                 "FACT_BATCH_SATURATED",
                 "FACT_UNIT_NOT_FOUND",
                 "FACT_QUOTE_NOT_GROUNDED",
                 "FACT_IDENTITY_DUPLICATED",
                 "FACT_IDENTITY_CONFLICT",
                 "FACT_VALUE_NOT_GROUNDED",
+                "LLM_OUTPUT_TRUNCATED",
             }:
                 cell_units = split_table_text_unit(blocks[0])
                 if len(cell_units) > 1:
-                    return [[unit] for unit in cell_units]
+                    return [([unit], None) for unit in cell_units]
+            if chain == "text" and failure_code in {
+                "LLM_OUTPUT_TRUNCATED",
+                "FACT_BATCH_SATURATED",
+            }:
+                text_blocks = _split_text_structure_unit(blocks[0])
+                if len(text_blocks) > 1:
+                    return [([unit], None) for unit in text_blocks]
+                current_limit = int(
+                    plan.get(
+                        "text_fact_limit",
+                        plan.get("payload", {})
+                        .get("requirements", {})
+                        .get("max_items", default_text_fact_limit),
+                    )
+                )
+                next_limit = {12: 6, 6: 3}.get(current_limit)
+                if next_limit is not None:
+                    return [([blocks[0]], next_limit)]
             return []
 
         # A prior task may have failed a table-row parent after its column
@@ -1393,7 +2304,12 @@ async def extract_documents_with_independent_map_reduce(
                 continue
             document = documents_by_id[plan["document_id"]]
             child_plans = [
-                make_child_plan(document, plan, child_blocks)
+                make_child_plan(
+                    document,
+                    plan,
+                    child_blocks,
+                    text_fact_limit=plan.get("text_fact_limit"),
+                )
                 for child_blocks in precovery_groups
             ]
             child_outcomes = [
@@ -1428,7 +2344,13 @@ async def extract_documents_with_independent_map_reduce(
             for outcome in wave_outcomes:
                 batch_id = outcome["batch_id"]
                 if batch_id in all_outcomes:
-                    raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "Reduce 收到重复 batch_id")
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        "Reduce 收到重复 batch_id",
+                        details=failure_details(
+                            outcome["plan"], "CHECKPOINT_BATCH_ID_DUPLICATE"
+                        ),
+                    )
                 all_outcomes[batch_id] = outcome
                 if outcome["status"] == "SUCCEEDED":
                     nonrecoverable_streak = 0
@@ -1461,8 +2383,13 @@ async def extract_documents_with_independent_map_reduce(
                     children = [
                         *children,
                         *[
-                            make_child_plan(document, plan, child_blocks)
-                            for child_blocks in child_groups
+                            make_child_plan(
+                                document,
+                                plan,
+                                child_blocks,
+                                text_fact_limit=text_fact_limit,
+                            )
+                            for child_blocks, text_fact_limit in child_groups
                         ],
                     ]
                     recovery_counts[plan["document_id"]] += 1
@@ -1471,7 +2398,9 @@ async def extract_documents_with_independent_map_reduce(
                         > recovery_budget[plan["document_id"]]
                     ):
                         raise WorkflowError(
-                            "DYNAMIC_CHECK_INCOMPLETE", "事实抽取恢复预算已用尽"
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "事实抽取恢复预算已用尽",
+                            details=_failure_details(outcome),
                         )
                     superseded.add(plan["batch_id"])
                     continue
@@ -1486,11 +2415,17 @@ async def extract_documents_with_independent_map_reduce(
                 else:
                     nonrecoverable_streak = 0
                 if nonrecoverable_streak >= 2:
+                    terminal_failure = outcome
                     raise WorkflowError(
-                        "DYNAMIC_CHECK_INCOMPLETE", "连续两次不可恢复抽取失败，已熔断"
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        "连续两次不可恢复抽取失败，已熔断",
+                        details=_failure_details(outcome),
                     )
+                terminal_failure = outcome
                 raise WorkflowError(
-                    "DYNAMIC_CHECK_INCOMPLETE", "最小事实分片仍未可靠完成"
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "最小事实分片仍未可靠完成",
+                    details=_failure_details(outcome),
                 ) from outcome.get("error")
             pending.extend(children)
         active = [
@@ -1535,7 +2470,21 @@ async def extract_documents_with_independent_map_reduce(
                     raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "Reduce 检测到结构单元身份冲突")
                 actual.update(unit_ids)
             if actual != expected:
-                raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "结构单元覆盖率不是 100%")
+                raise WorkflowError(
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "结构单元覆盖率不是 100%",
+                    details=failure_details(
+                        plan=next(
+                            (
+                                item
+                                for item in initial
+                                if item["document_id"] == document.file_id
+                            ),
+                            None,
+                        ),
+                        failure_code="STRUCTURE_UNIT_COVERAGE_INCOMPLETE",
+                    ),
+                )
         recoverable_codes = {
             "FACT_BATCH_SATURATED",
             "FACT_UNIT_NOT_FOUND",
@@ -1567,20 +2516,48 @@ async def extract_documents_with_independent_map_reduce(
             else 1.0
         )
         if first_rate < 0.9:
-            raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "首波不可恢复抽取成功率低于 90%")
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "首波不可恢复抽取成功率低于 90%",
+                details=failure_details(failure_code="FIRST_WAVE_SUCCESS_RATE_LOW"),
+            )
         return by_document, {
             "planned": len(initial),
             "recovery": sum(recovery_counts.values()),
             "first_wave_success_rate": first_rate,
             "wave_count": wave_count,
             "recovery_counts": dict(recovery_counts),
+            "discarded_fact_count": sum(
+                int(item.get("discarded_fact_count", 0))
+                for item in all_outcomes.values()
+                if item.get("status") == "SUCCEEDED"
+            ),
         }
 
     numeric_results, numeric_meta = await run_chain("numeric")
     text_results, text_meta = await run_chain("text")
     reduced: dict[str, dict[str, Any]] = {}
     for document in documents:
+        if document.file_id in document_snapshots:
+            reduced[document.file_id] = {
+                "value": document_snapshots[document.file_id].model_dump(mode="json"),
+                **document_snapshot_meta[document.file_id],
+                "chunk_count": 0,
+                "planned_batch_count": 0,
+                "numeric_batch_count": 0,
+                "text_batch_count": 0,
+                "recovery_count": 0,
+                "wave_count": 0,
+                "logical_calls": 0,
+                "first_wave_success_rate": 1.0,
+            }
+            continue
         if document.role == "TEMPLATE":
+            await save_document_checkpoint(
+                document,
+                profiles[document.file_id],
+                profile_meta[document.file_id].get("configured_model"),
+            )
             reduced[document.file_id] = {
                 "value": profiles[document.file_id].model_dump(mode="json"),
                 **profile_meta[document.file_id],
@@ -1604,6 +2581,13 @@ async def extract_documents_with_independent_map_reduce(
             raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "Reduce 未收到有效事实")
         merged = merge_chunk_extractions(document, parts)
         merged = merged.model_copy(update={"profile": profiles[document.file_id].profile})
+        validate_extraction_evidence(document, merged)
+        _validate_fact_identity_set(merged.facts)
+        await save_document_checkpoint(
+            document,
+            merged,
+            profile_meta[document.file_id].get("configured_model"),
+        )
         document_planned = numeric_meta["planned"] + text_meta["planned"]
         document_recovery = numeric_meta["recovery_counts"].get(document.file_id, 0) + text_meta[
             "recovery_counts"
@@ -1630,6 +2614,8 @@ async def extract_documents_with_independent_map_reduce(
             "recovery_count": document_recovery,
             "wave_count": wave_count,
             "logical_calls": logical_calls,
+            "discarded_fact_count": numeric_meta.get("discarded_fact_count", 0)
+            + text_meta.get("discarded_fact_count", 0),
             "first_wave_success_rate": min(
                 numeric_meta["first_wave_success_rate"], text_meta["first_wave_success_rate"]
             ),

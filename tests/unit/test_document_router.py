@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.core.errors import WorkflowError
-from app.documents.models import ParsedDocument
+from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
 from app.documents.router import DocumentParsingRouter
 from app.services.downloader import DOCX_MIME, PDF_MIME, LocalFile
 
@@ -60,6 +60,26 @@ class ExternalParser:
     async def parse(self, file: LocalFile, *, mode: str) -> ParsedDocument:
         self.calls.append((file.file_id, mode))
         return self.result
+
+
+class DocxPageExternalParser:
+    def __init__(self, result: ParsedDocument) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str]] = []
+
+    async def parse(self, file: LocalFile, *, mode: str) -> ParsedDocument:
+        self.calls.append((file.file_id, mode))
+        return self.result.model_copy(update={"file_id": file.file_id})
+
+
+class FailingDocxPageExternalParser:
+    def __init__(self, error: WorkflowError) -> None:
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    async def parse(self, file: LocalFile, *, mode: str) -> ParsedDocument:
+        self.calls.append((file.file_id, mode))
+        raise self.error
 
 
 def parsed() -> ParsedDocument:
@@ -133,6 +153,105 @@ async def test_draft_review_routes_each_docx_locally_and_each_pdf_external_auto(
         ("fil_reference", "auto"),
         ("fil_reference-2", "auto"),
     ]
+
+
+async def test_docx_page_location_keeps_local_document_and_records_sidecar(
+    tmp_path: Path,
+) -> None:
+    local_document = ParsedDocument(
+        file_id="fil_target",
+        role="TARGET",
+        file_name="target.docx",
+        sha256="d" * 64,
+        page_count=None,
+        blocks=[
+            DocumentBlock(
+                block_id="fil_target_p0",
+                type="PARAGRAPH",
+                order=0,
+                raw_text="合同金额为100万元。",
+                normalized_text="合同金额为100万元。",
+                location={"paragraph_index": 0},
+            )
+        ],
+        parser_name="python-docx",
+    )
+    external_document = local_document.model_copy(
+        deep=True,
+        update={
+            "blocks": [
+                local_document.blocks[0].model_copy(
+                    update={
+                        "location": DocumentLocation(paragraph_index=0, page=1)
+                    }
+                )
+            ],
+            "page_count": 1,
+        },
+    )
+    local = LocalParser(local_document)
+    external = DocxPageExternalParser(external_document)
+    router = DocumentParsingRouter(
+        local=local,
+        external=external,
+        docx_page_location_enabled=True,
+    )
+
+    parsed = await router.parse_draft_review([docx_file(tmp_path, "TARGET")])
+
+    assert parsed[0].blocks[0].location.page == 1
+    assert parsed[0].blocks[0].location.structure_id == "paragraph:0"
+    assert external.calls == [("fil_target", "auto")]
+    assert router.page_location_sidecars["fil_target"].page_count == 1
+
+
+async def test_docx_page_location_preserves_safe_external_failure_chain(
+    tmp_path: Path,
+) -> None:
+    local_document = parsed().model_copy(
+        update={
+            "file_id": "fil_target",
+            "role": "TARGET",
+            "file_name": "target.docx",
+            "blocks": [],
+        }
+    )
+    external = FailingDocxPageExternalParser(
+        WorkflowError(
+            "OCR_RESPONSE_INVALID",
+            "OCR 服务未返回完整的物理页码",
+            details={
+                "failure_stage": "PAGE_ID_VALIDATION",
+                "failure_code": "EXTERNAL_PAGE_ID_INCOMPLETE",
+                "page_count": 3,
+                "external_detail_page_count": 2,
+                "external_detail_count": 7,
+                "external_structure_count": 9,
+            },
+        )
+    )
+    router = DocumentParsingRouter(
+        local=LocalParser(local_document),
+        external=external,
+        docx_page_location_enabled=True,
+    )
+
+    with pytest.raises(WorkflowError) as caught:
+        await router.parse_draft_review([docx_file(tmp_path, "TARGET")])
+
+    assert caught.value.code == "DOCX_PAGE_LOCATION_INCOMPLETE"
+    assert caught.value.details == {
+        "failure_stage": "PAGE_ID_VALIDATION",
+        "failure_code": "EXTERNAL_PAGE_ID_INCOMPLETE",
+        "page_count": 3,
+        "external_detail_page_count": 2,
+        "external_detail_count": 7,
+        "external_structure_count": 9,
+        "local_structure_count": 0,
+        "candidate_mapping_count": 0,
+        "unmapped_location_count": 0,
+    }
+    assert external.calls == [("fil_target", "auto")]
 
 
 async def test_draft_review_pdf_requires_external_parser(tmp_path: Path) -> None:

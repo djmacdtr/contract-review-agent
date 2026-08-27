@@ -29,6 +29,7 @@ from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning
+from app.documents.page_locations import apply_docx_page_location_sidecars
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.draft_review.checkpoints import ExtractionCheckpoint
@@ -73,7 +74,7 @@ from app.results.advice import (
 from app.results.passed_checks import build_comparison_passed_checks
 from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
-from app.services.downloader import LocalFile, SafeFileDownloadService
+from app.services.downloader import DOCX_MIME, LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
@@ -375,6 +376,67 @@ def _safe_validation_items(exc: BaseException) -> list[dict[str, Any]]:
     ]
 
 
+def _mapping_failure_code(exc: BaseException) -> str:
+    """Return the deepest stable mapping error code without exposing content."""
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, LlmClientError):
+            if current.failure_code:
+                return current.failure_code
+            if isinstance(
+                current.__cause__,
+                (
+                    LlmClientError,
+                    EvidenceValidationError,
+                    ValidationError,
+                    WorkflowError,
+                ),
+            ):
+                current = current.__cause__
+                continue
+            return {
+                "LLM_SCHEMA_INVALID": "LLM_RESPONSE_SCHEMA_INVALID",
+                "LLM_RESPONSE_INVALID": "LLM_RESPONSE_ENVELOPE_INVALID",
+            }.get(current.code, current.code)
+        if isinstance(current, EvidenceValidationError):
+            return current.code
+        if isinstance(current, ValidationError):
+            return "LLM_RESPONSE_SCHEMA_INVALID"
+        if isinstance(current, WorkflowError):
+            details = current.details
+            if isinstance(details, dict) and isinstance(details.get("failure_code"), str):
+                return str(details["failure_code"])
+            current = current.__cause__
+            continue
+        if isinstance(current, TimeoutError):
+            return "LLM_TIMEOUT"
+        current = current.__cause__
+    return type(exc).__name__
+
+
+def _mapping_failure_details(
+    document: ParsedDocument,
+    payload: dict[str, Any],
+    exc: BaseException,
+) -> dict[str, Any]:
+    """Build the safe diagnostic boundary for one reference mapping request."""
+
+    return {
+        "failure_stage": "FACT_MAPPING",
+        "chain": "mapping",
+        "file": document.file_id,
+        "file_id": document.file_id,
+        "batch_depth": 0,
+        "unit_count": len(payload.get("reference_facts", [])),
+        "failure_code": _mapping_failure_code(exc),
+        "request_attempts": max(int(getattr(exc, "request_attempts", 0) or 0), 0),
+        "structure_retries": max(int(getattr(exc, "structure_retries", 0) or 0), 0),
+    }
+
+
 class DraftReviewState(TypedDict, total=False):
     task_id: str
     files: list[dict[str, Any]]
@@ -387,6 +449,7 @@ class DraftReviewState(TypedDict, total=False):
     llm_mappings: dict[str, dict[str, Any]]
     llm_mapping_reviews: dict[str, dict[str, Any]]
     llm_semantic_plans: dict[str, dict[str, Any]]
+    page_location_sidecars: dict[str, Any]
     result: dict[str, Any]
 
 
@@ -410,7 +473,10 @@ class DraftReviewWorkflowExecutor:
         )
         self.parsers = document_router or DocumentParsingRouter(
             local=local_parsers,
-            external=TextInDocumentParser(settings) if settings.OCR_ENABLED else None,
+            external=TextInDocumentParser(settings)
+            if settings.OCR_ENABLED or settings.DOCX_PAGE_LOCATION_ENABLED
+            else None,
+            docx_page_location_enabled=settings.DOCX_PAGE_LOCATION_ENABLED,
         )
         if llm is not None:
             self.llm = llm
@@ -429,7 +495,35 @@ class DraftReviewWorkflowExecutor:
 
         async def parse_documents(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.PARSING, 35, "正在逐份解析目标、模板和辅助资料")
-            return {"parsed_documents": await self.parsers.parse_draft_review(state["local_files"])}
+            parsed = await self.parsers.parse_draft_review(state["local_files"])
+            sidecars = getattr(self.parsers, "page_location_sidecars", {})
+            if self.settings.DOCX_PAGE_LOCATION_ENABLED:
+                missing = [
+                    file.file_id
+                    for file in state["local_files"]
+                    if file.detected_mime_type == DOCX_MIME and file.file_id not in sidecars
+                ]
+                if missing:
+                    raise WorkflowError(
+                        "DOCX_PAGE_LOCATION_INCOMPLETE",
+                        "DOCX 真实页码解析或映射未能可靠完成",
+                        details={
+                            "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
+                            "failure_code": "SIDECAR_MISSING",
+                            "page_count": None,
+                            "external_detail_page_count": 0,
+                            "external_detail_count": 0,
+                            "local_structure_count": 0,
+                            "external_structure_count": 0,
+                            "candidate_mapping_count": 0,
+                            "unmapped_location_count": len(missing),
+                            "missing_file_count": len(missing),
+                        },
+                    )
+            return {
+                "parsed_documents": parsed,
+                "page_location_sidecars": sidecars,
+            }
 
         async def compare_template(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.TEMPLATE_COMPARE, 65, "正在对齐模板固定条款和允许填写区域")
@@ -470,6 +564,15 @@ class DraftReviewWorkflowExecutor:
                 )
             ):
                 try:
+                    source_file_ids = state.get("options", {}).get(
+                        "_checkpoint_source_file_ids", {}
+                    )
+                    source_file_ids_by_file_id = {
+                        document.file_id: str(source_file_ids[str(index)])
+                        for index, document in enumerate(state["parsed_documents"])
+                        if isinstance(source_file_ids, dict)
+                        and source_file_ids.get(str(index))
+                    }
                     extractions, _profile_meta = await (
                         extract_documents_with_independent_map_reduce(
                             settings=self.settings,
@@ -478,6 +581,7 @@ class DraftReviewWorkflowExecutor:
                             checkpoint_store=self.checkpoint_store,
                             task_id=state.get("task_id"),
                             source_task_id=state.get("options", {}).get("source_task_id"),
+                            source_file_ids_by_file_id=source_file_ids_by_file_id,
                             text_candidates_by_document={
                                 document.file_id: build_template_text_candidates(
                                     state["template_review"], document
@@ -956,7 +1060,7 @@ class DraftReviewWorkflowExecutor:
             ]
             catalog = [_compact_mapping_fact(item) for item in catalog]
             target_ids = {item["target_fact_id"] for item in catalog}
-            await callback(TaskStage.FACT_EXTRACTION, 80, "正在逐份映射目标合同与辅助资料事实")
+            await callback(TaskStage.CROSS_VALIDATE, 80, "正在逐份映射目标合同与辅助资料事实")
             for document in state["parsed_documents"]:
                 if document.role != "REFERENCE":
                     continue
@@ -1033,7 +1137,10 @@ class DraftReviewWorkflowExecutor:
                     mapping_result = await self.llm.map_facts(payload)
                     mapping = FactMappingResponse.model_validate(mapping_result.value)
                     if mapping.reference_file_id != document.file_id:
-                        raise EvidenceValidationError("mapping reference file does not match")
+                        raise EvidenceValidationError(
+                            "mapping reference file does not match",
+                            code="FACT_MAPPING_REFERENCE_FILE_MISMATCH",
+                        )
                     proposed_keys = set()
                     for proposal in mapping.mappings:
                         key = (
@@ -1043,15 +1150,24 @@ class DraftReviewWorkflowExecutor:
                             location_key(proposal.reference_location),
                         )
                         if proposal.target_fact_id not in target_ids:
-                            raise EvidenceValidationError("mapping target fact does not exist")
+                            raise EvidenceValidationError(
+                                "mapping target fact does not exist",
+                                code="FACT_MAPPING_TARGET_NOT_FOUND",
+                            )
                         if proposal.source_file_id != document.file_id:
-                            raise EvidenceValidationError("mapping source file does not match")
+                            raise EvidenceValidationError(
+                                "mapping source file does not match",
+                                code="FACT_MAPPING_SOURCE_FILE_MISMATCH",
+                            )
                         if (
                             proposal.reference_field_key,
                             proposal.source_file_id,
                             location_key(proposal.reference_location),
                         ) not in reference_index:
-                            raise EvidenceValidationError("mapping reference fact does not exist")
+                            raise EvidenceValidationError(
+                                "mapping reference fact does not exist",
+                                code="FACT_MAPPING_REFERENCE_FACT_NOT_FOUND",
+                            )
                         if key in proposed_keys:
                             raise EvidenceValidationError(
                                 "mapping contains duplicate proposal",
@@ -1062,7 +1178,10 @@ class DraftReviewWorkflowExecutor:
                         requirement.target_fact_id for requirement in mapping.missing_requirements
                     }
                     if not requirement_ids <= target_ids:
-                        raise EvidenceValidationError("missing requirement target does not exist")
+                        raise EvidenceValidationError(
+                            "missing requirement target does not exist",
+                            code="FACT_MAPPING_TARGET_NOT_FOUND",
+                        )
                     mappings[document.file_id] = {
                         "value": mapping.model_dump(mode="json"),
                         "configured_model": mapping_result.configured_model,
@@ -1139,15 +1258,26 @@ class DraftReviewWorkflowExecutor:
                         "request_attempts": review_result.request_attempts,
                         "structure_retries": review_result.structure_retries,
                     }
-                except (
-                    LlmClientError,
-                    EvidenceValidationError,
-                    ValidationError,
-                    TimeoutError,
-                ) as exc:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    details = _mapping_failure_details(document, payload, exc)
+                    logger.error(
+                        "draft_review_mapping_failed",
+                        task_id=state["task_id"],
+                        failure_stage=details["failure_stage"],
+                        chain=details["chain"],
+                        file_id=details["file_id"],
+                        batch_depth=details["batch_depth"],
+                        unit_count=details["unit_count"],
+                        failure_code=details["failure_code"],
+                        request_attempts=details["request_attempts"],
+                        structure_retries=details["structure_retries"],
+                    )
                     raise WorkflowError(
                         "DYNAMIC_CHECK_INCOMPLETE",
                         f"文件 {document.file_name} 的跨资料事实映射未能可靠完成",
+                        details=details,
                     ) from exc
             return {"llm_mappings": mappings, "llm_mapping_reviews": mapping_reviews}
 
@@ -1501,7 +1631,11 @@ class DraftReviewWorkflowExecutor:
 
         async def persist_result(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.PERSISTING_RESULT, 97, "正在保存多文档解析结果")
-            return {}
+            result = state["result"]
+            apply_docx_page_location_sidecars(
+                result, state.get("page_location_sidecars", {})
+            )
+            return {"result": result}
 
         graph.add_node("download_files", download_files)
         graph.add_node("parse_documents", parse_documents)
@@ -2612,13 +2746,17 @@ class DraftReviewWorkflowExecutor:
             )
             documents = state["parsed_documents"]
             local_by_id = {file.file_id: file for file in state["local_files"]}
+            page_counts = {
+                file_id: sidecar.page_count
+                for file_id, sidecar in state.get("page_location_sidecars", {}).items()
+            }
             metadata = [
                 {
                     "file_id": document.file_id,
                     "detected_mime_type": local_by_id[document.file_id].detected_mime_type,
                     "file_size": local_by_id[document.file_id].file_size,
                     "sha256": document.sha256,
-                    "page_count": document.page_count,
+                    "page_count": page_counts.get(document.file_id, document.page_count),
                     "parser_name": document.parser_name,
                     "parse_status": self._parse_status(document),
                     "parse_warnings": [

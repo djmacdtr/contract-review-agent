@@ -17,6 +17,8 @@
         :diff-items="result.diff_items"
         :files="result.files"
         :module-order="moduleOrder"
+        :stamp-images="result.stamp_images ?? []"
+        :show-stamp-images="true"
       />
     </template>
   </main>

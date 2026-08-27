@@ -66,6 +66,16 @@ def extraction_payload() -> dict[str, Any]:
     }
 
 
+def test_mapping_schema_validation_exposes_only_safe_subcode() -> None:
+    with pytest.raises(LlmClientError) as raised:
+        openai_client_module._validate_mapping({})
+
+    assert raised.value.code == "LLM_SCHEMA_INVALID"
+    assert raised.value.failure_code == "LLM_RESPONSE_SCHEMA_INVALID"
+    assert raised.value.validation_summary
+    assert "模型事实映射" not in str(raised.value.validation_summary)
+
+
 def review_payload() -> dict[str, Any]:
     facts = []
     for field_key, paragraph_index in (("amount", 1), ("term", 2)):
@@ -716,6 +726,45 @@ async def test_text_fact_prompt_requires_empty_json_object_when_no_fact_is_groun
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "{\"items\":[]}" in body["messages"][0]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"items": []}'},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.extract_text_facts(payload)
+
+    assert result.value == {"items": []}
+
+
+async def test_text_schema_uses_payload_fact_limit() -> None:
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic_text",
+        "units": [],
+        "readonly_context": [],
+        "requirements": {"max_items": 6},
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["response_format"]["json_schema"]["schema"]["properties"]["items"][
+            "maxItems"
+        ] == 6
+        assert "requirements.max_items" in body["messages"][0]["content"]
         return httpx.Response(
             200,
             json={

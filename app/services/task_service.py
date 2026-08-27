@@ -82,8 +82,12 @@ class TaskService:
         files: Iterable[tuple[FileRole, RemoteFile, int]],
         request_id: str,
         source_task_id: str | None = None,
+        checkpoint_source_file_ids: dict[str, str] | None = None,
     ) -> TaskAccepted:
         task_id = new_task_id()
+        task_options = dict(options)
+        if checkpoint_source_file_ids:
+            task_options["_checkpoint_source_file_ids"] = dict(checkpoint_source_file_ids)
         file_rows: list[TaskFile] = []
         snapshot_files: list[dict] = []
         for role, remote, order in files:
@@ -125,8 +129,8 @@ class TaskService:
             stage=TaskStage.QUEUED,
             stage_message="任务已创建，等待 Worker",
             progress=0,
-            options=options,
-            input_snapshot={"files": snapshot_files, "options": options},
+            options=task_options,
+            input_snapshot={"files": snapshot_files, "options": task_options},
             request_id=request_id,
             source_task_id=source_task_id,
             max_attempts=self.settings.TASK_MAX_ATTEMPTS,
@@ -265,6 +269,10 @@ class TaskService:
         source_client_reference_id = source.client_reference_id
         source_options = dict(source.options)
         source_id = source.id
+        source_file_ids = {
+            str(file.sort_order): file.id
+            for file in source.files
+        }
         # The read above starts SQLAlchemy's implicit transaction. End it before
         # _create opens the explicit atomic creation transaction.
         await self.session.rollback()
@@ -275,6 +283,7 @@ class TaskService:
             files,
             request_id,
             source_task_id=source_id,
+            checkpoint_source_file_ids=source_file_ids,
         )
 
     @staticmethod

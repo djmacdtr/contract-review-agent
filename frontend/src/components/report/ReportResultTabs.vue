@@ -12,6 +12,9 @@
       </CheckModule>
       <el-empty v-if="!passedGroups.length" description="本次没有形成校验通过记录" />
     </div>
+    <div v-else-if="active === 'stamp'" class="tab-content">
+      <StampImageList :items="stampImages" />
+    </div>
     <div v-else class="tab-content">
       <CheckModule v-for="group in riskGroups" :key="group.code" :title="group.title" :count="group.items.length">
         <RiskItemCard
@@ -20,7 +23,6 @@
           :item="item"
           :evidence="relatedDiffs(item.related_diff_ids)"
           :files="files"
-          :left-label="leftLabel"
         />
       </CheckModule>
       <el-empty v-if="!riskGroups.length" description="当前分类没有检出风险" />
@@ -31,21 +33,24 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { DiffItem, PassedCheck, ResultFile, RiskItem } from '../../api/types'
+import type { StampImage } from '../../api/types'
 import { displayLabel } from '../../utils/labels'
 import CheckModule from './CheckModule.vue'
 import PassedCheckList from './PassedCheckList.vue'
 import RiskItemCard from './RiskItemCard.vue'
+import StampImageList from './StampImageList.vue'
 
-type TabKey = 'all' | 'deletion' | 'addition' | 'passed'
+type TabKey = 'all' | 'deletion' | 'addition' | 'passed' | 'stamp'
 const props = withDefaults(defineProps<{
   riskItems: RiskItem[]
   passedChecks: PassedCheck[]
   diffItems: DiffItem[]
   files: ResultFile[]
   moduleOrder?: string[]
-  leftLabel?: string
   showPassedChecks?: boolean
-}>(), { moduleOrder: () => [], leftLabel: '基准文件', showPassedChecks: true })
+  stampImages?: StampImage[]
+  showStampImages?: boolean
+}>(), { moduleOrder: () => [], showPassedChecks: true, stampImages: () => [], showStampImages: false })
 
 const active = ref<TabKey>('all')
 const tabs = computed(() => [
@@ -53,6 +58,7 @@ const tabs = computed(() => [
   { key: 'deletion' as const, label: '删除 / 缺失', count: props.riskItems.filter(item => item.risk_type === 'DELETION_OR_MISSING').length },
   { key: 'addition' as const, label: '新增 / 变更', count: props.riskItems.filter(item => item.risk_type === 'ADDITION_OR_CHANGE').length },
   ...(props.showPassedChecks ? [{ key: 'passed' as const, label: '校验通过', count: props.passedChecks.length }] : []),
+  ...(props.showStampImages ? [{ key: 'stamp' as const, label: '印章影像', count: props.stampImages.length }] : []),
 ])
 const currentRisks = computed(() => {
   if (active.value === 'deletion') return props.riskItems.filter(item => item.risk_type === 'DELETION_OR_MISSING')
@@ -75,5 +81,5 @@ function relatedDiffs(ids: string[]) { return props.diffItems.filter(item => ids
 </script>
 
 <style scoped>
-.result-tabs{display:grid;gap:14px}.tab-list{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.result-tab{display:flex;align-items:center;justify-content:center;gap:10px;border:1px solid var(--report-border);background:#fff;color:var(--report-text-2);border-radius:10px;padding:14px 12px;font:inherit;font-weight:700;cursor:pointer;box-shadow:var(--report-shadow)}.result-tab b{min-width:25px;border-radius:999px;padding:2px 8px;background:var(--report-surface-2);font-size:12px}.result-tab:hover{border-color:#bcd6f0}.result-tab.active{background:var(--report-primary);border-color:var(--report-primary);color:#fff}.result-tab.active b{background:#ffffff2b}.result-tab.deletion:not(.active) b,.result-tab.all:not(.active) b{color:var(--report-danger)}.result-tab.addition:not(.active) b{color:var(--report-warning)}.result-tab.passed:not(.active) b{color:var(--report-success)}.tab-content{display:grid;gap:14px}@media(max-width:760px){.tab-list{grid-template-columns:repeat(2,1fr)}}
+.result-tabs{display:grid;gap:14px}.tab-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.result-tab{display:flex;align-items:center;justify-content:center;gap:10px;border:1px solid var(--report-border);background:#fff;color:var(--report-text-2);border-radius:10px;padding:14px 12px;font:inherit;font-weight:700;cursor:pointer;box-shadow:var(--report-shadow)}.result-tab b{min-width:25px;border-radius:999px;padding:2px 8px;background:var(--report-surface-2);font-size:12px}.result-tab:hover{border-color:#bcd6f0}.result-tab.active{background:var(--report-primary);border-color:var(--report-primary);color:#fff}.result-tab.active b{background:#ffffff2b}.result-tab.deletion:not(.active) b,.result-tab.all:not(.active) b{color:var(--report-danger)}.result-tab.addition:not(.active) b{color:var(--report-warning)}.result-tab.passed:not(.active) b{color:var(--report-success)}.result-tab.stamp:not(.active) b{color:var(--report-primary)}.tab-content{display:grid;gap:14px}@media(max-width:760px){.tab-list{grid-template-columns:repeat(2,1fr)}}
 </style>

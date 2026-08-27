@@ -82,11 +82,14 @@ class WorkerRunner:
             for item in task.files
         ]
         try:
+            workflow_options = dict(task.options or {})
+            if task.source_task_id:
+                workflow_options["source_task_id"] = task.source_task_id
             output = await self.workflow.run(
                 task_id=task.id,
                 task_type=task.task_type,
                 files=files,
-                options=task.options,
+                options=workflow_options,
                 progress_callback=lambda stage, progress, message: self._progress(
                     task.id, stage, progress, message
                 ),
@@ -128,6 +131,13 @@ class WorkerRunner:
                 failure_kind=details.get("failure_kind"),
                 attempts=details.get("attempts"),
                 elapsed_ms=details.get("elapsed_ms"),
+                failure_stage=details.get("failure_stage"),
+                chain=details.get("chain"),
+                file_id=details.get("file_id", details.get("file")),
+                batch_depth=details.get("batch_depth"),
+                unit_count=details.get("unit_count"),
+                batch_id=details.get("batch_id"),
+                failure_code=details.get("failure_code"),
             )
             async with SessionFactory() as session, session.begin():
                 await self.repository.fail(
@@ -170,7 +180,19 @@ class WorkerRunner:
         return True
 
     async def run_forever(self) -> None:
-        logger.info("worker_started", worker_id=self.worker_id)
+        logger.info(
+            "worker_started",
+            worker_id=self.worker_id,
+            llm_enabled=self.settings.LLM_ENABLED,
+            llm_response_format=(
+                "json_schema"
+                if self.settings.LLM_NATIVE_STRUCTURED_OUTPUT
+                else self.settings.LLM_RESPONSE_FORMAT
+            ),
+            llm_native_structured_output=self.settings.LLM_NATIVE_STRUCTURED_OUTPUT,
+            llm_extraction_model=self.settings.LLM_EXTRACTION_MODEL,
+            llm_advice_model=self.settings.LLM_ADVICE_MODEL,
+        )
         while not self._stopping.is_set():
             processed = await self.run_once()
             if not processed:

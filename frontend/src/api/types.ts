@@ -53,6 +53,7 @@ export interface ResultFile {
   document_profile?: { document_kind: string; title?: string; confidence: number; generated_by: string; evidence_locations: DocumentLocation[] }
   content_structure?: { block_count: number; table_count: number; sample_locations: DocumentLocation[] }
 }
+export interface StampImage { file_name: string; page: number; data_uri: string }
 export interface ComparisonDiagnostics {
   reliable: boolean
   baseline_unit_count: number; target_unit_count: number; aligned_unit_count: number
@@ -105,7 +106,7 @@ export interface FactMatrixItem {
 export interface TaskResult {
   schema_version: string; task_id: string; task_type: TaskType; conclusion: string; mock: boolean
   summary: { title: string; description: string; statistics: ResultStatistics }
-  files: ResultFile[]; risk_items: RiskItem[]; review_items: ReviewItem[]; passed_checks: PassedCheck[]; diff_items: DiffItem[]
+  files: ResultFile[]; stamp_images?: StampImage[]; risk_items: RiskItem[]; review_items: ReviewItem[]; passed_checks: PassedCheck[]; diff_items: DiffItem[]
   fact_matrix: FactMatrixItem[]; rule_checks: RuleCheck[]
   warnings: { code: string; message: string; requires_manual_review?: boolean; page?: number; confidence?: number; details?: Record<string, unknown> }[]
   advice: Record<string, unknown>

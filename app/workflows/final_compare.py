@@ -17,6 +17,7 @@ from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument, ProcessingWarning
+from app.documents.page_locations import apply_docx_page_location_sidecars
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.results.advice import (
@@ -27,7 +28,7 @@ from app.results.advice import (
 from app.results.passed_checks import build_comparison_passed_checks
 from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
-from app.services.downloader import LocalFile, SafeFileDownloadService
+from app.services.downloader import DOCX_MIME, LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
@@ -43,6 +44,7 @@ class FinalCompareState(TypedDict, total=False):
     local_files: list[LocalFile]
     parsed_documents: list[ParsedDocument]
     comparison: ComparisonResult
+    page_location_sidecars: dict[str, Any]
     result: dict[str, Any]
 
 
@@ -63,7 +65,10 @@ class FinalCompareWorkflowExecutor:
         )
         self.parsers = document_router or DocumentParsingRouter(
             local=local_parsers,
-            external=TextInDocumentParser(settings) if settings.OCR_ENABLED else None,
+            external=TextInDocumentParser(settings)
+            if settings.OCR_ENABLED or settings.DOCX_PAGE_LOCATION_ENABLED
+            else None,
+            docx_page_location_enabled=settings.DOCX_PAGE_LOCATION_ENABLED,
         )
         if llm is not None:
             self.llm = llm
@@ -82,7 +87,34 @@ class FinalCompareWorkflowExecutor:
         async def parse_documents(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.PARSING, 35, "正在解析 DOCX、文本型 PDF 或扫描 PDF")
             parsed = await self.parsers.parse_final_compare(state["local_files"])
-            return {"parsed_documents": parsed}
+            sidecars = getattr(self.parsers, "page_location_sidecars", {})
+            if self.settings.DOCX_PAGE_LOCATION_ENABLED:
+                missing = [
+                    file.file_id
+                    for file in state["local_files"]
+                    if file.detected_mime_type == DOCX_MIME and file.file_id not in sidecars
+                ]
+                if missing:
+                    raise WorkflowError(
+                        "DOCX_PAGE_LOCATION_INCOMPLETE",
+                        "DOCX 真实页码解析或映射未能可靠完成",
+                        details={
+                            "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
+                            "failure_code": "SIDECAR_MISSING",
+                            "page_count": None,
+                            "external_detail_page_count": 0,
+                            "external_detail_count": 0,
+                            "local_structure_count": 0,
+                            "external_structure_count": 0,
+                            "candidate_mapping_count": 0,
+                            "unmapped_location_count": len(missing),
+                            "missing_file_count": len(missing),
+                        },
+                    )
+            return {
+                "parsed_documents": parsed,
+                "page_location_sidecars": sidecars,
+            }
 
         async def compare_versions(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.VERSION_COMPARE, 68, "正在对齐条款、文字和基础表格")
@@ -160,7 +192,11 @@ class FinalCompareWorkflowExecutor:
 
         async def persist_result(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.PERSISTING_RESULT, 97, "正在保存确定性比对结果")
-            return {}
+            result = state["result"]
+            apply_docx_page_location_sidecars(
+                result, state.get("page_location_sidecars", {})
+            )
+            return {"result": result}
 
         graph.add_node("download_files", download_files)
         graph.add_node("parse_documents", parse_documents)
@@ -213,6 +249,15 @@ class FinalCompareWorkflowExecutor:
             for document in documents
         ]
         diffs = [item.model_dump(mode="json") for item in comparison.diff_items]
+        stamp_images = [
+            {
+                "file_name": document.file_name,
+                "page": stamp.page,
+                "data_uri": stamp.data_uri,
+            }
+            for document in documents
+            for stamp in document.stamp_images
+        ]
         risk_items = build_risk_items(
             comparison.diff_items, module_code="VERSION_CHANGE"
         )
@@ -251,6 +296,7 @@ class FinalCompareWorkflowExecutor:
                 "statistics": statistics,
             },
             "files": files,
+            "stamp_images": stamp_images,
             "risk_items": risk_items,
             "review_items": [],
             "passed_checks": passed_checks,
@@ -295,13 +341,17 @@ class FinalCompareWorkflowExecutor:
             )
             documents = state["parsed_documents"]
             local_by_id = {file.file_id: file for file in state["local_files"]}
+            page_counts = {
+                file_id: sidecar.page_count
+                for file_id, sidecar in state.get("page_location_sidecars", {}).items()
+            }
             metadata = [
                 {
                     "file_id": document.file_id,
                     "detected_mime_type": local_by_id[document.file_id].detected_mime_type,
                     "file_size": local_by_id[document.file_id].file_size,
                     "sha256": document.sha256,
-                    "page_count": document.page_count,
+                    "page_count": page_counts.get(document.file_id, document.page_count),
                     "parser_name": document.parser_name,
                     "parse_status": (
                         "WARNING"

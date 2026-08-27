@@ -102,3 +102,16 @@ def test_ocr_readiness_requires_all_runtime_values() -> None:
         OCR_AUTH_HEADER="x-api-key",
     )
     assert configured.ocr_configured is True
+
+
+def test_docx_page_location_uses_external_parser_configuration() -> None:
+    disabled = Settings(_env_file=None, DOCX_PAGE_LOCATION_ENABLED=False)
+    assert disabled.document_parser_configured is False
+    enabled = Settings(
+        _env_file=None,
+        DOCX_PAGE_LOCATION_ENABLED=True,
+        OCR_BASE_URL="https://ocr.invalid",
+        OCR_API_KEY="secret",
+        OCR_AUTH_HEADER="x-api-key",
+    )
+    assert enabled.document_parser_configured is True

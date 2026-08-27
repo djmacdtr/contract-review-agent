@@ -149,9 +149,11 @@ docker volume inspect contract-review-postgres-data
 - `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
 - 正式新任务结果固定使用 `schema_version=2.1`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；实际启用、可靠完成且未发现对应风险的动态检查进入 `passed_checks`。正式成功结果固定 `review_items=[]`、`review_count=0`，结论只为 `RISK_FOUND` 或 `PASS`；解析、OCR、对齐或已启用动态能力未完成时任务直接失败。显式同模诊断是开发环境例外，只能输出 `REVIEW_REQUIRED/RISK_FOUND` 和待复核项。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
+- `DOCX_PAGE_LOCATION_ENABLED` 默认关闭；开启后 DOCX 仍由 `python-docx` 负责正文、表格和内部位置，同时调用已配置的外部文档解析器补全真实渲染页码。外部解析或顺序映射覆盖不足时任务以 `DOCX_PAGE_LOCATION_INCOMPLETE` 安全失败，不使用段落比例、文档属性总页数或固定数量估算页码。
 - `OCR_MAX_RESPONSE_MB` 限制供应商响应大小；`OCR_HTTP_RETRY_ATTEMPTS` 和 `OCR_RETRY_BACKOFF_SECONDS` 只作用于连接错误、超时及 502/503/504；`OCR_LOW_CONFIDENCE_THRESHOLD` 默认 `0.8`。
 - `PAGE_MISSING_MIN_EQUIVALENT=0.8`、`PAGE_MISSING_MIN_ANCHOR_SIMILARITY=0.85` 和 `PAGE_MISSING_MIN_STRUCTURE_UNITS=2` 控制连续缺失内容的页级识别；缺失规模不会单独触发任务失败。
 - `LLM_REVIEW_BATCH_MAX_CHARS=12000` 与 `LLM_REVIEW_CONTEXT_BLOCKS=1` 将事实评审限制为候选证据块及邻近上下文，并按 payload 大小分批；不会把整份长合同一次性发送给评审模型。
+- 宿主机 Worker 的正式 LLM 配置应明确设置 `LLM_RESPONSE_FORMAT=json_schema` 和 `LLM_NATIVE_STRUCTURED_OUTPUT=true`；启动日志只记录生效模式、开关和模型名，不记录 API Key。临时本地验收完成后，恢复正式文件域名的 `DOWNLOAD_HOST_ALLOWLIST`，不得使用 `fixture-server` 或通配符交付。
 - DRAFT_REVIEW 事实抽取使用紧凑两阶段链路：第一阶段只返回开放式 profile/facts，证据正文由程序按位置回查；数值候选由程序高召回定位并交给模型分类。事实完成证据评审和跨文档映射后，内部 `plan_semantics` 才生成动态语义概念及声明式数值规则；该步骤不改变公开 API，也不接入 FINAL_COMPARE。
 - 紧凑抽取和语义规划均限制数组、字段长度及数值 AST 深度/节点数；超过安全边界时分批处理或失败，不静默截断。抽取阶段不生成 `missing_field_keys`、`semantic_concepts` 或 `validation_specs`，完整结果字段由程序兼容性回填。
 - 事实评审的 JSON Schema 至少要求一个决策，并按当前批次候选数动态设置 `minItems=maxItems=N`；Adapter 继续校验候选身份恰好覆盖一次，失败时最多执行一次只包含遗漏身份的结构纠错。

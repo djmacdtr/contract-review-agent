@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     OCR_HTTP_RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=5)
     OCR_RETRY_BACKOFF_SECONDS: float = Field(default=0.5, ge=0, le=30)
     OCR_LOW_CONFIDENCE_THRESHOLD: float = Field(default=0.8, ge=0, le=1)
+    OCR_STAMP_MAX_COUNT: int = Field(default=64, ge=1, le=256)
+    OCR_STAMP_MAX_IMAGE_BYTES: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    OCR_STAMP_MAX_TOTAL_BYTES: int = Field(default=8_388_608, ge=1024, le=52_428_800)
+
+    DOCX_PAGE_LOCATION_ENABLED: bool = False
 
     PAGE_MISSING_MIN_EQUIVALENT: float = Field(default=0.8, gt=0)
     PAGE_MISSING_MIN_ANCHOR_SIMILARITY: float = Field(default=0.85, ge=0, le=1)
@@ -61,6 +66,9 @@ class Settings(BaseSettings):
     LLM_CHUNK_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
     LLM_EXTRACTION_PAYLOAD_MAX_CHARS: int = Field(default=12000, ge=4000, le=200000)
     LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES: int = Field(default=24, ge=1, le=128)
+    # Keep numeric requests small enough that a dense table cannot consume the
+    # entire structured-output budget before every candidate is classified.
+    LLM_EXTRACTION_MAX_NUMERIC_UNITS: int = Field(default=6, ge=1, le=6)
     LLM_EXTRACTION_MAX_FACTS: int = Field(default=24, ge=1, le=64)
     # Compatibility planner setting; the v2 paired protocol uses the explicit
     # simplified limit below.
@@ -76,7 +84,7 @@ class Settings(BaseSettings):
     LLM_EXTRACTION_MAX_TEXT_CANDIDATES: int = Field(default=8, ge=1, le=12)
     LLM_EXTRACTION_WAVE_SIZE: int = Field(default=6, ge=1, le=8)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET: int = Field(default=40, ge=1, le=128)
-    LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=50, ge=1, le=256)
+    LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=256, ge=1, le=256)
     LLM_EXTRACTION_TASK_CONCURRENCY: int = Field(default=2, ge=1, le=8)
     LLM_EXTRACTION_MAX_SPLIT_DEPTH: int = Field(default=8, ge=0, le=12)
     LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT: int = Field(
@@ -110,6 +118,12 @@ class Settings(BaseSettings):
         return self.OCR_ENABLED and all(
             value.strip() for value in (self.OCR_BASE_URL, self.OCR_API_KEY, self.OCR_AUTH_HEADER)
         )
+
+    @property
+    def document_parser_configured(self) -> bool:
+        return all(
+            value.strip() for value in (self.OCR_BASE_URL, self.OCR_API_KEY, self.OCR_AUTH_HEADER)
+        ) and (self.OCR_ENABLED or self.DOCX_PAGE_LOCATION_ENABLED)
 
     @property
     def llm_configured(self) -> bool:
