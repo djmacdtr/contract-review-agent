@@ -1,8 +1,10 @@
+import asyncio
 from typing import Literal, Protocol
 
 from app.adapters.document_parser.base import ExternalDocumentParser
 from app.core.errors import WorkflowError
 from app.documents.models import ParsedDocument
+from app.documents.page_location_cache import PageLocationSidecarCache
 from app.documents.page_locations import (
     DocxPageLocationSidecar,
     bind_docx_page_locations,
@@ -22,10 +24,12 @@ class DocumentParsingRouter:
         *,
         local: LocalDocumentParser,
         external: ExternalDocumentParser | None,
+        page_location_cache: PageLocationSidecarCache | None = None,
         docx_page_location_enabled: bool = False,
     ) -> None:
         self.local = local
         self.external = external
+        self.page_location_cache = page_location_cache
         self.docx_page_location_enabled = docx_page_location_enabled
         self.page_location_sidecars: dict[str, DocxPageLocationSidecar] = {}
 
@@ -69,14 +73,43 @@ class DocumentParsingRouter:
         return details
 
     async def _parse_docx(self, file: LocalFile) -> ParsedDocument:
+        # A worker may reuse this router across tasks. Never trust a sidecar
+        # left in the in-memory map from an earlier parse; reload the
+        # content-addressed cache for every file parse.
+        self.page_location_sidecars.pop(file.file_id, None)
         local_document = await self.local.parse(file)
         if not self.docx_page_location_enabled:
             return local_document
+        if self.page_location_cache is not None:
+            try:
+                cached_sidecar = await self.page_location_cache.load(
+                    file_sha256=file.sha256, file_id=file.file_id
+                )
+            except Exception:
+                cached_sidecar = None
+            if cached_sidecar is not None:
+                await asyncio.to_thread(
+                    bind_docx_page_locations, local_document, cached_sidecar
+                )
+                self.page_location_sidecars[file.file_id] = cached_sidecar
+                return local_document
         try:
             external_document = await self._parse_external(file, mode="auto")
-            sidecar = build_docx_page_location_sidecar(local_document, external_document)
-            bind_docx_page_locations(local_document, sidecar)
+            sidecar = await asyncio.to_thread(
+                build_docx_page_location_sidecar,
+                local_document,
+                external_document,
+            )
+            await asyncio.to_thread(bind_docx_page_locations, local_document, sidecar)
             self.page_location_sidecars[file.file_id] = sidecar
+            if self.page_location_cache is not None:
+                try:
+                    await self.page_location_cache.save(
+                        file_sha256=file.sha256, sidecar=sidecar
+                    )
+                except Exception:
+                    # A cache write cannot invalidate a valid external parse.
+                    pass
         except WorkflowError as exc:
             if exc.code == "DOCX_PAGE_LOCATION_INCOMPLETE":
                 raise
@@ -109,15 +142,22 @@ class DocumentParsingRouter:
 
     async def parse_draft_review(self, files: list[LocalFile]) -> list[ParsedDocument]:
         self.page_location_sidecars = {}
-        parsed: list[ParsedDocument] = []
-        for file in files:
-            if file.detected_mime_type == DOCX_MIME:
-                parsed.append(await self._parse_docx(file))
-            elif file.detected_mime_type == PDF_MIME:
-                parsed.append(await self._parse_external(file, mode="auto"))
-            else:
-                raise WorkflowError("UNSUPPORTED_FILE_TYPE", "起草检查仅支持 DOCX 或 PDF")
-        return parsed
+        semaphore = asyncio.Semaphore(2)
+
+        async def parse_one(file: LocalFile) -> ParsedDocument:
+            async with semaphore:
+                return await self.parse_draft_review_file(file)
+
+        return list(await asyncio.gather(*(parse_one(file) for file in files)))
+
+    async def parse_draft_review_file(self, file: LocalFile) -> ParsedDocument:
+        """Parse one draft file without resetting already collected page sidecars."""
+
+        if file.detected_mime_type == DOCX_MIME:
+            return await self._parse_docx(file)
+        if file.detected_mime_type == PDF_MIME:
+            return await self._parse_external(file, mode="auto")
+        raise WorkflowError("UNSUPPORTED_FILE_TYPE", "起草检查仅支持 DOCX 或 PDF")
 
     async def parse_final_compare(self, files: list[LocalFile]) -> list[ParsedDocument]:
         self.page_location_sidecars = {}

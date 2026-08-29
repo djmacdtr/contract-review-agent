@@ -758,10 +758,35 @@ def build_numeric_candidate_payload(
         "numeric_candidates": candidates,
         "requirements": {
             "max_items": 24,
+            "required_decision_count": len(candidates),
             "each_candidate_exactly_once": True,
             "identity_and_evidence_are_program_owned": True,
         },
     }
+
+
+def numeric_candidate_indexes(payload: dict[str, Any]) -> list[int]:
+    """Return the exact candidate indexes expected for one numeric request.
+
+    Normal planner payloads are numbered from one, while a truncation recovery
+    child may carry a non-contiguous subset of its parent's indexes.  Keeping
+    this detail in the payload lets the wire schema and the application-level
+    completeness check agree without changing the identity of ordinary
+    batches.
+    """
+
+    candidates = payload.get("numeric_candidates", [])
+    if not isinstance(candidates, list):
+        return []
+    explicit = payload.get("_candidate_indexes")
+    if (
+        isinstance(explicit, list)
+        and len(explicit) == len(candidates)
+        and all(type(index) is int and index >= 1 for index in explicit)
+        and len(set(explicit)) == len(explicit)
+    ):
+        return list(explicit)
+    return list(range(1, len(candidates) + 1))
 
 
 def build_text_fact_payload(
@@ -1201,7 +1226,7 @@ def expand_numeric_candidate_response(
 ) -> tuple[list[FactCandidate], set[int]]:
     response = NumericCandidateExtraction.model_validate(value)
     candidates = payload.get("numeric_candidates", [])
-    expected = set(range(1, len(candidates) + 1))
+    expected = set(numeric_candidate_indexes(payload))
     actual = [item.candidate_index for item in response.items]
     if len(actual) != len(set(actual)) or set(actual) != expected:
         raise EvidenceValidationError(
@@ -1260,7 +1285,7 @@ def expand_text_fact_response(
     except (AttributeError, TypeError, ValueError):
         max_items = 12
     max_items = max(1, min(max_items, 12))
-    if len(response.items) >= max_items:
+    if response.has_more:
         raise EvidenceValidationError(
             "text fact batch reached its saturation limit",
             code="FACT_BATCH_SATURATED",
@@ -1342,7 +1367,7 @@ def filter_text_fact_evidence(
     except (AttributeError, TypeError, ValueError):
         max_items = 12
     max_items = max(1, min(max_items, 12))
-    if len(response.items) >= max_items:
+    if response.has_more:
         raise EvidenceValidationError(
             "text fact batch reached its saturation limit",
             code="FACT_BATCH_SATURATED",
@@ -1816,13 +1841,14 @@ def plan_numeric_document_batches(
     max_numeric_candidates: int = 24,
     max_numeric_units: int = 6,
     estimated_output_token_limit: int = 2000,
+    include_empty: bool = False,
 ) -> list[dict[str, Any]]:
     units = _numeric_planning_units(
         document,
         max_unit_chars=max(1000, max_payload_chars - 1800),
         max_numeric_candidates=max_numeric_candidates,
     )
-    return _plan_independent_batches(
+    all_plans = _plan_independent_batches(
         document,
         chain="numeric",
         extraction_version=NUMERIC_EXTRACTION_VERSION,
@@ -1833,6 +1859,21 @@ def plan_numeric_document_batches(
         estimated_output_token_limit=estimated_output_token_limit,
         units_override=units,
     )
+    # A structure with no numeric candidate is not a model task.  Keep the
+    # pre-filter count only as an internal compatibility value: it is already
+    # part of historical payload digests, while the returned plan list is the
+    # actual work/coverage set used by the current planner.
+    checkpoint_planned_batch_count = len(all_plans)
+    if include_empty:
+        for plan in all_plans:
+            plan["checkpoint_planned_batch_count"] = checkpoint_planned_batch_count
+        return all_plans
+    plans = [
+        plan for plan in all_plans if int(plan.get("numeric_candidate_count", 0)) > 0
+    ]
+    for plan in plans:
+        plan["checkpoint_planned_batch_count"] = checkpoint_planned_batch_count
+    return plans
 
 
 def plan_text_document_batches(

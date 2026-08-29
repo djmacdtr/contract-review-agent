@@ -13,6 +13,7 @@ class LlmResult:
     structure_retries: int = 0
     finish_reason: str | None = None
     response_format: str = "prompt_only"
+    response_metadata: dict[str, Any] | None = None
 
 
 class ContractLlmClient(Protocol):
@@ -25,7 +26,10 @@ class ContractLlmClient(Protocol):
     async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_facts(self, payload: dict[str, Any]) -> LlmResult: ...
     async def map_facts(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def map_fact_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def cross_validate_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def generate_delivery_advice(self, payload: dict[str, Any]) -> LlmResult: ...
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult: ...
 
     async def probe_models(self) -> list[str]: ...
@@ -34,7 +38,7 @@ class ContractLlmClient(Protocol):
 class MockContractLlmClient:
     """No-network adapter used for milestones 0-1, regardless of gateway settings."""
 
-    def __init__(self, model: str = "GLM-5.2") -> None:
+    def __init__(self, model: str = "GLM-5.3-Flash") -> None:
         self.model = model
 
     async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult:
@@ -91,7 +95,7 @@ class MockContractLlmClient:
 
     async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult:
         return LlmResult(
-            value={"items": []},
+            value={"items": [], "has_more": False},
             configured_model=self.model,
             actual_model=None,
             mock=True,
@@ -160,6 +164,34 @@ class MockContractLlmClient:
             actual_model=None,
             mock=True,
         )
+
+    async def cross_validate_candidates(self, payload: dict[str, Any]) -> LlmResult:
+        items = [
+            {
+                "candidate_id": group["candidate_id"],
+                "decision": (
+                    "MATCH"
+                    if any(
+                        reference["normalized_value"] == group["target"]["normalized_value"]
+                        for references in group.get("references", {}).values()
+                        for reference in references
+                    )
+                    else "CONFLICT"
+                ),
+                "reason": "模拟候选值判断",
+            }
+            for group in payload.get("candidates", [])
+            if isinstance(group, dict) and group.get("candidate_id")
+        ]
+        return LlmResult(
+            value={"items": items},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
+
+    async def generate_delivery_advice(self, payload: dict[str, Any]) -> LlmResult:
+        return await self.generate_advice(payload)
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
         risk_advices = [

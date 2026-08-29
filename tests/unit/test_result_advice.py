@@ -5,6 +5,7 @@ from app.results.advice import (
     advice_payload,
     ensure_fallback_risk_advices,
     merge_model_advice,
+    validate_advice_item,
 )
 
 
@@ -109,6 +110,104 @@ def test_model_advice_merges_only_current_unique_risk_ids() -> None:
     )
 
     assert "24个月变为36个月" in result["risk_items"][0]["analysis_advice"]
+
+
+def test_multi_sentence_advice_is_deterministically_normalized() -> None:
+    result = result_fixture()
+    response = advice_response(
+        {
+            "risk_id": "risk_000001",
+            "analysis_advice": "请核对租赁期限。\n确认审批依据。",
+        }
+    )
+
+    outcome = validate_advice_item(
+        result,
+        response.risk_advices[0],
+        seen_risk_ids=set(),
+        seen_advice_texts=set(),
+    )
+
+    assert outcome.accepted is True
+    assert outcome.reason_code == "MULTI_SENTENCE"
+    assert outcome.normalized_multi_sentence is True
+    assert outcome.normalized_advice == "请核对租赁期限；确认审批依据。"
+
+
+def test_dynamic_specificity_is_shared_and_opt_in() -> None:
+    result = result_fixture()
+    generic = advice_response(
+        {
+            "risk_id": "risk_000001",
+            "analysis_advice": "请核对相关内容。",
+        }
+    )
+
+    outcome = validate_advice_item(
+        result,
+        generic.risk_advices[0],
+        seen_risk_ids=set(),
+        seen_advice_texts=set(),
+        require_dynamic_anchor=True,
+    )
+
+    assert outcome.accepted is False
+    assert outcome.reason_code == "NOT_SPECIFIC"
+
+    merge_model_advice(result, generic)
+    assert result["risk_items"][0]["analysis_advice"] == "请核对相关内容。"
+
+
+@pytest.mark.parametrize(
+    ("analysis_advice", "expected_code"),
+    [
+        ("请核对已有建议。", "DUPLICATED"),
+        ("请检查 fil_target 对应位置。", "INTERNAL_ID"),
+        ("请检查 confidence 对应的审批依据。", "TECHNICAL_TERM"),
+    ],
+)
+def test_advice_quality_categories_are_safe_and_item_scoped(
+    analysis_advice: str,
+    expected_code: str,
+) -> None:
+    result = result_fixture()
+    response = advice_response(
+        {
+            "risk_id": "risk_000001",
+            "analysis_advice": analysis_advice,
+        }
+    )
+    seen_texts = {"请核对已有建议。"} if expected_code == "DUPLICATED" else set()
+
+    outcome = validate_advice_item(
+        result,
+        response.risk_advices[0],
+        seen_risk_ids=set(),
+        seen_advice_texts=seen_texts,
+    )
+
+    assert outcome.accepted is False
+    assert outcome.reason_code == expected_code
+    assert outcome.normalized_advice
+
+
+def test_merge_model_advice_persists_normalized_text() -> None:
+    result = result_fixture()
+
+    merge_model_advice(
+        result,
+        advice_response(
+            {
+                "risk_id": "risk_000001",
+                "analysis_advice": "请核对租赁期限。\n确认审批依据。",
+            }
+        ),
+    )
+
+    assert result["risk_items"][0]["analysis_advice"] == "请核对租赁期限；确认审批依据。"
+    assert result["advice"]["risk_advices"][0]["analysis_advice"] == (
+        "请核对租赁期限；确认审批依据。"
+    )
 
 
 @pytest.mark.parametrize(

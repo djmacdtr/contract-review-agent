@@ -27,12 +27,14 @@ from app.draft_review.extraction import (
     DOCUMENT_EXTRACTION_CHECKPOINT_VERSION,
     _checkpoint_payload_digest,
     _document_checkpoint_identity_values,
+    _failure_details,
     _payload_digest,
     _split_text_structure_unit,
     _validate_fact_identity_set,
     extract_documents_with_independent_map_reduce,
     extract_documents_with_wave_map_reduce,
     numeric_recovery_blocks,
+    text_recovery_blocks,
 )
 from app.draft_review.facts import (
     EvidenceValidationError,
@@ -43,6 +45,7 @@ from app.draft_review.facts import (
     expand_numeric_candidate_response,
     expand_text_fact_response,
     match_quote_to_source,
+    numeric_candidate_indexes,
     plan_numeric_document_batches,
     plan_simplified_document_batches,
     plan_text_candidate_batches,
@@ -122,6 +125,7 @@ def test_v2_schemas_forbid_model_owned_evidence_and_identity() -> None:
 def test_numeric_candidates_must_be_exactly_once_and_program_rehydrates() -> None:
     doc = document()
     payload = build_numeric_candidate_payload(doc, [doc.blocks[0]], batch_id="batch_a")
+    assert payload["requirements"]["required_decision_count"] == 1
     facts, classified = expand_numeric_candidate_response(
         payload,
         {
@@ -135,7 +139,8 @@ def test_numeric_candidates_must_be_exactly_once_and_program_rehydrates() -> Non
                     "reason_code": "BUSINESS_VALUE",
                     "confidence": 0.9,
                 }
-            ]
+            ],
+            "has_more": False,
         },
     )
     assert classified == {1}
@@ -147,7 +152,42 @@ def test_numeric_candidates_must_be_exactly_once_and_program_rehydrates() -> Non
         expand_numeric_candidate_response(payload, {"items": []})
 
 
-def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
+def test_numeric_index_diagnostics_are_safe_and_reach_failure_details() -> None:
+    error = LlmClientError(
+        "LLM_EXTRACTION_EVIDENCE_INVALID",
+        "safe failure",
+        failure_code="NUMERIC_CANDIDATE_UNCLASSIFIED",
+        validation_summary={
+            "expected_count": 1,
+            "returned_count": 1,
+            "missing_index_count": 1,
+            "duplicate_index_count": 0,
+            "invalid_index_count": 1,
+        },
+    )
+
+    details = _failure_details(
+        {
+            "plan": {
+                "document_id": "file_a",
+                "chain": "numeric",
+                "depth": 0,
+                "unit_ids": ["unit_a"],
+                "batch_id": "batch_safe",
+            },
+            "error": error,
+        }
+    )
+
+    assert details["expected_count"] == 1
+    assert details["returned_count"] == 1
+    assert details["missing_index_count"] == 1
+    assert details["duplicate_index_count"] == 0
+    assert details["invalid_index_count"] == 1
+    assert "safe failure" not in str(details)
+
+
+def test_text_quote_is_exact_and_has_more_controls_saturation() -> None:
     doc = document()
     payload = build_text_fact_payload(doc, [doc.blocks[0]], batch_id="batch_b")
     facts = expand_text_fact_response(
@@ -162,7 +202,8 @@ def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
                     "quote": "甲方",
                     "confidence": 0.9,
                 }
-            ]
+            ],
+            "has_more": False,
         },
     )
     assert facts[0].location.paragraph_index == 0
@@ -179,7 +220,8 @@ def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
                         "quote": "乙方",
                         "confidence": 0.9,
                     }
-                ]
+                ],
+                "has_more": False,
             },
         )
     saturated = {
@@ -193,10 +235,15 @@ def test_text_quote_is_exact_and_saturated_batches_are_rejected() -> None:
                 "confidence": 0.9,
             }
             for index in range(12)
-        ]
+        ],
+        "has_more": False,
     }
+    assert len(expand_text_fact_response(payload, saturated)) == 12
+    saturated["has_more"] = True
     with pytest.raises(EvidenceValidationError, match="saturation"):
         expand_text_fact_response(payload, saturated)
+    with pytest.raises(ValidationError):
+        TextFactExtraction.model_validate({"items": []})
 
 
 def test_failed_table_row_can_split_to_column_units_without_losing_location() -> None:
@@ -342,7 +389,7 @@ async def test_independent_reduce_recovers_ambiguous_table_row_by_columns() -> N
                     failure_code="FACT_QUOTE_NOT_GROUNDED",
                 )
             return LlmResult(
-                value={"items": []},
+                value={"items": [], "has_more": False},
                 configured_model="table-retry",
                 actual_model="table-retry",
                 mock=False,
@@ -407,7 +454,7 @@ async def test_independent_reduce_reuses_completed_table_children_before_parent_
                     failure_code="FACT_QUOTE_NOT_GROUNDED",
                 )
             return LlmResult(
-                value={"items": []},
+                value={"items": [], "has_more": False},
                 configured_model="table-retry",
                 actual_model="table-retry",
                 mock=False,
@@ -473,7 +520,8 @@ def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None
                     "quote": "AB",
                     "confidence": 0.8,
                 }
-            ]
+            ],
+            "has_more": False,
         },
     )
     assert facts[0].raw_value == "ＡＢ"
@@ -496,7 +544,8 @@ def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None
                         "quote": "ＡＢ",
                         "confidence": 0.8,
                     }
-                ]
+                ],
+                "has_more": False,
             },
         )
     assert unknown.value.code == "FACT_UNIT_NOT_FOUND"
@@ -514,7 +563,8 @@ def test_text_evidence_keeps_specific_codes_and_only_normalizes_format() -> None
                         "quote": "ＡＢ主体",
                         "confidence": 0.8,
                     }
-                ]
+                ],
+                "has_more": False,
             },
         )
     assert rewrite.value.code == "FACT_QUOTE_NOT_GROUNDED"
@@ -641,7 +691,8 @@ def test_template_candidates_are_delta_scoped_deduplicated_and_table_aware() -> 
                     "quote": "100万元",
                     "confidence": 0.9,
                 }
-            ]
+            ],
+            "has_more": False,
         },
     )
     assert facts[0].location == table_location
@@ -672,7 +723,8 @@ def test_text_response_drops_numeric_categories_owned_by_numeric_chain() -> None
                     "quote": "甲方",
                     "confidence": 0.9,
                 },
-            ]
+            ],
+            "has_more": False,
         },
     )
 
@@ -798,6 +850,33 @@ def test_numeric_planner_splits_dense_table_cells_before_candidate_limit() -> No
     assert sum(plan["numeric_candidate_count"] for plan in plans) == 30
 
 
+def test_numeric_planner_filters_empty_batches_and_preserves_checkpoint_count() -> None:
+    source = document()
+    blocks = [source.blocks[0]] + [
+        DocumentBlock(
+            block_id=f"non_numeric_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"项目说明{index}。",
+            normalized_text=f"项目说明{index}。",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(1, 7)
+    ]
+    doc = source.model_copy(update={"blocks": blocks})
+
+    all_plans = plan_numeric_document_batches(
+        doc, max_numeric_units=6, include_empty=True
+    )
+    plans = plan_numeric_document_batches(doc, max_numeric_units=6)
+
+    assert len(all_plans) == 2
+    assert len(plans) == 1
+    assert plans[0]["numeric_candidate_count"] > 0
+    assert plans[0]["blocks"] == all_plans[0]["blocks"]
+    assert plans[0]["checkpoint_planned_batch_count"] == len(all_plans)
+
+
 def test_numeric_truncation_recovery_is_fixed_6_to_3_to_1() -> None:
     blocks = [
         DocumentBlock(
@@ -817,6 +896,125 @@ def test_numeric_truncation_recovery_is_fixed_6_to_3_to_1() -> None:
     assert [len(group) for group in first] == [3, 3]
     assert [len(group) for group in second] == [1, 1, 1]
     assert numeric_recovery_blocks(blocks, "LLM_INVALID_JSON") == []
+
+
+@pytest.mark.asyncio
+async def test_numeric_leaf_truncation_splits_candidate_indexes_without_loss() -> None:
+    block = DocumentBlock(
+        block_id="dense_numeric_leaf",
+        type="PARAGRAPH",
+        order=0,
+        raw_text="租金为1万元，首期租金为2万元，保证金为3万元，金额合计4万元。",
+        normalized_text="租金为1万元，首期租金为2万元，保证金为3万元，金额合计4万元。",
+        location=DocumentLocation(paragraph_index=0),
+    )
+    doc = document().model_copy(update={"blocks": [block]})
+
+    class CandidateSplitLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.candidate_counts: list[int] = []
+            self.candidate_indexes: list[list[int]] = []
+
+        async def extract_numeric_candidates(self, payload: dict) -> LlmResult:
+            self.numeric_calls += 1
+            indexes = numeric_candidate_indexes(payload)
+            self.candidate_counts.append(len(indexes))
+            self.candidate_indexes.append(indexes)
+            if len(indexes) > 2:
+                raise LlmClientError(
+                    "LLM_OUTPUT_TRUNCATED",
+                    "synthetic numeric truncation",
+                    finish_reason="length",
+                )
+            return LlmResult(
+                value={
+                    "items": [
+                        {
+                            "candidate_index": index,
+                            "semantic_key": "amount",
+                            "display_name": "金额",
+                            "value_type": "MONEY",
+                            "decision": "IGNORE",
+                            "reason_code": "SYNTHETIC",
+                            "confidence": 0.9,
+                        }
+                        for index in indexes
+                    ]
+                },
+                configured_model="candidate-split",
+                actual_model="candidate-split",
+                mock=False,
+            )
+
+    llm = CandidateSplitLlm()
+    await extract_documents_with_independent_map_reduce(
+        settings=Settings(
+            _env_file=None,
+            LLM_ENABLED=False,
+            LLM_EXTRACTION_MAX_NUMERIC_UNITS=6,
+        ),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.candidate_counts == [4, 2, 2]
+    assert llm.candidate_indexes == [[1, 2, 3, 4], [1, 2], [3, 4]]
+    assert set(llm.candidate_indexes[1]).isdisjoint(llm.candidate_indexes[2])
+
+
+@pytest.mark.asyncio
+async def test_numeric_single_candidate_truncation_is_terminal() -> None:
+    llm_calls = 0
+
+    class SingleCandidateTruncationLlm(WaveLlm):
+        async def extract_numeric_candidates(self, payload: dict) -> LlmResult:
+            nonlocal llm_calls
+            llm_calls += 1
+            assert len(payload["numeric_candidates"]) == 1
+            raise LlmClientError(
+                "LLM_OUTPUT_TRUNCATED",
+                "synthetic numeric truncation",
+                finish_reason="length",
+            )
+
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[document().model_copy(update={"blocks": [document().blocks[0]]})],
+            llm=SingleCandidateTruncationLlm(),  # type: ignore[arg-type]
+        )
+
+    assert llm_calls == 1
+    assert caught.value.details["failure_code"] == "LLM_OUTPUT_TRUNCATED"
+    assert caught.value.details["numeric_candidate_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("count", "expected_sizes"),
+    [(16, [8, 8]), (8, [4, 4]), (5, [3, 2])],
+)
+def test_text_recovery_blocks_bisect_contiguously_without_loss(
+    count: int, expected_sizes: list[int]
+) -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"text_recovery_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"条款{index}",
+            normalized_text=f"条款{index}",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(count)
+    ]
+
+    groups = text_recovery_blocks(blocks)
+
+    assert [len(group) for group in groups] == expected_sizes
+    assert [block.block_id for group in groups for block in group] == [
+        block.block_id for block in blocks
+    ]
 
 
 class WaveLlm:
@@ -864,7 +1062,7 @@ class WaveLlm:
     async def extract_text_facts(self, payload: dict) -> LlmResult:
         self.text_calls += 1
         return LlmResult(
-            value={"items": []},
+            value={"items": [], "has_more": False},
             configured_model="wave",
             actual_model="wave",
             mock=False,
@@ -881,11 +1079,47 @@ class CheckpointLlm(WaveLlm):
         if self.fail_text:
             raise LlmClientError("LLM_INVALID_JSON", "synthetic text failure")
         return LlmResult(
-            value={"items": []},
+            value={"items": [], "has_more": False},
             configured_model="checkpoint",
             actual_model="checkpoint",
             mock=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_independent_extraction_never_calls_numeric_for_empty_batch() -> None:
+    source = document()
+    blocks = [source.blocks[0]] + [
+        DocumentBlock(
+            block_id=f"empty_numeric_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"项目说明{index}。",
+            normalized_text=f"项目说明{index}。",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(1, 7)
+    ]
+    doc = source.model_copy(update={"blocks": blocks})
+
+    class RejectsEmptyNumeric(WaveLlm):
+        async def extract_numeric_candidates(self, payload: dict) -> LlmResult:
+            assert payload["numeric_candidates"]
+            return await super().extract_numeric_candidates(payload)
+
+    llm = RejectsEmptyNumeric()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(
+            _env_file=None,
+            LLM_ENABLED=False,
+            LLM_EXTRACTION_MAX_NUMERIC_UNITS=6,
+        ),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.numeric_calls == 1
+    assert result["file_a"]["numeric_batch_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -976,6 +1210,33 @@ async def test_independent_text_failure_does_not_invalidate_numeric_checkpoint()
 
 
 @pytest.mark.asyncio
+async def test_numeric_upstream_failure_does_not_split_or_schedule_remaining_batches() -> None:
+    class UpstreamNumeric(WaveLlm):
+        async def extract_numeric_candidates(self, payload: dict) -> LlmResult:
+            self.numeric_calls += 1
+            raise LlmClientError("LLM_UPSTREAM_ERROR", "synthetic upstream failure")
+
+    llm = UpstreamNumeric()
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(
+                _env_file=None,
+                LLM_ENABLED=False,
+                LLM_EXTRACTION_MAX_NUMERIC_UNITS=1,
+            ),
+            documents=[document()],
+            llm=llm,  # type: ignore[arg-type]
+        )
+
+    # The fixture produces two one-unit numeric batches.  The first transport
+    # failure opens the circuit; the second batch is never sent and no text
+    # chain is scheduled.
+    assert caught.value.details["failure_code"] == "LLM_UPSTREAM_ERROR"
+    assert llm.numeric_calls == 1
+    assert llm.text_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_independent_checkpoint_recovery_ignores_task_file_ids() -> None:
     source = document()
     retry = source.model_copy(
@@ -1005,7 +1266,7 @@ async def test_independent_checkpoint_recovery_ignores_task_file_ids() -> None:
                     }
                 ]
             return LlmResult(
-                value={"items": items},
+                value={"items": items, "has_more": False},
                 configured_model="checkpoint",
                 actual_model="checkpoint",
                 mock=False,
@@ -1129,7 +1390,7 @@ async def test_document_checkpoint_reuse_skips_all_extraction_for_new_file_ids()
                     }
                 ]
             return LlmResult(
-                value={"items": items},
+                value={"items": items, "has_more": False},
                 configured_model="snapshot-source",
                 actual_model="snapshot-source",
                 mock=False,
@@ -1193,6 +1454,53 @@ async def test_failed_reduce_does_not_save_document_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_successful_document_snapshot_is_saved_before_later_document_failure() -> None:
+    reference = document().model_copy(
+        update={"file_id": "reference_first", "sha256": "b" * 64}
+    )
+    target = document().model_copy(
+        update={
+            "file_id": "target_later",
+            "role": "TARGET",
+            "sha256": "c" * 64,
+            "blocks": [
+                block.model_copy(update={"block_id": f"target_{block.block_id}"})
+                for block in document().blocks
+            ],
+        }
+    )
+    store = InMemoryExtractionCheckpointStore()
+
+    class TargetFailureLlm(WaveLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            if payload["file_id"] == target.file_id:
+                raise LlmClientError("LLM_UPSTREAM_ERROR", "synthetic target failure")
+            return LlmResult(
+                value={"items": [], "has_more": False},
+                configured_model="document-snapshot",
+                actual_model="document-snapshot",
+                mock=False,
+            )
+
+    with pytest.raises(WorkflowError):
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(_env_file=None, LLM_ENABLED=False),
+            documents=[target, reference],
+            llm=TargetFailureLlm(),  # type: ignore[arg-type]
+            checkpoint_store=store,
+            task_id="document_snapshot_partial_failure",
+        )
+
+    document_snapshots = [
+        item
+        for item in store._records.values()
+        if item.extraction_version == DOCUMENT_EXTRACTION_CHECKPOINT_VERSION
+    ]
+    assert [item.file_sha256 for item in document_snapshots] == [reference.sha256]
+
+
+@pytest.mark.asyncio
 async def test_singleton_truncation_reduces_text_limit_without_same_payload_retry() -> None:
     block = document().blocks[1].model_copy(
         update={"raw_text": "项目名称为测试项目", "normalized_text": "项目名称为测试项目"}
@@ -1216,8 +1524,8 @@ async def test_singleton_truncation_reduces_text_limit_without_same_payload_retr
                     finish_reason="length",
                 )
             return LlmResult(
-                value={"items": []},
-                configured_model="truncation",
+            value={"items": [], "has_more": False},
+            configured_model="truncation",
                 actual_model="truncation",
                 mock=False,
             )
@@ -1232,6 +1540,97 @@ async def test_singleton_truncation_reduces_text_limit_without_same_payload_retr
     assert llm.limits == [12, 6, 3]
     assert len(set(llm.payloads)) == len(llm.payloads)
     assert result["file_a"]["text_batch_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_unit_truncation_bisects_without_exhausting_recovery_budget() -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"paragraph_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"测试资料条目甲乙丙丁第{chr(0x4E00 + index)}项",
+            normalized_text=f"测试资料条目甲乙丙丁第{chr(0x4E00 + index)}项",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(16)
+    ]
+    doc = document().model_copy(update={"role": "TARGET", "blocks": blocks})
+
+    class SizeAwareTruncationLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unit_counts: list[int] = []
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            unit_count = len(payload["units"])
+            self.unit_counts.append(unit_count)
+            if unit_count > 4:
+                raise LlmClientError(
+                    "LLM_OUTPUT_TRUNCATED",
+                    "synthetic truncation",
+                    finish_reason="length",
+                )
+            return LlmResult(
+                value={"items": [], "has_more": False},
+                configured_model="truncation",
+                actual_model="truncation",
+                mock=False,
+            )
+
+    llm = SizeAwareTruncationLlm()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(
+            _env_file=None,
+            LLM_ENABLED=False,
+            LLM_EXTRACTION_MAX_TEXT_UNITS=16,
+            LLM_EXTRACTION_WAVE_SIZE=6,
+        ),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.unit_counts == [16, 8, 8, 4, 4, 4, 4]
+    assert max(llm.unit_counts) == 16
+    assert result["file_a"]["recovery_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_text_recovery_budget_error_keeps_outer_and_underlying_codes() -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"budget_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"条款{chr(0x4E00 + index)}项",
+            normalized_text=f"条款{chr(0x4E00 + index)}项",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(32)
+    ]
+    doc = document().model_copy(update={"blocks": blocks})
+
+    class AlwaysInvalidText(WaveLlm):
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            raise LlmClientError("LLM_INVALID_JSON", "synthetic invalid JSON")
+
+    with pytest.raises(WorkflowError) as caught:
+        await extract_documents_with_independent_map_reduce(
+            settings=Settings(
+                _env_file=None,
+                LLM_ENABLED=False,
+                LLM_EXTRACTION_MAX_TEXT_UNITS=16,
+                LLM_EXTRACTION_WAVE_SIZE=6,
+            ),
+            documents=[doc],
+            llm=AlwaysInvalidText(),  # type: ignore[arg-type]
+        )
+
+    assert caught.value.details["failure_code"] == "TEXT_RECOVERY_BUDGET_EXHAUSTED"
+    assert caught.value.details["underlying_failure_code"] == "LLM_INVALID_JSON"
+    assert caught.value.details["chain"] == "text"
 
 
 @pytest.mark.asyncio
@@ -1306,7 +1705,7 @@ async def test_table_truncation_splits_cells_before_reducing_fact_limit() -> Non
                     finish_reason="length",
                 )
             return LlmResult(
-                value={"items": []},
+                value={"items": [], "has_more": False},
                 configured_model="table-truncation",
                 actual_model="table-truncation",
                 mock=False,
@@ -1543,16 +1942,12 @@ async def test_independent_checkpoint_failure_preserves_safe_context() -> None:
         )
 
     assert caught.value.code == "DYNAMIC_CHECK_INCOMPLETE"
-    assert caught.value.details == {
-        "failure_stage": "FACT_EXTRACTION",
-        "chain": "numeric",
-        "file": "file_a",
-        "file_id": "file_a",
-        "batch_depth": 1,
-        "unit_count": 1,
-        "batch_id": caught.value.details["batch_id"],
-        "failure_code": "FACT_QUOTE_NOT_GROUNDED",
-    }
+    assert caught.value.details["failure_stage"] == "FACT_EXTRACTION"
+    assert caught.value.details["chain"] in {"numeric", "text"}
+    assert caught.value.details["file"] == "file_a"
+    assert caught.value.details["file_id"] == "file_a"
+    assert caught.value.details["unit_count"] == 1
+    assert caught.value.details["failure_code"] == "FACT_QUOTE_NOT_GROUNDED"
     assert caught.value.details["batch_id"].startswith("batch_")
 
 

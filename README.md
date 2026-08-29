@@ -137,7 +137,7 @@ docker volume inspect contract-review-postgres-data
 
 复制 `.env.example` 为 `.env`。示例只包含开发默认值，LLM/OCR Key 为空，`.env` 已被 Git 忽略。
 
-- `LLM_ENABLED=false`，模型配置默认 `GLM-5.2`；启用后 DRAFT_REVIEW 按文档分块抽取事实并校验证据，事实、评审或映射能力未可靠完成时任务失败；Advice 失败不会改变确定性结论。
+- `LLM_ENABLED=false`，模型配置默认 `GLM-5.3-Flash`；启用后 DRAFT_REVIEW 按文档分块抽取事实并校验证据，事实、评审或映射能力未可靠完成时任务失败；Advice 失败不会改变确定性结论。
 - v1 交付默认使用单模型模式：`LLM_FACT_REVIEW_ENABLED=false`、`LLM_MAPPING_REVIEW_ENABLED=false`、`LLM_SEMANTIC_PLAN_ENABLED=false`。此模式仍执行原文证据回查、事实身份校验和程序数值比较；只有显式开启评审开关时，`LLM_REQUIRE_INDEPENDENT_MODEL=true` 才启用独立模型门。
 - `MOCK_STAGE_DELAY_SECONDS` 控制控制台可见的模拟阶段延时，测试中设为 `0`。
 - `WORKER_STALE_AFTER_SECONDS` 和 `TASK_MAX_ATTEMPTS` 控制心跳恢复。
@@ -145,7 +145,7 @@ docker volume inspect contract-review-postgres-data
 - `MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`DOWNLOAD_MAX_REDIRECTS` 控制下载边界。
 - `MAX_REFERENCE_FILES` 控制 DRAFT_REVIEW 辅助资料数量，代码默认 20，允许在 1–100 范围内配置；超限会明确返回 `INVALID_REQUEST`，不会截断。
 - DRAFT_REVIEW 的 `reference_type` 已弃用并被忽略；新请求只传 URL、文件名和可选 MIME/展示名，系统分类将在后续 LLM 阶段作为输出提供。
-- DRAFT_REVIEW 逐份真实解析：DOCX 使用 `python-docx`，PDF 使用外部解析器 `auto`；目标合同与模板正文使用可靠对齐，允许填写项保留过滤轨迹，无法可靠处理的扩展表格会令任务失败。结果标记为 `RULE_BASED` 或 `HYBRID`、`mock=false`。
+- DRAFT_REVIEW 逐份真实解析：DOCX 使用 `python-docx`，PDF 使用外部解析器 `auto`；目标合同与模板正文使用可靠对齐，允许填写项保留过滤轨迹，无法可靠处理的目标/模板输入会令任务失败，单个辅助资料失败则跳过该资料并继续。结果标记为 `RULE_BASED` 或 `HYBRID`、`mock=false`。
 - `FINAL_COMPARE` 按文件对制定解析计划：DOCX/DOCX 均使用本地 `python-docx`；PDF/PDF 均使用外部解析器 `auto`；混合 DOCX/PDF 中 PDF 使用外部解析器 `scan`。`pdfplumber` 仅保留为诊断工具，不作为正式比对的静默降级路径。
 - 正式新任务结果固定使用 `schema_version=2.1`：确认的不合规、缺失、冲突或未经允许变化进入 `risk_items`；实际启用、可靠完成且未发现对应风险的动态检查进入 `passed_checks`。正式成功结果固定 `review_items=[]`、`review_count=0`，结论只为 `RISK_FOUND` 或 `PASS`；解析、OCR、对齐或已启用动态能力未完成时任务直接失败。显式同模诊断是开发环境例外，只能输出 `REVIEW_REQUIRED/RISK_FOUND` 和待复核项。
 - `OCR_ENABLED` 默认关闭；启用时还必须配置 `OCR_BASE_URL`、`OCR_API_KEY` 和 `OCR_AUTH_HEADER`。示例文件不会包含真实地址或密钥。
@@ -154,7 +154,8 @@ docker volume inspect contract-review-postgres-data
 - `PAGE_MISSING_MIN_EQUIVALENT=0.8`、`PAGE_MISSING_MIN_ANCHOR_SIMILARITY=0.85` 和 `PAGE_MISSING_MIN_STRUCTURE_UNITS=2` 控制连续缺失内容的页级识别；缺失规模不会单独触发任务失败。
 - `LLM_REVIEW_BATCH_MAX_CHARS=12000` 与 `LLM_REVIEW_CONTEXT_BLOCKS=1` 将事实评审限制为候选证据块及邻近上下文，并按 payload 大小分批；不会把整份长合同一次性发送给评审模型。
 - 宿主机 Worker 的正式 LLM 配置应明确设置 `LLM_RESPONSE_FORMAT=json_schema` 和 `LLM_NATIVE_STRUCTURED_OUTPUT=true`；启动日志只记录生效模式、开关和模型名，不记录 API Key。临时本地验收完成后，恢复正式文件域名的 `DOWNLOAD_HOST_ALLOWLIST`，不得使用 `fixture-server` 或通配符交付。
-- DRAFT_REVIEW 事实抽取使用紧凑两阶段链路：第一阶段只返回开放式 profile/facts，证据正文由程序按位置回查；数值候选由程序高召回定位并交给模型分类。事实完成证据评审和跨文档映射后，内部 `plan_semantics` 才生成动态语义概念及声明式数值规则；该步骤不改变公开 API，也不接入 FINAL_COMPARE。
+- DRAFT_REVIEW 使用目标合同中心的动态事实抽取、一次跨资料映射、程序化数值比较和动态通过项生成；事实抽取、证据校验和映射均保留原文位置，不能用模型返回的新证据替代程序拥有的证据。
+- Advice 仅作为结果补充，采用已有双侧差异和业务证据生成具体建议；模型建议不可用时使用确定性建议，不改变模板差异和事实结果。
 - 紧凑抽取和语义规划均限制数组、字段长度及数值 AST 深度/节点数；超过安全边界时分批处理或失败，不静默截断。抽取阶段不生成 `missing_field_keys`、`semantic_concepts` 或 `validation_specs`，完整结果字段由程序兼容性回填。
 - 事实评审的 JSON Schema 至少要求一个决策，并按当前批次候选数动态设置 `minItems=maxItems=N`；Adapter 继续校验候选身份恰好覆盖一次，失败时最多执行一次只包含遗漏身份的结构纠错。
 - `LLM_SAME_MODEL_DIAGNOSTIC=false` 仅供 development/test/evaluation 显式联调。同模型评审不会形成独立共识、模型风险或模型通过项；真正独立模型评审作为后续增强，禁止把同模型双调用描述为独立共识。

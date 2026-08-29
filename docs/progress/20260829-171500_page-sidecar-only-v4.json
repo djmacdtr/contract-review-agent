@@ -1,0 +1,7 @@
+{
+  "status": "FAILED",
+  "task_id": "tsk_01M167E69YV0MGNHENB9HW10DG",
+  "failure_stage": "PAGE_SIDECAR_LOAD",
+  "failure_code": "PAGE_SIDECAR_CACHE_INCOMPLETE",
+  "external_calls": 0
+}

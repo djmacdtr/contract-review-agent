@@ -57,6 +57,7 @@ def response_for(request: httpx.Request, *, invalid_text: bool = False) -> httpx
                         "confidence": 0.9,
                     }
                 ],
+                "has_more": False,
             },
             ensure_ascii=False,
         )

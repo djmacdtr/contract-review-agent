@@ -1,0 +1,48 @@
+{
+  "status": "PAGE_SIDECARS_OK",
+  "task_id": "tsk_01M167E69YV0MGNHENB9HW10DG",
+  "failure_stage": null,
+  "failure_code": null,
+  "external_calls": 0,
+  "elapsed_seconds": 179.25,
+  "page_sidecar_cache": {
+    "owner": "sys_page_location_cache_v1",
+    "version": "docx-page-location-v1",
+    "required_count": 3,
+    "sidecar_count": 3,
+    "documents": [
+      {
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DH",
+        "role": "TARGET",
+        "page_count": 46,
+        "mapped_location_count": 1668,
+        "required_location_count": 2958,
+        "candidate_mapping_count": 496,
+        "unmapped_location_count": 1290,
+        "status": "HIT"
+      },
+      {
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DJ",
+        "role": "TEMPLATE",
+        "page_count": 24,
+        "mapped_location_count": 319,
+        "required_location_count": 424,
+        "candidate_mapping_count": 483,
+        "unmapped_location_count": 105,
+        "status": "CACHED"
+      },
+      {
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DK",
+        "role": "REFERENCE",
+        "page_count": 2,
+        "mapped_location_count": 95,
+        "required_location_count": 95,
+        "candidate_mapping_count": 12,
+        "unmapped_location_count": 0,
+        "status": "CACHED"
+      }
+    ],
+    "max_concurrency": 2,
+    "per_file_timeout_seconds": 300
+  }
+}

@@ -167,10 +167,13 @@ class NumericCandidateItem(StrictLlmSchema):
     the program rehydrates the candidate from the input payload.
     """
 
-    candidate_index: int = Field(ge=1, le=24)
+    candidate_id: str | None = Field(default=None, pattern=r"^numeric_[0-9a-f]{16}$")
+    candidate_index: int | None = Field(default=None, ge=1, le=24)
     semantic_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     display_name: str = Field(min_length=1, max_length=80)
     value_type: ValueType
+    normalized_meaning: str | None = Field(default=None, max_length=256)
+    requires_cross_document_validation: bool = True
     decision: Literal["FACT", "IGNORE"]
     reason_code: str = Field(min_length=1, max_length=40)
     confidence: float = Field(ge=0, le=1)
@@ -189,7 +192,7 @@ class TextFactItem(StrictLlmSchema):
     semantic_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
     display_name: str = Field(min_length=1, max_length=80)
     value_type: ValueType
-    quote: str = Field(min_length=1, max_length=4000)
+    quote: str | None = Field(default=None, min_length=1, max_length=4000)
     confidence: float = Field(ge=0, le=1)
 
 
@@ -197,6 +200,7 @@ class TextFactExtraction(StrictLlmSchema):
     """Strict non-numeric fact chain response."""
 
     items: list[TextFactItem] = Field(..., max_length=12)
+    has_more: bool
 
 
 # Descriptive aliases used by the extraction controller and tests.  Keeping
@@ -285,6 +289,7 @@ class FactCandidate(StrictLlmSchema):
     evidence_text: str = Field(min_length=1, max_length=8000)
     location: DocumentLocation
     confidence: float = Field(ge=0, le=1)
+    requires_cross_document_validation: bool = True
 
 
 class DocumentFactExtraction(StrictLlmSchema):
@@ -364,6 +369,20 @@ class FactMappingResponse(StrictLlmSchema):
     missing_requirements: list[MissingRequirement] = Field(default_factory=list)
 
 
+class FactRelationDecision(StrictLlmSchema):
+    """ID-only relation over program-selected facts."""
+
+    target_fact_id: str = Field(pattern=r"^target_fact_\d{6}$")
+    reference_fact_id: str = Field(pattern=r"^fact_[0-9a-f]{24}$")
+    decision: Literal["MATCH", "CONFLICT", "UNRELATED", "UNCERTAIN"]
+    confidence: float = Field(ge=0, le=1)
+    reason_code: str = Field(min_length=1, max_length=80)
+
+
+class FactRelationBatchResponse(StrictLlmSchema):
+    items: list[FactRelationDecision] = Field(default_factory=list, max_length=64)
+
+
 class FactMappingReviewDecision(StrictLlmSchema):
     target_fact_id: str = Field(pattern=r"^target_fact_\d{6}$")
     reference_field_key: str = Field(pattern=r"^[a-z][a-z0-9_]{1,63}$")
@@ -389,6 +408,20 @@ class FactMappingReview(StrictLlmSchema):
     )
     confidence: float = Field(ge=0, le=1)
     evidence_complete: bool
+
+
+class CrossValidationDecision(StrictLlmSchema):
+    """One decision for one program-generated cross-document candidate group."""
+
+    candidate_id: str = Field(pattern=r"^cross_[0-9a-f]{20}$")
+    decision: Literal["MATCH", "CONFLICT", "UNRELATED", "UNCERTAIN"]
+    reason: str = Field(min_length=1, max_length=160)
+
+
+class CrossValidationResponse(StrictLlmSchema):
+    """Bounded best-effort response for the KISS delivery path."""
+
+    items: list[CrossValidationDecision] = Field(default_factory=list, max_length=20)
 
 
 class AdviceEvidence(StrictLlmSchema):

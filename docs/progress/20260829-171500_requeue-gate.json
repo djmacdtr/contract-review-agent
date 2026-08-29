@@ -1,0 +1,20 @@
+{
+  "status": "REQUEUED",
+  "task_id": "tsk_01M167E69YV0MGNHENB9HW10DG",
+  "source_task_id": "tsk_01M161GFY6Q7YSP07R877XQM2B",
+  "attempt_count": 2,
+  "max_attempts": 3,
+  "zero_call_gate": {
+    "source_snapshot_count": 3,
+    "formal_context_count": 3,
+    "evidence_rebound_count": 3,
+    "current_materialized_count": 3,
+    "page_sidecar_count": 3,
+    "old_file_reference_count": 0,
+    "ocr_calls": 0,
+    "fact_extraction_calls": 0,
+    "expected_external_calls_before_worker": 0
+  },
+  "failure_stage": null,
+  "failure_code": null
+}

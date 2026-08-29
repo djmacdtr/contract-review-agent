@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 import pdfplumber
@@ -29,6 +30,9 @@ class DocxParser:
     name = "python-docx"
 
     async def parse(self, file: LocalFile) -> ParsedDocument:
+        return await asyncio.to_thread(self._parse_sync, file)
+
+    def _parse_sync(self, file: LocalFile) -> ParsedDocument:
         try:
             document = Document(file.path)
             blocks: list[DocumentBlock] = []
@@ -145,6 +149,9 @@ class TextPdfParser:
         self.min_text_chars_per_page = min_text_chars_per_page
 
     async def parse(self, file: LocalFile) -> ParsedDocument:
+        return await asyncio.to_thread(self._parse_sync, file)
+
+    def _parse_sync(self, file: LocalFile) -> ParsedDocument:
         try:
             blocks: list[DocumentBlock] = []
             total_chars = 0

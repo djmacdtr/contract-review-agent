@@ -56,7 +56,7 @@ PRODUCTION_PROBE_CASES: dict[str, tuple[type[BaseModel], dict[str, Any], str]] =
         },
         '{"items":[{"unit_id":"unit_0123456789abcdef","semantic_key":"synthetic_party",'
         '"display_name":"合成主体","value_type":"ENTITY","quote":"甲方",'
-        '"confidence":0.9}]}',
+        '"confidence":0.9}],"has_more":false}',
     ),
 }
 

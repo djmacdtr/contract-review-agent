@@ -1,0 +1,55 @@
+{
+  "algorithm_version": "docx-page-location-alignment-v1",
+  "cache_owner": "sys_page_location_cache_v1",
+  "cache_version": "docx-page-location-v1",
+  "external_calls": 0,
+  "files": [
+    {
+      "candidate_mapping_count": 12,
+      "external_structure_count": 84,
+      "file_sha256": "3e1cd5ca6521f51b0a2b952d7e56ad1911af9ca765c47428297432d62bff9f16",
+      "local_structure_count": 95,
+      "mapped_location_count": 95,
+      "page_count": 2,
+      "required_location_count": 95,
+      "role": "REFERENCE",
+      "status": "CACHED",
+      "unmapped_location_count": 0
+    },
+    {
+      "candidate_mapping_count": 496,
+      "external_structure_count": 2562,
+      "file_sha256": "730e27c9305053bb047014efb75bb88db3b6ba45aba46f13337c84a25fd0b228",
+      "local_structure_count": 2958,
+      "mapped_location_count": 1668,
+      "page_count": 46,
+      "required_location_count": 2958,
+      "role": "TARGET",
+      "status": "CACHED",
+      "unmapped_location_count": 1290
+    },
+    {
+      "candidate_mapping_count": 519,
+      "external_structure_count": 426,
+      "file_sha256": "5b73208658f27993d5433ac4a738851aca973aee98dc73abbe81bfdfd5f3f4ef",
+      "local_structure_count": 424,
+      "mapped_location_count": 422,
+      "page_count": 24,
+      "required_location_count": 424,
+      "role": "TEMPLATE",
+      "status": "REBUILT_FLATTENED_TABLE_FROM_OCR_CACHE",
+      "unmapped_location_count": 2
+    }
+  ],
+  "llm_calls": 0,
+  "ocr_calls": 0,
+  "public_evidence_coverage": {
+    "covered_evidence_count": 1,
+    "missing_evidence_count": 0,
+    "required_evidence_count": 1,
+    "scope": "failed_task_public_trigger"
+  },
+  "sidecar_count": 3,
+  "source_task_id": "tsk_01M161GFY6Q7YSP07R877XQM2B",
+  "status": "PAGE_LOCATION_PREFLIGHT_OK"
+}

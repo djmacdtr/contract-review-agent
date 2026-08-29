@@ -34,6 +34,7 @@ from app.draft_review.facts import (
     filter_text_fact_evidence,
     merge_chunk_extractions,
     normalize_text,
+    numeric_candidate_indexes,
     plan_document_batches,
     plan_numeric_document_batches,
     plan_simplified_document_batches,
@@ -49,6 +50,36 @@ from app.draft_review.facts import (
 )
 
 DOCUMENT_EXTRACTION_CHECKPOINT_VERSION = "document-extraction-v1"
+
+# Keep the Canary gate aligned with the independent production map-reduce
+# recovery policy. A multi-unit text batch may be split for these bounded
+# protocol, evidence, and upstream failures; leaf validation remains strict.
+TEXT_RECOVERABLE_FAILURE_CODES = frozenset(
+    {
+        "FACT_BATCH_SATURATED",
+        "FACT_UNIT_NOT_FOUND",
+        "FACT_QUOTE_NOT_GROUNDED",
+        "FACT_IDENTITY_DUPLICATED",
+        "FACT_IDENTITY_CONFLICT",
+        "FACT_VALUE_NOT_GROUNDED",
+        "LLM_OUTPUT_TRUNCATED",
+        "LLM_INVALID_JSON",
+        "LLM_SCHEMA_INVALID",
+        "LLM_EXTRACTION_EVIDENCE_INVALID",
+    }
+)
+
+LLM_TRANSPORT_FAILURE_CODES = frozenset(
+    {
+        "LLM_UPSTREAM_ERROR",
+        "LLM_RATE_LIMITED",
+        "LLM_TIMEOUT",
+        "LLM_NETWORK_ERROR",
+    }
+)
+
+TEXT_MIN_RECOVERY_BUDGET = 3
+TEXT_MAX_RECOVERY_DEPTH = 2
 
 
 def numeric_recovery_blocks(
@@ -73,6 +104,21 @@ def numeric_recovery_blocks(
         if len(children) > 1:
             return [[child] for child in children]
     return []
+
+
+def text_recovery_blocks(blocks: list[DocumentBlock]) -> list[list[DocumentBlock]]:
+    """Return contiguous, balanced text recovery groups.
+
+    Text batches are split by structure-unit boundaries.  Keeping the two
+    halves contiguous and as even as possible preserves source order and full
+    coverage while avoiding the request explosion caused by one child per
+    unit.  A singleton has no further structural split at this level.
+    """
+
+    if len(blocks) <= 1:
+        return []
+    midpoint = (len(blocks) + 1) // 2
+    return [blocks[:midpoint], blocks[midpoint:]]
 
 
 class _MapState(TypedDict, total=False):
@@ -122,12 +168,17 @@ def _safe_failure_code(error: BaseException | None) -> str:
     return type(error).__name__ if error is not None else "DYNAMIC_CHECK_INCOMPLETE"
 
 
-def _failure_details(outcome: dict[str, Any]) -> dict[str, Any]:
+def _failure_details(
+    outcome: dict[str, Any],
+    *,
+    failure_code: str | None = None,
+    underlying_failure_code: str | None = None,
+) -> dict[str, Any]:
     """Build the only failure payload allowed to cross the workflow boundary."""
 
     plan = outcome.get("plan") or {}
     file_id = plan.get("document_id")
-    return {
+    details = {
         "failure_stage": "FACT_EXTRACTION",
         "chain": plan.get("chain", "unknown"),
         # ``file`` is retained for compatibility with existing structured logs;
@@ -137,9 +188,61 @@ def _failure_details(outcome: dict[str, Any]) -> dict[str, Any]:
         "batch_depth": int(plan.get("depth", 0)),
         "unit_count": len(plan.get("unit_ids", [])),
         "batch_id": plan.get("batch_id"),
-        "failure_code": outcome.get("failure_code")
+        "failure_code": failure_code
+        or outcome.get("failure_code")
         or _safe_failure_code(outcome.get("error")),
     }
+    if details["chain"] == "numeric":
+        candidate_count = plan.get("numeric_candidate_count")
+        if not isinstance(candidate_count, int):
+            candidates = plan.get("payload", {}).get("numeric_candidates", [])
+            candidate_count = len(candidates) if isinstance(candidates, list) else 0
+        details["numeric_candidate_count"] = candidate_count
+    if underlying_failure_code:
+        details["underlying_failure_code"] = underlying_failure_code
+    error = outcome.get("error")
+    for key in (
+        "finish_reason",
+        "content_chars",
+        "reasoning_content_chars",
+        "max_tokens",
+        "http_status",
+    ):
+        value = getattr(error, key, None)
+        if (
+            (key == "finish_reason" and isinstance(value, str))
+            or (
+                key != "finish_reason"
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            )
+        ):
+            details[key] = value
+    usage = getattr(error, "usage", None)
+    if isinstance(usage, dict):
+        safe_usage = {
+            key: int(value)
+            for key, value in usage.items()
+            if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            and type(value) is int
+            and value >= 0
+        }
+        if safe_usage:
+            details["usage"] = safe_usage
+    validation_summary = getattr(error, "validation_summary", None)
+    if isinstance(validation_summary, dict):
+        for key in (
+            "expected_count",
+            "returned_count",
+            "missing_index_count",
+            "duplicate_index_count",
+            "invalid_index_count",
+        ):
+            value = validation_summary.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                details[key] = value
+    return details
 
 
 def _payload_digest(payload: dict[str, Any]) -> str:
@@ -417,6 +520,85 @@ def _remap_profile_file_id(
     )
 
 
+def _page_neutral_document(document: ParsedDocument) -> ParsedDocument:
+    """Remove display pagination while preserving all logical evidence data."""
+
+    def neutral_location(location: Any) -> Any:
+        return location.model_copy(update={"page": None, "physical_pages": ()})
+
+    blocks: list[DocumentBlock] = []
+    for block in document.blocks:
+        table = block.table
+        if table is not None:
+            rows = [
+                row.model_copy(
+                    update={
+                        "cells": [
+                            cell.model_copy(update={"location": neutral_location(cell.location)})
+                            for cell in row.cells
+                        ]
+                    }
+                )
+                for row in table.rows
+            ]
+            table = table.model_copy(update={"rows": rows})
+        blocks.append(
+            block.model_copy(
+                update={
+                    "location": neutral_location(block.location),
+                    "table": table,
+                }
+            )
+        )
+    return document.model_copy(update={"blocks": blocks})
+
+
+def _page_neutral_extraction(extraction: DocumentFactExtraction) -> DocumentFactExtraction:
+    """Make checkpoint validation independent of physical pagination fields."""
+
+    def neutral_location(location: Any) -> Any:
+        return location.model_copy(update={"page": None, "physical_pages": ()})
+
+    return extraction.model_copy(
+        update={
+            "profile": extraction.profile.model_copy(
+                update={
+                    "evidence_locations": [
+                        neutral_location(location)
+                        for location in extraction.profile.evidence_locations
+                    ]
+                }
+            ),
+            "facts": [
+                fact.model_copy(update={"location": neutral_location(fact.location)})
+                for fact in extraction.facts
+            ],
+            "semantic_concepts": [
+                concept.model_copy(
+                    update={
+                        "evidence_locations": [
+                            neutral_location(location)
+                            for location in concept.evidence_locations
+                        ]
+                    }
+                )
+                for concept in extraction.semantic_concepts
+            ],
+            "validation_specs": [
+                spec.model_copy(
+                    update={
+                        "evidence_locations": [
+                            neutral_location(location)
+                            for location in spec.evidence_locations
+                        ]
+                    }
+                )
+                for spec in extraction.validation_specs
+            ],
+        }
+    )
+
+
 def _validated_document_checkpoint(
     document: ParsedDocument,
     value: dict[str, Any],
@@ -436,7 +618,10 @@ def _validated_document_checkpoint(
             return None
         extraction = _remap_profile_file_id(extraction, document.file_id)
         _validate_fact_identity_set(extraction.facts)
-        validate_extraction_evidence(document, extraction)
+        validate_extraction_evidence(
+            _page_neutral_document(document),
+            _page_neutral_extraction(extraction),
+        )
     except (EvidenceValidationError, TypeError, ValueError):
         return None
     return extraction
@@ -986,7 +1171,6 @@ async def extract_documents_with_map_reduce(
             }
     return reduced, profile_meta
 
-
 def _simplified_child_plan(
     document: ParsedDocument,
     parent: dict[str, Any],
@@ -1045,8 +1229,6 @@ def _simplified_can_split(error_code: str, plan: dict[str, Any], settings: Setti
             "FACT_BATCH_SATURATED",
             "FACT_QUOTE_NOT_GROUNDED",
             "FACT_UNIT_NOT_FOUND",
-            "LLM_TIMEOUT",
-            "LLM_UPSTREAM_ERROR",
         }
     )
 
@@ -1416,6 +1598,7 @@ async def extract_documents_with_independent_map_reduce(
     logical_calls = 0
     document_logical_calls: Counter[str] = Counter()
     wave_count = 0
+    transport_circuit_open = asyncio.Event()
 
     async def materialize_checkpoint(
         checkpoint: ExtractionCheckpoint,
@@ -1723,7 +1906,7 @@ async def extract_documents_with_independent_map_reduce(
                     text_candidates_by_document.get(document.file_id, []),
                     max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
                     max_candidates=min(
-                        getattr(settings, "LLM_EXTRACTION_MAX_TEXT_CANDIDATES", 8), 4
+                        getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 16), 16
                     ),
                     max_text_facts=default_text_fact_limit,
                     estimated_output_token_limit=min(
@@ -1731,11 +1914,9 @@ async def extract_documents_with_independent_map_reduce(
                     ),
                 )
             else:
-                # Auxiliary documents are open-ended and showed saturation and
-                # cross-unit quote failures at wider batches in the real runs.
                 effective_text_units = min(
                     getattr(settings, "LLM_EXTRACTION_MAX_TEXT_UNITS", 16),
-                    1 if document.role != "TARGET" else 16,
+                    16,
                 )
                 text_plans = plan_text_document_batches(
                     document,
@@ -1751,12 +1932,17 @@ async def extract_documents_with_independent_map_reduce(
             for chain, plans in (("numeric", numeric_plans), ("text", text_plans)):
                 per_document_chain_count[(document.file_id, chain)] = len(plans)
                 for plan in plans:
-                    plan["planned_batch_count"] = len(plans)
+                    planned_batch_count = (
+                        int(plan.get("checkpoint_planned_batch_count", len(plans)))
+                        if chain == "numeric"
+                        else len(plans)
+                    )
+                    plan["planned_batch_count"] = planned_batch_count
                     plan["payload"].update(
                         {
                             "batch_depth": 0,
                             "parent_batch_id": None,
-                            "planned_batch_count": len(plans),
+                            "planned_batch_count": planned_batch_count,
                             "extraction_version": plan["extraction_version"],
                         }
                     )
@@ -1897,6 +2083,7 @@ async def extract_documents_with_independent_map_reduce(
         blocks: list[DocumentBlock],
         *,
         text_fact_limit: int | None = None,
+        numeric_candidate_subset: list[int] | None = None,
     ) -> dict[str, Any]:
         chain = parent["chain"]
         version = NUMERIC_EXTRACTION_VERSION if chain == "numeric" else TEXT_EXTRACTION_VERSION
@@ -1912,10 +2099,45 @@ async def extract_documents_with_independent_map_reduce(
             return []
 
         if chain == "numeric":
-            payload = build_numeric_candidate_payload(document, blocks, batch_id=batch_id)
+            payload = build_numeric_candidate_payload(
+                document,
+                blocks,
+                batch_id=batch_id,
+            )
+            candidate_variant: str | None = None
+            if numeric_candidate_subset is not None:
+                parent_candidates = parent.get("payload", {}).get(
+                    "numeric_candidates", []
+                )
+                candidates_by_index = {
+                    int(candidate["candidate_index"]): candidate
+                    for candidate in parent_candidates
+                    if isinstance(candidate, dict)
+                    and type(candidate.get("candidate_index")) is int
+                }
+                selected_candidates = [
+                    candidates_by_index[index]
+                    for index in numeric_candidate_subset
+                    if index in candidates_by_index
+                ]
+                if len(selected_candidates) != len(numeric_candidate_subset):
+                    raise EvidenceValidationError(
+                        "numeric recovery candidate indexes are incomplete",
+                        code="NUMERIC_CANDIDATE_UNCLASSIFIED",
+                    )
+                payload["numeric_candidates"] = selected_candidates
+                payload["_candidate_indexes"] = list(numeric_candidate_subset)
+                payload["requirements"] = {
+                    **payload.get("requirements", {}),
+                    "required_decision_count": len(selected_candidates),
+                }
+                candidate_variant = "numeric_candidates_" + "_".join(
+                    str(index) for index in numeric_candidate_subset
+                )
             count = len(payload["numeric_candidates"])
             estimate = min(settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000)
         else:
+            candidate_variant = None
             text_fact_limit = text_fact_limit or int(
                 parent.get("text_fact_limit", default_text_fact_limit)
             )
@@ -1966,13 +2188,16 @@ async def extract_documents_with_independent_map_reduce(
         }
         if chain == "text":
             child["text_fact_limit"] = text_fact_limit
+        if numeric_candidate_subset is not None:
+            child["numeric_candidate_indexes"] = list(numeric_candidate_subset)
+            child["numeric_candidate_parent_batch_id"] = parent["batch_id"]
         child = _with_checkpoint_identity(
             child,
             document,
             variant=(
                 f"text_max_items_{text_fact_limit}"
                 if chain == "text"
-                else None
+                else candidate_variant
             ),
         )
         source_file_id = (source_file_ids_by_file_id or {}).get(document.file_id)
@@ -2072,6 +2297,26 @@ async def extract_documents_with_independent_map_reduce(
     async def invoke_plan(plan: dict[str, Any]) -> dict[str, Any]:
         nonlocal logical_calls
         payload = plan["payload"]
+        if (
+            plan["chain"] == "numeric"
+            and int(plan.get("numeric_candidate_count", 0)) == 0
+        ):
+            return {
+                "status": "SUCCEEDED",
+                "batch_id": plan["batch_id"],
+                "document_id": plan["document_id"],
+                "chain": plan["chain"],
+                "plan": plan,
+                "facts": [],
+                "checkpoint_reused": False,
+                "configured_model": None,
+                "actual_model": None,
+                "duration_ms": 0,
+                "request_attempts": 0,
+                "structure_retries": 0,
+                "discarded_fact_count": 0,
+                "discarded_fact_codes": {},
+            }
         digest = _checkpoint_payload_digest(payload)
         try:
             checkpoint_outcome = await load_checkpoint_outcome(plan)
@@ -2097,6 +2342,19 @@ async def extract_documents_with_independent_map_reduce(
             }
         if checkpoint_outcome is not None:
             return checkpoint_outcome
+        if transport_circuit_open.is_set():
+            return {
+                "status": "FAILED",
+                "batch_id": plan["batch_id"],
+                "document_id": plan["document_id"],
+                "chain": plan["chain"],
+                "plan": plan,
+                "error_code": "LLM_TRANSPORT_CIRCUIT_OPEN",
+                "failure_code": "LLM_TRANSPORT_CIRCUIT_OPEN",
+                "checkpoint_reused": False,
+                "request_attempts": 0,
+                "structure_retries": 0,
+            }
         if (
             logical_calls >= settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL
             or document_logical_calls[plan["document_id"]]
@@ -2113,9 +2371,22 @@ async def extract_documents_with_independent_map_reduce(
                 "checkpoint_reused": False,
             }
         try:
-            logical_calls += 1
-            document_logical_calls[plan["document_id"]] += 1
             async with semaphore:
+                if transport_circuit_open.is_set():
+                    return {
+                        "status": "FAILED",
+                        "batch_id": plan["batch_id"],
+                        "document_id": plan["document_id"],
+                        "chain": plan["chain"],
+                        "plan": plan,
+                        "error_code": "LLM_TRANSPORT_CIRCUIT_OPEN",
+                        "failure_code": "LLM_TRANSPORT_CIRCUIT_OPEN",
+                        "checkpoint_reused": False,
+                        "request_attempts": 0,
+                        "structure_retries": 0,
+                    }
+                logical_calls += 1
+                document_logical_calls[plan["document_id"]] += 1
                 if plan["chain"] == "numeric":
                     result = await llm.extract_numeric_candidates(payload)
                     facts, _classified = expand_numeric_candidate_response(payload, result.value)
@@ -2182,6 +2453,8 @@ async def extract_documents_with_independent_map_reduce(
         except BaseException as exc:
             # A transport retry is an HTTP metric, not another logical batch
             # invocation.  The counter was incremented once before dispatch.
+            if _safe_failure_code(exc) in LLM_TRANSPORT_FAILURE_CODES:
+                transport_circuit_open.set()
             return {
                 "status": "FAILED",
                 "batch_id": plan["batch_id"],
@@ -2219,12 +2492,25 @@ async def extract_documents_with_independent_map_reduce(
         nonlocal wave_count
         initial = initial_by_chain[chain]
         if not initial:
-            return {}, {"planned": 0, "recovery": 0, "first_wave_success_rate": 1.0}
+            return {}, {
+                "planned": 0,
+                "recovery": 0,
+                "recovery_counts": {},
+                "first_wave_success_rate": 1.0,
+            }
         recovery_budget = {
-            document_id: max(2, (count * 30 + 99) // 100)
+            document_id: max(
+                TEXT_MIN_RECOVERY_BUDGET if chain == "text" else 2,
+                (count * 30 + 99) // 100,
+            )
             for (document_id, plan_chain), count in per_document_chain_count.items()
             if plan_chain == chain
         }
+        max_recovery_depth = (
+            min(settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH, TEXT_MAX_RECOVERY_DEPTH)
+            if chain == "text"
+            else settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
+        )
         pending: list[dict[str, Any]] = []
         all_outcomes: dict[str, dict[str, Any]] = {}
         superseded: set[str] = set()
@@ -2246,14 +2532,37 @@ async def extract_documents_with_independent_map_reduce(
 
         def recovery_groups(
             plan: dict[str, Any], failure_code: str
-        ) -> list[tuple[list[DocumentBlock], int | None]]:
+        ) -> list[tuple[list[DocumentBlock], int | None, list[int] | None]]:
             blocks = plan["blocks"]
+            if failure_code in LLM_TRANSPORT_FAILURE_CODES:
+                return []
             if chain == "numeric":
+                # A singleton structure can still contain many numeric
+                # candidates (for example, one dense table cell).  Once the
+                # structure cannot be split further, partition the stable
+                # candidate indexes instead of resending the same oversized
+                # request or manufacturing one structure per candidate.
+                if failure_code == "LLM_OUTPUT_TRUNCATED" and len(blocks) == 1:
+                    candidate_indexes = numeric_candidate_indexes(plan["payload"])
+                    if len(candidate_indexes) > 1:
+                        midpoint = (len(candidate_indexes) + 1) // 2
+                        return [
+                            ([blocks[0]], None, candidate_indexes[:midpoint]),
+                            ([blocks[0]], None, candidate_indexes[midpoint:]),
+                        ]
+                    # A one-candidate leaf has no safe candidate partition.
+                    # Do not fall back to another structural split or resend
+                    # the same request indefinitely.
+                    return []
                 numeric_groups = numeric_recovery_blocks(blocks, failure_code)
                 if numeric_groups:
-                    return [(group, None) for group in numeric_groups]
+                    return [(group, None, None) for group in numeric_groups]
+            if chain == "text" and len(blocks) > 1:
+                return [
+                    (group, None, None) for group in text_recovery_blocks(blocks)
+                ]
             if len(blocks) > 1:
-                return [([block], None) for block in blocks]
+                return [([block], None, None) for block in blocks]
             if chain == "text" and failure_code in {
                 "FACT_BATCH_SATURATED",
                 "FACT_UNIT_NOT_FOUND",
@@ -2265,14 +2574,14 @@ async def extract_documents_with_independent_map_reduce(
             }:
                 cell_units = split_table_text_unit(blocks[0])
                 if len(cell_units) > 1:
-                    return [([unit], None) for unit in cell_units]
+                    return [([unit], None, None) for unit in cell_units]
             if chain == "text" and failure_code in {
                 "LLM_OUTPUT_TRUNCATED",
                 "FACT_BATCH_SATURATED",
             }:
                 text_blocks = _split_text_structure_unit(blocks[0])
                 if len(text_blocks) > 1:
-                    return [([unit], None) for unit in text_blocks]
+                    return [([unit], None, None) for unit in text_blocks]
                 current_limit = int(
                     plan.get(
                         "text_fact_limit",
@@ -2283,7 +2592,7 @@ async def extract_documents_with_independent_map_reduce(
                 )
                 next_limit = {12: 6, 6: 3}.get(current_limit)
                 if next_limit is not None:
-                    return [([blocks[0]], next_limit)]
+                    return [([blocks[0]], next_limit, None)]
             return []
 
         # A prior task may have failed a table-row parent after its column
@@ -2340,6 +2649,22 @@ async def extract_documents_with_independent_map_reduce(
             wave_outcomes = await run_wave(wave)
             if not first_wave:
                 first_wave = wave_outcomes
+            transport_failure = next(
+                (
+                    item
+                    for item in wave_outcomes
+                    if (item.get("failure_code") or item.get("error_code"))
+                    in LLM_TRANSPORT_FAILURE_CODES
+                ),
+                None,
+            )
+            if transport_failure is not None:
+                terminal_failure = transport_failure
+                raise WorkflowError(
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "模型服务请求失败，已停止后续抽取调度",
+                    details=_failure_details(transport_failure),
+                ) from transport_failure.get("error")
             children: list[dict[str, Any]] = []
             for outcome in wave_outcomes:
                 batch_id = outcome["batch_id"]
@@ -2361,46 +2686,46 @@ async def extract_documents_with_independent_map_reduce(
                 child_groups = recovery_groups(plan, failure_code)
                 recoverable = (
                     bool(child_groups)
-                    and int(plan.get("depth", 0)) < settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
-                    and failure_code
-                    in {
-                        "FACT_BATCH_SATURATED",
-                        "FACT_UNIT_NOT_FOUND",
-                        "FACT_QUOTE_NOT_GROUNDED",
-                        "FACT_IDENTITY_DUPLICATED",
-                        "FACT_IDENTITY_CONFLICT",
-                        "FACT_VALUE_NOT_GROUNDED",
-                        "LLM_OUTPUT_TRUNCATED",
-                        "LLM_INVALID_JSON",
-                        "LLM_SCHEMA_INVALID",
-                        "LLM_EXTRACTION_EVIDENCE_INVALID",
-                        "LLM_TIMEOUT",
-                        "LLM_UPSTREAM_ERROR",
-                    }
+                    and int(plan.get("depth", 0)) < max_recovery_depth
+                    and failure_code in TEXT_RECOVERABLE_FAILURE_CODES
                 )
                 if recoverable:
                     document = documents_by_id[plan["document_id"]]
-                    children = [
-                        *children,
-                        *[
-                            make_child_plan(
-                                document,
-                                plan,
-                                child_blocks,
-                                text_fact_limit=text_fact_limit,
-                            )
-                            for child_blocks, text_fact_limit in child_groups
-                        ],
+                    new_children = [
+                        make_child_plan(
+                            document,
+                            plan,
+                            child_blocks,
+                            text_fact_limit=text_fact_limit,
+                            numeric_candidate_subset=candidate_indexes,
+                        )
+                        for child_blocks, text_fact_limit, candidate_indexes in child_groups
                     ]
+                    if chain == "numeric":
+                        new_children = [
+                            child
+                            for child in new_children
+                            if int(child.get("numeric_candidate_count", 0)) > 0
+                        ]
+                    children.extend(new_children)
                     recovery_counts[plan["document_id"]] += 1
                     if (
                         recovery_counts[plan["document_id"]]
                         > recovery_budget[plan["document_id"]]
                     ):
+                        terminal_failure = outcome
+                        if chain == "text":
+                            details = _failure_details(
+                                outcome,
+                                failure_code="TEXT_RECOVERY_BUDGET_EXHAUSTED",
+                                underlying_failure_code=failure_code,
+                            )
+                        else:
+                            details = _failure_details(outcome)
                         raise WorkflowError(
                             "DYNAMIC_CHECK_INCOMPLETE",
                             "事实抽取恢复预算已用尽",
-                            details=_failure_details(outcome),
+                            details=details,
                         )
                     superseded.add(plan["batch_id"])
                     continue
@@ -2464,11 +2789,67 @@ async def extract_documents_with_independent_map_reduce(
                     for unit_id in child["plan"]["unit_ids"]
                 )
             actual: set[str] = set()
+            candidate_recovery_expected: dict[str, set[tuple[str, int]]] = {}
+            candidate_recovery_actual: dict[str, set[tuple[str, int]]] = {}
             for outcome in by_document.get(document.file_id, []):
+                candidate_parent_id = outcome["plan"].get(
+                    "numeric_candidate_parent_batch_id"
+                )
                 unit_ids = set(outcome["plan"]["unit_ids"])
+                if candidate_parent_id:
+                    parent = all_outcomes.get(candidate_parent_id)
+                    if parent is None:
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "Numeric 候选恢复缺少父批次",
+                            details=failure_details(
+                                outcome["plan"], "NUMERIC_CANDIDATE_PARENT_MISSING"
+                            ),
+                        )
+                    parent_plan = parent["plan"]
+                    expected_indexes = numeric_candidate_indexes(
+                        parent_plan["payload"]
+                    )
+                    candidate_recovery_expected[candidate_parent_id] = {
+                        (unit_id, index)
+                        for unit_id in parent_plan["unit_ids"]
+                        for index in expected_indexes
+                    }
+                    child_indexes = outcome["plan"].get(
+                        "numeric_candidate_indexes", []
+                    )
+                    child_keys = {
+                        (unit_id, index)
+                        for unit_id in unit_ids
+                        for index in child_indexes
+                    }
+                    previous = candidate_recovery_actual.setdefault(
+                        candidate_parent_id, set()
+                    )
+                    if previous.intersection(child_keys):
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "Reduce 检测到 Numeric 候选身份冲突",
+                            details=failure_details(
+                                outcome["plan"], "NUMERIC_CANDIDATE_DUPLICATE"
+                            ),
+                        )
+                    previous.update(child_keys)
+                    actual.update(unit_ids)
+                    continue
                 if actual.intersection(unit_ids):
                     raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "Reduce 检测到结构单元身份冲突")
                 actual.update(unit_ids)
+            for parent_batch_id, expected_candidates in candidate_recovery_expected.items():
+                if candidate_recovery_actual.get(parent_batch_id, set()) != expected_candidates:
+                    parent = all_outcomes[parent_batch_id]
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        "Numeric 候选覆盖率不是 100%",
+                        details=failure_details(
+                            parent["plan"], "NUMERIC_CANDIDATE_COVERAGE_INCOMPLETE"
+                        ),
+                    )
             if actual != expected:
                 raise WorkflowError(
                     "DYNAMIC_CHECK_INCOMPLETE",
@@ -2485,28 +2866,13 @@ async def extract_documents_with_independent_map_reduce(
                         failure_code="STRUCTURE_UNIT_COVERAGE_INCOMPLETE",
                     ),
                 )
-        recoverable_codes = {
-            "FACT_BATCH_SATURATED",
-            "FACT_UNIT_NOT_FOUND",
-            "FACT_QUOTE_NOT_GROUNDED",
-            "FACT_IDENTITY_DUPLICATED",
-            "FACT_IDENTITY_CONFLICT",
-            "FACT_VALUE_NOT_GROUNDED",
-            "LLM_OUTPUT_TRUNCATED",
-            "LLM_INVALID_JSON",
-            "LLM_SCHEMA_INVALID",
-            "LLM_EXTRACTION_EVIDENCE_INVALID",
-            "LLM_TIMEOUT",
-            "LLM_UPSTREAM_ERROR",
-        }
-
         def is_recoverable_first_wave(item: dict[str, Any]) -> bool:
             failure_code = item.get("failure_code") or item.get("error_code")
             return (
                 item.get("status") == "FAILED"
                 and bool(recovery_groups(item["plan"], failure_code))
-                and int(item["plan"].get("depth", 0)) < settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
-                and failure_code in recoverable_codes
+                and int(item["plan"].get("depth", 0)) < max_recovery_depth
+                and failure_code in TEXT_RECOVERABLE_FAILURE_CODES
             )
 
         denominator = sum(not is_recoverable_first_wave(item) for item in first_wave)

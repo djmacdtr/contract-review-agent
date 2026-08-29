@@ -4,6 +4,10 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from app.adapters.document_parser.cached_parser import (
+    CachedExternalDocumentParser,
+    SqlAlchemyDocumentParseCache,
+)
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.adapters.llm.base import ContractLlmClient
 from app.adapters.llm.openai_client import OpenAIContractLlmClient
@@ -16,6 +20,7 @@ from app.comparison.models import ComparisonResult
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
+from app.db.session import SessionFactory
 from app.documents.models import ParsedDocument, ProcessingWarning
 from app.documents.page_locations import apply_docx_page_location_sidecars
 from app.documents.parsers import ParserRegistry
@@ -65,7 +70,11 @@ class FinalCompareWorkflowExecutor:
         )
         self.parsers = document_router or DocumentParsingRouter(
             local=local_parsers,
-            external=TextInDocumentParser(settings)
+            external=CachedExternalDocumentParser(
+                TextInDocumentParser(settings),
+                SqlAlchemyDocumentParseCache(SessionFactory),
+                settings,
+            )
             if settings.OCR_ENABLED or settings.DOCX_PAGE_LOCATION_ENABLED
             else None,
             docx_page_location_enabled=settings.DOCX_PAGE_LOCATION_ENABLED,

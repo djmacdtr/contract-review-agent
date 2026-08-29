@@ -14,7 +14,6 @@ from app.documents.models import (
 )
 from app.draft_review.extraction import extract_documents_with_independent_map_reduce
 from app.draft_review.facts import (
-    EvidenceValidationError,
     build_text_fact_payload,
     filter_text_fact_evidence,
     plan_text_document_batches,
@@ -105,7 +104,8 @@ def test_text_evidence_filter_keeps_grounded_candidates_and_discards_one() -> No
                     "quote": "甲方",
                     "confidence": 0.9,
                 },
-            ]
+            ],
+            "has_more": False,
         },
     )
 
@@ -132,7 +132,8 @@ def test_text_evidence_filter_all_invalid_candidates_returns_empty() -> None:
                     "quote": "乙方",
                     "confidence": 0.9,
                 }
-            ]
+            ],
+            "has_more": False,
         },
     )
 
@@ -155,11 +156,13 @@ def test_text_evidence_filter_keeps_schema_and_saturation_strict() -> None:
                 "confidence": 0.9,
             }
             for index in range(12)
-        ]
+        ],
+        "has_more": False,
     }
 
-    with pytest.raises(EvidenceValidationError, match="saturation"):
-        filter_text_fact_evidence(document, payload, saturated)
+    accepted, discarded = filter_text_fact_evidence(document, payload, saturated)
+    assert len(accepted) == 12
+    assert discarded == {}
 
 
 def test_text_diagnostic_reconstructs_a_table_cell_child_batch() -> None:
@@ -190,6 +193,45 @@ def test_text_diagnostic_reconstructs_a_table_cell_child_batch() -> None:
     assert rebuilt["batch_id"] == child["batch_id"]
     assert rebuilt["depth"] == 1
     assert len(rebuilt["blocks"]) == 1
+
+
+def test_text_diagnostic_reconstructs_production_balanced_depth_two_batch() -> None:
+    source = paragraph_document()
+    blocks = [
+        DocumentBlock(
+            block_id=f"production_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"条款{index}内容。",
+            normalized_text=f"条款{index}内容。",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(16)
+    ]
+    document = source.model_copy(update={"blocks": blocks})
+    settings = Settings(_env_file=None)
+    initial = plan_text_document_batches(
+        document,
+        max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+        max_text_units=16,
+        max_text_facts=12,
+        estimated_output_token_limit=min(
+            settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS,
+            2000,
+        ),
+    )
+    parent = _decorate_initial_plan(initial[0], planned_batch_count=len(initial))
+    middle = _make_child_plan(document, parent, blocks[:8], text_fact_limit=12)
+    target = _make_child_plan(document, middle, blocks[:4], text_fact_limit=12)
+
+    rebuilt = reconstruct_text_batch(document, target["batch_id"], settings)
+
+    assert rebuilt is not None
+    assert rebuilt["batch_id"] == target["batch_id"]
+    assert rebuilt["depth"] == 2
+    assert [block.block_id for block in rebuilt["blocks"]] == [
+        f"production_{index}" for index in range(4)
+    ]
 
 
 def test_text_diagnostic_details_exclude_body_and_credentials() -> None:
@@ -267,7 +309,8 @@ async def test_independent_text_chain_filters_one_bad_candidate_without_failing(
                             "quote": "乙方",
                             "confidence": 0.9,
                         },
-                    ]
+                    ],
+                    "has_more": False,
                 },
                 configured_model="test",
                 actual_model="test",

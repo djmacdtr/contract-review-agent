@@ -11,9 +11,12 @@ from app.documents.models import (
     TableRow,
 )
 from app.documents.page_locations import (
+    DocxPageLocationSidecar,
     apply_docx_page_location_sidecars,
+    augment_unmapped_table_page_bindings,
     bind_docx_page_locations,
     build_docx_page_location_sidecar,
+    validate_public_page_coverage,
 )
 
 
@@ -191,6 +194,55 @@ def test_table_block_and_cells_receive_external_pages() -> None:
     assert sidecar.pages_for(local_table.table.rows[1].cells[1].location) == (2,)
 
 
+def test_docx_table_maps_to_flattened_external_paragraphs_in_order() -> None:
+    local_table = table_block(
+        "fil_local", 0, [["名称", "金额"], ["设备A", "100万元"]]
+    )
+    external = document(
+        "fil_local",
+        [
+            paragraph_block("fil_local", 0, "名称 金额", page=1),
+            paragraph_block("fil_local", 1, "设备A 100万元", page=2),
+        ],
+        2,
+    )
+    external.parser_metadata["page_ids"] = [1, 2]
+
+    sidecar = build_docx_page_location_sidecar(
+        document("fil_local", [local_table], None), external
+    )
+
+    assert sidecar.pages_for(local_table.location) == (1, 2)
+    assert sidecar.pages_for(local_table.table.rows[0].cells[0].location) == (1,)
+    assert sidecar.pages_for(local_table.table.rows[1].cells[1].location) == (2,)
+
+
+def test_unmapped_table_inherits_pages_from_ordered_flattened_anchors() -> None:
+    local_table = table_block("fil_local", 0, [["名称", "金额"]])
+    local = document("fil_local", [local_table], None)
+    external = document(
+        "fil_local",
+        [paragraph_block("fil_local", 0, "名称 金额", page=3)],
+        3,
+    )
+    sidecar = DocxPageLocationSidecar(
+        file_id="fil_local",
+        page_count=3,
+        mappings={},
+        required_location_count=3,
+        candidate_mapping_count=0,
+        local_structure_count=3,
+        external_structure_count=1,
+        external_detail_page_count=3,
+    )
+
+    rebound = augment_unmapped_table_page_bindings(local, external, sidecar)
+
+    assert rebound.pages_for(local_table.location) == (3,)
+    assert rebound.pages_for(local_table.table.rows[0].cells[0].location) == (3,)
+    assert rebound.pages_for(local_table.table.rows[0].cells[1].location) == (3,)
+
+
 def test_blank_physical_page_without_details_is_allowed() -> None:
     local = document(
         "fil_local", [paragraph_block("fil_local", 0, "唯一正文")], None
@@ -307,6 +359,8 @@ def test_unmapped_public_evidence_fails_with_safe_stage() -> None:
                 "paragraph_index": 1,
             }
         ],
+        "public_evidence_file_id": "fil_local",
+        "public_evidence_location": {"paragraph_index": 1},
     }
 
 
@@ -551,3 +605,82 @@ def test_bound_structure_pages_are_propagated_into_diff_evidence() -> None:
     assert diff.baseline.location.page == 3
     assert diff.baseline.location.structure_id == "paragraph:0"
     assert "structure_id" not in diff.model_dump(mode="json")["baseline"]["location"]
+
+
+def test_public_page_coverage_requires_diff_sides_and_linked_risk_evidence() -> None:
+    external = document(
+        "fil_doc", [paragraph_block("fil_doc", 0, "证据", page=2)], 2
+    )
+    external.parser_metadata["page_ids"] = [1, 2]
+    sidecar = build_docx_page_location_sidecar(
+        document("fil_doc", [paragraph_block("fil_doc", 0, "证据")], None),
+        external,
+    )
+    result = {
+        "files": [{"file_id": "fil_doc", "page_count": 2}],
+        "diff_items": [
+            {
+                "diff_id": "diff_1",
+                "baseline": {
+                    "file_id": "fil_doc",
+                    "location": {"paragraph_index": 0, "page": 2},
+                },
+                "target": {
+                    "file_id": "fil_doc",
+                    "location": {"paragraph_index": 0, "page": 2},
+                },
+            }
+        ],
+        "risk_items": [
+            {
+                "risk_id": "risk_1",
+                "related_diff_ids": ["diff_1"],
+                "source_evidence": [
+                    {
+                        "file_id": "fil_doc",
+                        "location": {"paragraph_index": 0, "page": 2},
+                    }
+                ],
+            }
+        ],
+    }
+
+    coverage = validate_public_page_coverage(result, {"fil_doc": sidecar})
+
+    assert coverage == {
+        "required_evidence_count": 3,
+        "covered_evidence_count": 3,
+        "missing_evidence_count": 0,
+    }
+
+
+def test_public_page_coverage_fails_without_a_public_page() -> None:
+    external = document(
+        "fil_doc", [paragraph_block("fil_doc", 0, "证据", page=1)], 1
+    )
+    external.parser_metadata["page_ids"] = [1]
+    sidecar = build_docx_page_location_sidecar(
+        document("fil_doc", [paragraph_block("fil_doc", 0, "证据")], None),
+        external,
+    )
+    result = {
+        "files": [{"file_id": "fil_doc", "page_count": 1}],
+        "diff_items": [
+            {
+                "diff_id": "diff_1",
+                "baseline": {
+                    "file_id": "fil_doc",
+                    "location": {"paragraph_index": 0},
+                },
+            }
+        ],
+        "risk_items": [],
+    }
+
+    with pytest.raises(WorkflowError) as caught:
+        validate_public_page_coverage(result, {"fil_doc": sidecar})
+
+    assert caught.value.code == "DOCX_PAGE_LOCATION_INCOMPLETE"
+    assert caught.value.details["failure_code"] == "PUBLIC_DIFF_PAGE_MISSING"
+    assert caught.value.details["public_evidence_file_id"] == "fil_doc"
+    assert caught.value.details["public_evidence_location"] == {"paragraph_index": 0}

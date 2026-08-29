@@ -1,0 +1,21 @@
+{
+  "status": "FAILED",
+  "source_task_id": "tsk_01M161GFY6Q7YSP07R877XQM2B",
+  "task_id": "tsk_01M167E69YV0MGNHENB9HW10DG",
+  "worker_claimed": true,
+  "elapsed_seconds": 7.672,
+  "snapshot_reuse": {
+    "document_snapshot_count": 3,
+    "checkpoint_row_count": 3,
+    "current_checkpoint_count": 3,
+    "fact_extraction_calls": 0
+  },
+  "llm_http_calls": 0,
+  "llm_status_counts": {},
+  "llm_call_metadata": [],
+  "console_tasks_path": "/console/#/tasks",
+  "console_report_path": "/console/#/reports/draft/tsk_01M167E69YV0MGNHENB9HW10DG",
+  "failure_stage": "SNAPSHOT_INJECTION",
+  "failure_code": "SNAPSHOT_EVIDENCE_REBIND_FAILED",
+  "underlying_failure_code": null
+}

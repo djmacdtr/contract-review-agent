@@ -22,6 +22,7 @@ from app.documents.models import (
     TableCell,
     TableRow,
 )
+from app.draft_review.extraction import _validated_document_checkpoint
 from app.draft_review.facts import (
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
     EvidenceValidationError,
@@ -135,6 +136,21 @@ def test_evidence_must_exist_at_declared_location() -> None:
     with pytest.raises(EvidenceValidationError) as error:
         validate_extraction_evidence(document, invalid)
     assert error.value.code == "FACT_VALUE_NOT_GROUNDED"
+
+
+def test_document_checkpoint_validation_ignores_display_page_binding() -> None:
+    document = parsed("fil_a", "融资金额为1000万元")
+    document.page_count = 46
+    document.blocks[0].location.page = 4
+    document.blocks[0].location.physical_pages = (4,)
+
+    validated = _validated_document_checkpoint(
+        document,
+        extraction("fil_a", "1000万元").model_dump(mode="json"),
+    )
+
+    assert validated is not None
+    assert validated.facts[0].source_file_id == "fil_a"
 
 
 def _table_document(file_id: str = "fil_table") -> ParsedDocument:

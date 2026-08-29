@@ -22,17 +22,19 @@ class WorkerRunner:
         *,
         repository: TaskRepository | None = None,
         workflow=None,
+        session_factory=None,
     ) -> None:
         self.settings = settings
         self.repository = repository or TaskRepository()
         self.workflow = workflow or WorkflowRouter(settings)
+        self.session_factory = session_factory or SessionFactory
         self.worker_id = f"{settings.WORKER_ID}:{socket.gethostname()}:{id(self):x}"
         self._stopping = asyncio.Event()
 
     async def recover_stale(self) -> tuple[list[str], list[str]]:
-        async with SessionFactory() as session, session.begin():
+        async with self.session_factory() as session, session.begin():
             result = await self.repository.recover_stale(
-                session, self.settings.WORKER_STALE_AFTER_SECONDS
+                session, self.settings.effective_worker_stale_after_seconds
             )
         if any(result):
             logger.warning(
@@ -41,11 +43,11 @@ class WorkerRunner:
         return result
 
     async def claim(self):
-        async with SessionFactory() as session, session.begin():
+        async with self.session_factory() as session, session.begin():
             return await self.repository.claim_next(session, self.worker_id)
 
     async def _progress(self, task_id: str, stage: TaskStage, progress: int, message: str) -> None:
-        async with SessionFactory() as session, session.begin():
+        async with self.session_factory() as session, session.begin():
             owned = await self.repository.update_progress(
                 session,
                 task_id=task_id,
@@ -61,7 +63,7 @@ class WorkerRunner:
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(self.settings.WORKER_HEARTBEAT_INTERVAL_SECONDS)
-                async with SessionFactory() as session, session.begin():
+                async with self.session_factory() as session, session.begin():
                     owned = await self.repository.heartbeat(session, task_id, self.worker_id)
                 if not owned:
                     return
@@ -101,7 +103,7 @@ class WorkerRunner:
                 result = output
                 file_metadata = []
             metadata = result["metadata"]
-            async with SessionFactory() as session, session.begin():
+            async with self.session_factory() as session, session.begin():
                 completed = await self.repository.complete(
                     session,
                     task_id=task.id,
@@ -136,10 +138,28 @@ class WorkerRunner:
                 file_id=details.get("file_id", details.get("file")),
                 batch_depth=details.get("batch_depth"),
                 unit_count=details.get("unit_count"),
+                numeric_candidate_count=details.get("numeric_candidate_count"),
                 batch_id=details.get("batch_id"),
                 failure_code=details.get("failure_code"),
+                underlying_failure_code=details.get("underlying_failure_code"),
+                finish_reason=details.get("finish_reason"),
+                content_chars=details.get("content_chars"),
+                reasoning_content_chars=details.get("reasoning_content_chars"),
+                max_tokens=details.get("max_tokens"),
+                http_status=details.get("http_status"),
+                usage=details.get("usage"),
+                expected_count=details.get("expected_count"),
+                returned_count=details.get("returned_count"),
+                missing_index_count=details.get("missing_index_count"),
+                duplicate_index_count=details.get("duplicate_index_count"),
+                invalid_index_count=details.get("invalid_index_count"),
+                public_evidence_file_id=details.get("public_evidence_file_id"),
+                public_evidence_location=details.get("public_evidence_location"),
+                required_evidence_count=details.get("required_evidence_count"),
+                covered_evidence_count=details.get("covered_evidence_count"),
+                missing_evidence_count=details.get("missing_evidence_count"),
             )
-            async with SessionFactory() as session, session.begin():
+            async with self.session_factory() as session, session.begin():
                 await self.repository.fail(
                     session,
                     task_id=task.id,
@@ -156,7 +176,7 @@ class WorkerRunner:
                 task_type=task.task_type.value,
                 error_type=type(exc).__name__,
             )
-            async with SessionFactory() as session, session.begin():
+            async with self.session_factory() as session, session.begin():
                 await self.repository.fail(
                     session,
                     task_id=task.id,

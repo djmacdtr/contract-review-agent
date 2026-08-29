@@ -1,0 +1,189 @@
+{
+  "status": "FAILED",
+  "task_id": "tsk_01M16MWEMN7SAVK42HER1NRNVB",
+  "source_task_id": "tsk_01M16HJ4ZB4ZXBEG2FKRZF7XSB",
+  "source_checkpoint_count": 52,
+  "new_task_checkpoint_count": 55,
+  "worker_claimed": true,
+  "elapsed_seconds": 467.625,
+  "llm_http_calls": 23,
+  "llm_status_counts": {
+    "200": 23
+  },
+  "text_response_format": "json_object",
+  "text_model_override": null,
+  "numeric_model_override": null,
+  "advice_response_format": "json_object",
+  "llm_call_metadata": [
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "length"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    }
+  ],
+  "console_tasks_path": "/console/#/tasks",
+  "console_report_path": "/console/#/tasks/tsk_01M16MWEMN7SAVK42HER1NRNVB/report",
+  "stage": "GENERATING_ADVICE",
+  "progress": 92,
+  "error_code": "DOCX_PAGE_LOCATION_INCOMPLETE",
+  "failure": {
+    "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
+    "failure_code": "PUBLIC_LOCATION_UNMAPPED"
+  }
+}

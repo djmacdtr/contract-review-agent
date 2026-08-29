@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from copy import deepcopy
 from typing import Any, TypedDict
 
 import structlog
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
+from app.adapters.document_parser.cached_parser import (
+    CachedExternalDocumentParser,
+    SqlAlchemyDocumentParseCache,
+)
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.adapters.llm.base import ContractLlmClient, LlmResult
 from app.adapters.llm.openai_client import (
@@ -16,10 +23,12 @@ from app.adapters.llm.openai_client import (
 )
 from app.adapters.llm.schemas import (
     AdviceResponse,
+    CrossValidationResponse,
     DocumentFactExtraction,
     FactCandidate,
     FactMappingResponse,
     FactMappingReview,
+    FactRelationBatchResponse,
     FactReview,
     SemanticConceptPlan,
     SemanticPlanResponse,
@@ -28,11 +37,22 @@ from app.adapters.llm.schemas import (
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
+from app.db.session import SessionFactory
 from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning
-from app.documents.page_locations import apply_docx_page_location_sidecars
+from app.documents.page_location_cache import SqlAlchemyPageLocationSidecarCache
+from app.documents.page_locations import (
+    apply_docx_page_location_sidecars,
+    validate_public_page_coverage,
+)
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.draft_review.checkpoints import ExtractionCheckpoint
+from app.draft_review.delivery_cross_check import (
+    MAX_CROSS_BATCH_SIZE,
+    build_cross_validation_payload,
+    build_reference_candidate_groups,
+    group_decision_to_results,
+)
 from app.draft_review.extraction import (
     extract_documents_with_independent_map_reduce,
     extract_documents_with_map_reduce,
@@ -64,12 +84,20 @@ from app.draft_review.facts import (
     validate_mapping_review_coverage,
     validate_semantic_plan,
 )
+from app.draft_review.mapping import (
+    build_mapping_batches,
+    expected_mapping_pairs,
+    reference_fact_id,
+    subset_mapping_payload,
+)
 from app.draft_review.numeric_rules import evaluate_validation_spec, referenced_fact_refs
 from app.draft_review.template_checks import TemplateReviewResult, analyze_template
 from app.results.advice import (
+    ADVICE_QUALITY_CODES,
     advice_payload,
+    empty_advice_quality_counts,
     ensure_fallback_risk_advices,
-    merge_model_advice,
+    validate_advice_item,
 )
 from app.results.passed_checks import build_comparison_passed_checks
 from app.results.risk_model import build_risk_items, build_statistics
@@ -81,6 +109,7 @@ from app.workflows.types import WorkflowOutput
 
 DRAFT_REVIEW_WORKFLOW_VERSION = "0.7.0"
 DRAFT_REVIEW_RULES_VERSION = "0.6.0"
+PRE_PAGE_RESULT_SNAPSHOT_VERSION = "draft-result-pre-page-v1"
 logger = structlog.get_logger(__name__)
 
 
@@ -449,6 +478,8 @@ class DraftReviewState(TypedDict, total=False):
     llm_mappings: dict[str, dict[str, Any]]
     llm_mapping_reviews: dict[str, dict[str, Any]]
     llm_semantic_plans: dict[str, dict[str, Any]]
+    reference_candidates: dict[str, Any]
+    cross_validations: dict[str, Any]
     page_location_sidecars: dict[str, Any]
     result: dict[str, Any]
 
@@ -473,9 +504,18 @@ class DraftReviewWorkflowExecutor:
         )
         self.parsers = document_router or DocumentParsingRouter(
             local=local_parsers,
-            external=TextInDocumentParser(settings)
+            external=CachedExternalDocumentParser(
+                TextInDocumentParser(settings),
+                SqlAlchemyDocumentParseCache(SessionFactory),
+                settings,
+            )
             if settings.OCR_ENABLED or settings.DOCX_PAGE_LOCATION_ENABLED
             else None,
+            page_location_cache=(
+                SqlAlchemyPageLocationSidecarCache(SessionFactory)
+                if settings.DOCX_PAGE_LOCATION_ENABLED
+                else None
+            ),
             docx_page_location_enabled=settings.DOCX_PAGE_LOCATION_ENABLED,
         )
         if llm is not None:
@@ -485,6 +525,60 @@ class DraftReviewWorkflowExecutor:
         else:
             self.llm = None
         self.checkpoint_store = checkpoint_store
+
+    async def _save_pre_page_result_snapshot(
+        self,
+        *,
+        task_id: str,
+        result: dict[str, Any],
+        documents: list[ParsedDocument],
+    ) -> None:
+        """Persist a page-free result artifact before physical page enrichment.
+
+        The artifact uses the existing checkpoint table and is deliberately
+        content-addressed by each document SHA. It is an internal recovery
+        input only; the public result and its identities are not changed.
+        """
+
+        if self.checkpoint_store is None:
+            return
+        sha_by_file_id = {document.file_id: document.sha256 for document in documents}
+        for file in result.get("files", []):
+            if not isinstance(file, dict):
+                continue
+            file_id = file.get("file_id")
+            file_sha256 = sha_by_file_id.get(file_id)
+            if not isinstance(file_id, str) or not isinstance(file_sha256, str):
+                continue
+            snapshot = deepcopy(result)
+            identity_payload = {
+                "version": PRE_PAGE_RESULT_SNAPSHOT_VERSION,
+                "file_sha256": file_sha256,
+                "result": snapshot,
+            }
+            payload_digest = hashlib.sha256(
+                json.dumps(
+                    identity_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            await self.checkpoint_store.save(
+                ExtractionCheckpoint(
+                    task_id=task_id,
+                    file_sha256=file_sha256,
+                    batch_id=f"page_result_{payload_digest[:32]}",
+                    extraction_version=PRE_PAGE_RESULT_SNAPSHOT_VERSION,
+                    payload_digest=payload_digest,
+                    value={
+                        "file_id": file_id,
+                        "result": snapshot,
+                    },
+                    status="SUCCEEDED",
+                    model_name="DRAFT_REVIEW_PRE_PAGE_RESULT",
+                )
+            )
 
     def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
         graph = StateGraph(DraftReviewState)
@@ -501,7 +595,8 @@ class DraftReviewWorkflowExecutor:
                 missing = [
                     file.file_id
                     for file in state["local_files"]
-                    if file.detected_mime_type == DOCX_MIME and file.file_id not in sidecars
+                    if file.detected_mime_type == DOCX_MIME
+                    and file.file_id not in sidecars
                 ]
                 if missing:
                     raise WorkflowError(
@@ -550,9 +645,157 @@ class DraftReviewWorkflowExecutor:
                 raise WorkflowError("COMPARISON_UNRELIABLE", "目标合同与模板的对齐覆盖率不足")
             return {"template_review": review}
 
+        async def build_reference_candidates(state: DraftReviewState) -> dict[str, Any]:
+            if not state.get("options", {}).get("check_numeric_consistency", True):
+                return {
+                    "reference_candidates": {
+                        "groups": [],
+                        "warnings": [],
+                        "target_candidate_count": 0,
+                        "reference_candidate_count": 0,
+                        "group_count": 0,
+                        "omitted_count": 0,
+                    }
+                }
+            target = next(
+                (document for document in state["parsed_documents"] if document.role == "TARGET"),
+                None,
+            )
+            references = [
+                document
+                for document in state["parsed_documents"]
+                if document.role == "REFERENCE" and document.blocks
+            ]
+            if target is None or not references:
+                raise WorkflowError(
+                    "REFERENCE_DOCUMENTS_UNAVAILABLE",
+                    "没有可用于跨资料检查的辅助资料",
+                )
+            candidates = build_reference_candidate_groups(
+                target,
+                references,
+                state["template_review"],
+            )
+            return {"reference_candidates": candidates}
+
+        async def cross_validate_candidates(state: DraftReviewState) -> dict[str, Any]:
+            candidates = state.get("reference_candidates", {})
+            groups = candidates.get("groups", [])
+            warnings = list(candidates.get("warnings", []))
+            decisions: dict[str, dict[str, Any]] = {}
+            model_runs: list[dict[str, Any]] = []
+            if not groups:
+                return {
+                    "cross_validations": {
+                        "decisions": decisions,
+                        "warnings": warnings,
+                        "model_runs": model_runs,
+                    }
+                }
+            if self.llm is None or not hasattr(self.llm, "cross_validate_candidates"):
+                warnings.append(
+                    {
+                        "code": "LLM_CROSS_VALIDATE_UNAVAILABLE",
+                        "message": "跨资料对应判断未完成，已保留确定性模板检查结果。",
+                        "requires_manual_review": False,
+                    }
+                )
+                return {
+                    "cross_validations": {
+                        "decisions": decisions,
+                        "warnings": warnings,
+                        "model_runs": model_runs,
+                    }
+                }
+            await callback(TaskStage.CROSS_VALIDATE, 75, "正在核对目标合同与辅助资料中的相关内容")
+            for batch_index in range(0, len(groups), MAX_CROSS_BATCH_SIZE):
+                batch = groups[batch_index : batch_index + MAX_CROSS_BATCH_SIZE]
+                if batch_index // MAX_CROSS_BATCH_SIZE >= 3:
+                    warnings.append(
+                        {
+                            "code": "CROSS_VALIDATE_BATCH_LIMITED",
+                            "message": "跨资料候选较多，部分候选未完成判断，未生成对应通过项。",
+                            "requires_manual_review": False,
+                        }
+                    )
+                    break
+                payload = build_cross_validation_payload(batch)
+                try:
+                    generated = await self.llm.cross_validate_candidates(payload)
+                    response = CrossValidationResponse.model_validate(generated.value)
+                    expected = {group["candidate_id"] for group in batch}
+                    actual = [item.candidate_id for item in response.items]
+                    if len(actual) != len(set(actual)) or set(actual) != expected:
+                        raise ValueError("cross validation coverage invalid")
+                    decisions.update(
+                        {
+                            item.candidate_id: item.model_dump(mode="json")
+                            for item in response.items
+                        }
+                    )
+                    model_runs.append(
+                        {
+                            "purpose": "CROSS_VALIDATE",
+                            "configured_model": generated.configured_model,
+                            "actual_model": generated.actual_model,
+                            "duration_ms": generated.duration_ms,
+                            "request_attempts": generated.request_attempts,
+                            "structure_retries": generated.structure_retries,
+                            "batch_count": 1,
+                            "candidate_count": len(batch),
+                            "status": "SUCCEEDED",
+                        }
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    warnings.append(
+                        {
+                            "code": "LLM_CROSS_VALIDATE_UNAVAILABLE",
+                            "message": "一批跨资料对应判断未完成，相关候选未生成风险或通过项。",
+                            "requires_manual_review": False,
+                        }
+                    )
+                    model_runs.append(
+                        {
+                            "purpose": "CROSS_VALIDATE",
+                            "configured_model": None,
+                            "actual_model": None,
+                            "duration_ms": 0,
+                            "request_attempts": 0,
+                            "structure_retries": 0,
+                            "batch_count": 1,
+                            "candidate_count": len(batch),
+                            "status": "SKIPPED",
+                        }
+                    )
+            return {
+                "cross_validations": {
+                    "decisions": decisions,
+                    "warnings": warnings,
+                    "model_runs": model_runs,
+                }
+            }
+
         async def extract_facts(state: DraftReviewState) -> dict[str, Any]:
             if self.llm is None:
                 return {"llm_extractions": {}}
+            workflow_options = state.get("options", {})
+            checkpoint_source_task_id = workflow_options.get(
+                "_report_regeneration_source_task_id"
+            ) or workflow_options.get("source_task_id")
+            snapshot_loader = getattr(self, "load_report_regeneration_snapshots", None)
+            if workflow_options.get("_report_regeneration_explicit_snapshot") and callable(
+                snapshot_loader
+            ):
+                extractions = await snapshot_loader(
+                    documents=state["parsed_documents"],
+                    template_review=state["template_review"],
+                    task_id=state.get("task_id"),
+                    source_task_id=checkpoint_source_task_id,
+                )
+                return {"llm_extractions": extractions, "llm_reviews": {}}
+
             await callback(TaskStage.FACT_EXTRACTION, 75, "正在逐份抽取合同事实并保留证据")
 
             if all(
@@ -580,7 +823,7 @@ class DraftReviewWorkflowExecutor:
                             llm=self.llm,
                             checkpoint_store=self.checkpoint_store,
                             task_id=state.get("task_id"),
-                            source_task_id=state.get("options", {}).get("source_task_id"),
+                            source_task_id=checkpoint_source_task_id,
                             source_file_ids_by_file_id=source_file_ids_by_file_id,
                             text_candidates_by_document={
                                 document.file_id: build_template_text_candidates(
@@ -602,7 +845,7 @@ class DraftReviewWorkflowExecutor:
                         else None
                     )
                     if review_method is not None:
-                        source_task_id = state.get("options", {}).get("source_task_id")
+                        source_task_id = checkpoint_source_task_id
                         task_id = state.get("task_id")
 
                         async def review_one(
@@ -830,6 +1073,17 @@ class DraftReviewWorkflowExecutor:
                         "DYNAMIC_CHECK_INCOMPLETE",
                         "动态事实抽取未能可靠完成",
                     ) from exc
+
+            if not hasattr(self.llm, "extract_facts"):
+                raise WorkflowError(
+                    "DYNAMIC_CHECK_INCOMPLETE",
+                    "当前模型适配器不支持动态事实抽取",
+                    details={
+                        "failure_stage": "FACT_EXTRACTION",
+                        "chain": "adapter_capability",
+                        "failure_code": "FACT_EXTRACTION_METHOD_UNAVAILABLE",
+                    },
+                )
 
             extractions: dict[str, dict[str, Any]] = {}
             reviews: dict[str, dict[str, Any]] = {}
@@ -1060,6 +1314,20 @@ class DraftReviewWorkflowExecutor:
             ]
             catalog = [_compact_mapping_fact(item) for item in catalog]
             target_ids = {item["target_fact_id"] for item in catalog}
+            target_facts_for_retrieval = [
+                (catalog_item["target_fact_id"], fact)
+                for fact, catalog_item in zip(
+                    target_extraction.facts,
+                    target_fact_catalog(target_extraction),
+                    strict=True,
+                )
+                if catalog_item["target_fact_id"] in target_ids
+                and fact.requires_cross_document_validation
+            ]
+            # The 0.7.0 delivery path uses the established full mapping payload.
+            # Candidate-relation mapping remains available as dormant code for
+            # later experiments, but is not part of this business baseline.
+            candidate_mapping_method = None
             await callback(TaskStage.CROSS_VALIDATE, 80, "正在逐份映射目标合同与辅助资料事实")
             for document in state["parsed_documents"]:
                 if document.role != "REFERENCE":
@@ -1101,6 +1369,195 @@ class DraftReviewWorkflowExecutor:
                     (fact.field_key, fact.source_file_id, location_key(fact.location)): fact
                     for fact in accepted_reference_facts
                 }
+                if candidate_mapping_method is not None:
+                    max_payload_chars = min(
+                        48_000,
+                        max(8_000, self.settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS * 4),
+                    )
+                    batches = build_mapping_batches(
+                        target_facts_for_retrieval,
+                        accepted_reference_facts,
+                        reference_file_id=document.file_id,
+                        max_payload_chars=max_payload_chars,
+                    )
+                    reference_by_id = {
+                        reference_fact_id(fact): fact for fact in accepted_reference_facts
+                    }
+                    decisions: dict[tuple[str, str], dict[str, Any]] = {}
+                    unresolved_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+                    configured_models: set[str] = set()
+                    actual_models: set[str] = set()
+                    duration_ms = 0
+                    request_attempts = 0
+                    structure_retries = 0
+                    successful_batch_count = 0
+
+                    async def map_candidate_batch(
+                        batch_payload: dict[str, Any],
+                        *,
+                        batch_id: str,
+                        missing_retry: bool = False,
+                        _configured_models: set[str] = configured_models,
+                        _actual_models: set[str] = actual_models,
+                        _unresolved_pairs: dict[
+                            tuple[str, str], dict[str, Any]
+                        ] = unresolved_pairs,
+                        _reference_by_id: dict[str, FactCandidate] = reference_by_id,
+                        _decisions: dict[tuple[str, str], dict[str, Any]] = decisions,
+                    ) -> None:
+                        nonlocal duration_ms
+                        nonlocal request_attempts
+                        nonlocal structure_retries
+                        nonlocal successful_batch_count
+                        expected = expected_mapping_pairs(batch_payload)
+                        if not expected:
+                            return
+                        try:
+                            generated = await candidate_mapping_method(batch_payload)
+                            response = FactRelationBatchResponse.model_validate(generated.value)
+                            successful_batch_count += 1
+                            duration_ms += generated.duration_ms
+                            request_attempts += generated.request_attempts
+                            structure_retries += generated.structure_retries
+                            if generated.configured_model:
+                                _configured_models.add(generated.configured_model)
+                            if generated.actual_model:
+                                _actual_models.add(generated.actual_model)
+                        except asyncio.CancelledError:
+                            raise
+                        except (
+                            LlmClientError,
+                            ValidationError,
+                            ValueError,
+                            TimeoutError,
+                        ) as exc:
+                            if len(expected) > 1:
+                                ordered = sorted(expected)
+                                middle = len(ordered) // 2
+                                left = set(ordered[:middle])
+                                right = set(ordered[middle:])
+                                await map_candidate_batch(
+                                    subset_mapping_payload(batch_payload, left),
+                                    batch_id=f"{batch_id}.0",
+                                )
+                                await map_candidate_batch(
+                                    subset_mapping_payload(batch_payload, right),
+                                    batch_id=f"{batch_id}.1",
+                                )
+                                return
+                            pair = next(iter(expected))
+                            _unresolved_pairs[pair] = {
+                                "batch_id": batch_id,
+                                "failure_code": (
+                                    getattr(exc, "failure_code", None)
+                                    or getattr(exc, "code", None)
+                                    or type(exc).__name__
+                                ),
+                            }
+                            return
+
+                        seen: set[tuple[str, str]] = set()
+                        for item in response.items:
+                            pair = (item.target_fact_id, item.reference_fact_id)
+                            if pair not in expected or pair in seen:
+                                continue
+                            seen.add(pair)
+                            if item.reference_fact_id not in _reference_by_id:
+                                continue
+                            _decisions[pair] = item.model_dump(mode="json")
+                            _unresolved_pairs.pop(pair, None)
+                        missing = expected - seen
+                        if missing and not missing_retry:
+                            await map_candidate_batch(
+                                subset_mapping_payload(batch_payload, missing),
+                                batch_id=f"{batch_id}.missing",
+                                missing_retry=True,
+                            )
+                        else:
+                            for pair in missing:
+                                _unresolved_pairs.setdefault(
+                                    pair,
+                                    {
+                                        "batch_id": batch_id,
+                                        "failure_code": "MAPPING_ITEM_MISSING_OR_INVALID",
+                                    },
+                                )
+
+                    for batch_index, batch in enumerate(batches, start=1):
+                        await map_candidate_batch(
+                            batch,
+                            batch_id=f"mapping-{document.file_id}-{batch_index:04d}",
+                        )
+
+                    expected_count = sum(len(expected_mapping_pairs(batch)) for batch in batches)
+                    if expected_count and not decisions:
+                        first_failure = next(iter(unresolved_pairs.values()), {})
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            f"文件 {document.file_name} 的跨资料事实映射未能可靠完成",
+                            details={
+                                "failure_stage": "FACT_MAPPING",
+                                "chain": "candidate_relation",
+                                "file_id": document.file_id,
+                                "batch_id": first_failure.get("batch_id"),
+                                "failure_code": first_failure.get(
+                                    "failure_code", "FACT_MAPPING_NO_VALID_DECISIONS"
+                                ),
+                                "candidate_pair_count": expected_count,
+                            },
+                        )
+
+                    proposals: list[dict[str, Any]] = []
+                    for (target_fact_id, reference_id), decision in decisions.items():
+                        if decision["decision"] == "UNRELATED":
+                            continue
+                        if decision["confidence"] < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE:
+                            unresolved_pairs.setdefault(
+                                (target_fact_id, reference_id),
+                                {
+                                    "batch_id": None,
+                                    "failure_code": "MAPPING_CONFIDENCE_INVALID",
+                                },
+                            )
+                            continue
+                        reference_fact = reference_by_id[reference_id]
+                        proposals.append(
+                            {
+                                "target_fact_id": target_fact_id,
+                                "reference_field_key": reference_fact.field_key,
+                                "source_file_id": reference_fact.source_file_id,
+                                "reference_location": reference_fact.location.model_dump(
+                                    mode="json", exclude_none=True
+                                ),
+                                # MATCH and CONFLICT both mean the pair is
+                                # semantically related. Value equality is
+                                # decided later by compare_facts().
+                                "decision": (
+                                    "UNCERTAIN"
+                                    if decision["decision"] == "UNCERTAIN"
+                                    else "MATCH"
+                                ),
+                                "confidence": decision["confidence"],
+                                "reason_code": decision["reason_code"],
+                            }
+                        )
+                    mapping = FactMappingResponse(
+                        reference_file_id=document.file_id,
+                        mappings=proposals,
+                        missing_requirements=[],
+                    )
+                    mappings[document.file_id] = {
+                        "value": mapping.model_dump(mode="json"),
+                        "configured_model": next(iter(configured_models), None),
+                        "actual_model": next(iter(actual_models), None),
+                        "duration_ms": duration_ms,
+                        "request_attempts": request_attempts,
+                        "structure_retries": structure_retries,
+                        "batch_count": successful_batch_count,
+                        "candidate_pair_count": expected_count,
+                        "dropped_candidate_pair_count": len(unresolved_pairs),
+                    }
+                    continue
                 payload = {
                     "reference_file_id": document.file_id,
                     "reference_profile": reference_extraction.profile.model_dump(mode="json"),
@@ -1586,56 +2043,238 @@ class DraftReviewWorkflowExecutor:
 
         async def generate_advice(state: DraftReviewState) -> dict[str, Any]:
             result = state["result"]
-            if self.llm is None or not hasattr(self.llm, "generate_advice"):
-                return {}
+            risks = list(result.get("risk_items", []))
+            for risk in risks:
+                risk.pop("analysis_advice", None)
+            advice_method = getattr(self.llm, "generate_advice", None)
+            if not risks:
+                result.setdefault("metadata", {})["advice_coverage"] = {
+                    "risk_count": 0,
+                    "model_count": 0,
+                    "fallback_count": 0,
+                    "model_rate": 1.0,
+                    "fallback_rate": 0.0,
+                }
+                return {"result": result}
+            if advice_method is None:
+                ensure_fallback_risk_advices(result)
+                result.setdefault("metadata", {})["advice_coverage"] = {
+                    "risk_count": len(risks),
+                    "model_count": 0,
+                    "fallback_count": len(risks),
+                    "model_rate": 0.0,
+                    "fallback_rate": 1.0,
+                }
+                result.setdefault("advice", {})["risk_advices"] = [
+                    {
+                        "risk_id": risk["risk_id"],
+                        "analysis_advice": risk["analysis_advice"],
+                    }
+                    for risk in risks
+                ]
+                return {"result": result}
             await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
-            try:
-                generated = await self.llm.generate_advice(advice_payload(result))
-                advice = AdviceResponse.model_validate(generated.value)
-                if result.get("metadata", {}).get("review_mode") == "NOT_RUN":
-                    advice = advice.model_copy(
-                        update={
-                            "limitations": list(
-                                dict.fromkeys(
-                                    [
-                                        *advice.limitations,
-                                        "跨资料对应由模型识别，并经过原文证据和程序规则校验，不构成法律判断",
-                                    ]
-                                )
-                            )
+            accepted: dict[str, str] = {}
+            accepted_texts: set[str] = set()
+            advice_quality_counts = empty_advice_quality_counts()
+            advice_specificity_invalid_count = 0
+            multi_sentence_normalized_count = 0
+            unresolved: dict[str, dict[str, Any]] = {}
+            top_level: dict[str, Any] | None = None
+            aggregate_lists: dict[str, list[Any]] = {
+                "priority_actions": [],
+                "manual_review_focus": [],
+                "limitations": [],
+                "evidence_refs": [],
+            }
+            advice_semaphore = asyncio.Semaphore(
+                max(1, self.settings.LLM_EXTRACTION_TASK_CONCURRENCY)
+            )
+
+            async def process_batch(
+                batch: list[dict[str, Any]],
+                *,
+                batch_id: str,
+                missing_retry: bool = False,
+            ) -> None:
+                nonlocal advice_specificity_invalid_count, multi_sentence_normalized_count
+                nonlocal top_level
+                batch_result = {
+                    **result,
+                    "risk_items": batch,
+                    "diff_items": [
+                        diff
+                        for diff in result.get("diff_items", [])
+                        if any(
+                            diff.get("diff_id") in risk.get("related_diff_ids", [])
+                            for risk in batch
+                        )
+                    ],
+                }
+                try:
+                    async with advice_semaphore:
+                        generated = await advice_method(advice_payload(batch_result))
+                    advice = AdviceResponse.model_validate(generated.value)
+                    result["metadata"].setdefault("model_runs", []).append(
+                        {
+                            "purpose": "RISK_ADVICE",
+                            "configured_model": generated.configured_model,
+                            "actual_model": generated.actual_model,
+                            "duration_ms": generated.duration_ms,
+                            "request_attempts": generated.request_attempts,
+                            "structure_retries": generated.structure_retries,
+                            "batch_count": 1,
+                            "batch_id": batch_id,
+                            "risk_count": len(batch),
+                            "status": "SUCCEEDED",
                         }
                     )
-                merge_model_advice(result, advice)
-                result["metadata"].setdefault("model_runs", []).append(
-                    {
-                        "purpose": "RISK_ADVICE",
-                        "configured_model": generated.configured_model,
-                        "actual_model": generated.actual_model,
-                        "duration_ms": generated.duration_ms,
-                        "request_attempts": generated.request_attempts,
-                        "structure_retries": generated.structure_retries,
-                        "status": "SUCCEEDED",
+                except asyncio.CancelledError:
+                    raise
+                except (LlmClientError, ValidationError, ValueError, TimeoutError) as exc:
+                    if len(batch) > 1:
+                        middle = len(batch) // 2
+                        await process_batch(batch[:middle], batch_id=f"{batch_id}.0")
+                        await process_batch(batch[middle:], batch_id=f"{batch_id}.1")
+                        return
+                    unresolved[batch[0]["risk_id"]] = {
+                        "batch_id": batch_id,
+                        "failure_code": (
+                            getattr(exc, "failure_code", None)
+                            or getattr(exc, "code", None)
+                            or type(exc).__name__
+                        ),
                     }
+                    return
+
+                advice_value = advice.model_dump(mode="json")
+                if top_level is None:
+                    top_level = {"overall_advice": advice_value["overall_advice"]}
+                for key in aggregate_lists:
+                    for item in advice_value.get(key, []):
+                        if item not in aggregate_lists[key]:
+                            aggregate_lists[key].append(item)
+
+                expected_ids = {risk["risk_id"] for risk in batch}
+                seen_response_ids: set[str] = set()
+                for item in advice.risk_advices:
+                    if item.risk_id not in expected_ids or item.risk_id in seen_response_ids:
+                        continue
+                    outcome = validate_advice_item(
+                        result,
+                        item,
+                        seen_risk_ids=seen_response_ids,
+                        seen_advice_texts=accepted_texts,
+                        require_dynamic_anchor=True,
+                    )
+                    seen_response_ids.add(item.risk_id)
+                    if outcome.reason_code in ADVICE_QUALITY_CODES:
+                        advice_quality_counts[outcome.reason_code] += 1
+                    if outcome.reason_code == "NOT_SPECIFIC":
+                        advice_specificity_invalid_count += 1
+                    if outcome.normalized_multi_sentence:
+                        multi_sentence_normalized_count += 1
+                    if not outcome.accepted:
+                        continue
+                    accepted[item.risk_id] = outcome.normalized_advice
+                    accepted_texts.add(outcome.normalized_advice)
+                    unresolved.pop(item.risk_id, None)
+
+                missing = [risk for risk in batch if risk["risk_id"] not in accepted]
+                if missing and not missing_retry:
+                    await process_batch(
+                        missing,
+                        batch_id=f"{batch_id}.missing",
+                        missing_retry=True,
+                    )
+                else:
+                    for risk in missing:
+                        unresolved.setdefault(
+                            risk["risk_id"],
+                            {
+                                "batch_id": batch_id,
+                                "failure_code": "ADVICE_ITEM_MISSING_OR_INVALID",
+                            },
+                        )
+
+            initial_batches = [
+                (risks[start : start + 8], f"advice-{batch_index:04d}")
+                for batch_index, start in enumerate(range(0, len(risks), 8), start=1)
+            ]
+            for start in range(0, len(initial_batches), 3):
+                await asyncio.gather(
+                    *(
+                        process_batch(batch, batch_id=batch_id)
+                        for batch, batch_id in initial_batches[start : start + 3]
+                    )
                 )
-            except Exception:
-                # Advice is supplemental and must never invalidate deterministic results.
+
+            for risk in risks:
+                if risk["risk_id"] in accepted:
+                    risk["analysis_advice"] = accepted[risk["risk_id"]]
+            ensure_fallback_risk_advices(result)
+            fallback_count = len(risks) - len(accepted)
+            model_rate = len(accepted) / len(risks)
+            fallback_rate = fallback_count / len(risks)
+            result["metadata"]["advice_coverage"] = {
+                "risk_count": len(risks),
+                "model_count": len(accepted),
+                "fallback_count": fallback_count,
+                "model_rate": round(model_rate, 6),
+                "fallback_rate": round(fallback_rate, 6),
+            }
+            result["metadata"]["advice_validation"] = {
+                "accepted_count": len(accepted),
+                **advice_quality_counts,
+                "not_specific_count": advice_specificity_invalid_count,
+                "multi_sentence_normalized_count": multi_sentence_normalized_count,
+            }
+            if fallback_count:
                 result.setdefault("warnings", []).append(
                     {
                         "code": "LLM_ADVICE_UNAVAILABLE",
-                        "message": "模型建议未完成，已保留确定性分析建议。",
+                        "message": "少量模型建议未完成，已对未覆盖风险使用确定性建议。",
                         "requires_manual_review": False,
                     }
                 )
-                ensure_fallback_risk_advices(result)
+            result["advice"] = {
+                **(top_level or {"overall_advice": "请按证据位置逐项复核风险。"}),
+                **aggregate_lists,
+                "risk_advices": [
+                    {
+                        "risk_id": risk["risk_id"],
+                        "analysis_advice": risk["analysis_advice"],
+                    }
+                    for risk in risks
+                ],
+            }
+            return {"result": result}
+
+        async def page_enrich(state: DraftReviewState) -> dict[str, Any]:
+            result = state["result"]
+            if self.settings.DOCX_PAGE_LOCATION_ENABLED:
+                await self._save_pre_page_result_snapshot(
+                    task_id=state["task_id"],
+                    result=result,
+                    documents=state.get("parsed_documents", []),
+                )
+                await asyncio.to_thread(
+                    apply_docx_page_location_sidecars,
+                    result,
+                    state.get("page_location_sidecars", {}),
+                    strict=True,
+                )
+                page_coverage = await asyncio.to_thread(
+                    validate_public_page_coverage,
+                    result,
+                    state.get("page_location_sidecars", {}),
+                )
+                result.setdefault("metadata", {})["page_location_coverage"] = page_coverage
             return {"result": result}
 
         async def persist_result(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.PERSISTING_RESULT, 97, "正在保存多文档解析结果")
-            result = state["result"]
-            apply_docx_page_location_sidecars(
-                result, state.get("page_location_sidecars", {})
-            )
-            return {"result": result}
+            return {"result": state["result"]}
 
         graph.add_node("download_files", download_files)
         graph.add_node("parse_documents", parse_documents)
@@ -1645,6 +2284,7 @@ class DraftReviewWorkflowExecutor:
         graph.add_node("plan_semantics", plan_semantics)
         graph.add_node("build_result", build_result)
         graph.add_node("generate_advice", generate_advice)
+        graph.add_node("page_enrich", page_enrich)
         graph.add_node("persist_result", persist_result)
         graph.add_edge(START, "download_files")
         graph.add_edge("download_files", "parse_documents")
@@ -1655,12 +2295,10 @@ class DraftReviewWorkflowExecutor:
             graph.add_edge("map_cross_document_facts", "plan_semantics")
             graph.add_edge("plan_semantics", "build_result")
         else:
-            # Delivery mode publishes only independently reviewed mappings and
-            # deterministic fact comparisons. Semantic planning remains
-            # available behind its internal configuration switch.
             graph.add_edge("map_cross_document_facts", "build_result")
         graph.add_edge("build_result", "generate_advice")
-        graph.add_edge("generate_advice", "persist_result")
+        graph.add_edge("generate_advice", "page_enrich")
+        graph.add_edge("page_enrich", "persist_result")
         graph.add_edge("persist_result", END)
         return graph.compile()
 
@@ -1682,6 +2320,166 @@ class DraftReviewWorkflowExecutor:
                 for block in document.blocks[:5]
             ],
         }
+
+    def _build_delivery_result(
+        self,
+        task_id: str,
+        input_files: list[dict[str, Any]],
+        documents: list[ParsedDocument],
+        template_review: TemplateReviewResult,
+        reference_candidates: dict[str, Any],
+        cross_validations: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build the bounded KISS result from parser-owned evidence."""
+
+        if not template_review.diagnostics.comparison.reliable:
+            raise WorkflowError(
+                "COMPARISON_UNRELIABLE",
+                "目标合同与模板的对齐覆盖率不足，未生成正式报告",
+            )
+        options = options or {}
+        input_by_id = {item["file_id"]: item for item in input_files}
+        warnings = [warning.model_dump(mode="json") for warning in template_review.warnings]
+        warnings.extend(
+            warning.model_dump(mode="json")
+            for document in documents
+            for warning in document.warnings
+        )
+        warnings.extend(reference_candidates.get("warnings", []))
+        warnings.extend(cross_validations.get("warnings", []))
+        files: list[dict[str, Any]] = []
+        for document in documents:
+            files.append(
+                {
+                    "file_id": document.file_id,
+                    "role": document.role,
+                    "file_name": document.file_name,
+                    "safe_url": input_by_id[document.file_id]["safe_url"],
+                    "sha256": document.sha256,
+                    "page_count": document.page_count,
+                    "parser_name": document.parser_name,
+                    "parse_status": self._parse_status(document),
+                    "parse_warnings": [
+                        warning.model_dump(mode="json") for warning in document.warnings
+                    ],
+                    "parser_metadata": document.parser_metadata,
+                    "document_profile": {
+                        "document_kind": "UNKNOWN",
+                        "title": None,
+                        "confidence": 0.0,
+                        "generated_by": "NOT_RUN",
+                        "evidence_locations": [],
+                    },
+                    "content_structure": self._content_structure(document),
+                }
+            )
+
+        cross = group_decision_to_results(
+            reference_candidates.get("groups", []),
+            cross_validations.get("decisions", {}),
+        )
+        template_diffs = [item.model_dump(mode="json") for item in template_review.diff_items]
+        cross_diffs = [item.model_dump(mode="json") for item in cross["diff_items"]]
+        risk_items = build_risk_items(
+            template_review.diff_items,
+            module_code="TEMPLATE_INTEGRITY",
+            failed_rules=template_review.failed_rule_checks,
+        )
+        risk_items.extend(
+            build_risk_items(cross["diff_items"], module_code="FACT_CONSISTENCY")
+        )
+        comparison_documents = [
+            document for document in documents if document.role in {"TARGET", "TEMPLATE"}
+        ]
+        passed_checks = build_comparison_passed_checks(
+            comparison_documents,
+            template_review.diff_items,
+            template_review.diagnostics.comparison,
+            check_prefix="check_template",
+            module_code="TEMPLATE_INTEGRITY",
+            content_title="模板固定内容未发现变化",
+            numeric_sensitive=True,
+        )
+        if options.get("check_blank_fields", True) and not template_review.failed_rule_checks:
+            passed_checks.append(
+                {
+                    "check_id": "check_required_fields",
+                    "module_code": "TEMPLATE_COMPLETENESS",
+                    "title": "未发现明确漏填标记",
+                    "description": "已执行占位符、空白线和基础表格必填检查。",
+                }
+            )
+        if options.get("check_numeric_consistency", True):
+            passed_checks.extend(cross["passed_checks"])
+        model_runs = list(cross_validations.get("model_runs", []))
+        result = {
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "task_id": task_id,
+            "task_type": TaskType.DRAFT_REVIEW.value,
+            "conclusion": "RISK_FOUND" if risk_items else "PASS",
+            "summary": {
+                "title": "起草合同模板和跨资料检查结果",
+                "description": (
+                    f"已完成 {len(files)} 份文件检查，确认 {len(risk_items)} 项风险，"
+                    f"{len(passed_checks)} 项校验通过。"
+                ),
+                "statistics": build_statistics(risk_items, [], passed_checks),
+            },
+            "files": files,
+            "risk_items": risk_items,
+            "review_items": [],
+            "passed_checks": passed_checks,
+            "diff_items": [*template_diffs, *cross_diffs],
+            "fact_matrix": cross["fact_matrix"],
+            "rule_checks": list(template_review.rule_checks),
+            "warnings": warnings,
+            "advice": {
+                "overall_advice": "请按证据位置复核模板差异和跨资料对应内容。",
+                "priority_actions": ["核对固定条款、金额期限及辅助资料对应关系"],
+                "manual_review_focus": ["模板差异、填写完整性和跨资料冲突"],
+                "limitations": [
+                    "跨资料候选由程序检索并由模型进行有限判断；未处理候选不会生成通过结论。"
+                ],
+                "risk_advices": [],
+            },
+            "metadata": {
+                "execution_mode": "HYBRID" if model_runs else "RULE_BASED",
+                "workflow_version": DRAFT_REVIEW_WORKFLOW_VERSION,
+                "rules_version": DRAFT_REVIEW_RULES_VERSION,
+                "primary_model": next(
+                    (
+                        run.get("actual_model") or run.get("configured_model")
+                        for run in model_runs
+                        if run.get("status") == "SUCCEEDED"
+                    ),
+                    None,
+                ),
+                "model_runs": model_runs,
+                "independent_review": False,
+                "review_mode": "NOT_RUN",
+                "comparison_diagnostics": template_review.diagnostics.comparison.model_dump(
+                    mode="json"
+                ),
+                "template_diagnostics": template_review.diagnostics.model_dump(mode="json"),
+                "cross_candidate_stats": {
+                    key: value
+                    for key, value in reference_candidates.items()
+                    if key != "groups" and key != "warnings"
+                },
+            },
+            "mock": False,
+        }
+        ensure_fallback_risk_advices(result)
+        result["advice"]["risk_advices"] = [
+            {
+                "risk_id": risk["risk_id"],
+                "analysis_advice": risk["analysis_advice"],
+            }
+            for risk in result.get("risk_items", [])
+            if risk.get("analysis_advice")
+        ]
+        return result
 
     def _build_result(
         self,
@@ -1772,6 +2570,10 @@ class DraftReviewWorkflowExecutor:
         mapping_records: list[dict[str, Any]] = []
         required_missing: set[tuple[str, str]] = set()
         uncertain_reference_file_ids: set[str] = set()
+        low_confidence_reference_file_ids: set[str] = set()
+        non_low_confidence_uncertain_reference_file_ids: set[str] = set()
+        accepted_mapping_count = 0
+        dropped_low_confidence_count = 0
         model_runs: list[dict[str, Any]] = []
         diagnostic_review_items: list[dict[str, Any]] = []
         diagnostic_mode = bool(
@@ -2037,12 +2839,12 @@ class DraftReviewWorkflowExecutor:
                                 "映射引用了无法回查的事实，未生成正式报告",
                             )
                         if proposal.confidence < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE:
-                            raise WorkflowError(
-                                "DYNAMIC_CHECK_INCOMPLETE",
-                                "映射结果置信度不足，未生成正式报告",
-                                details={"failure_code": "MAPPING_CONFIDENCE_INVALID"},
-                            )
+                            dropped_low_confidence_count += 1
+                            low_confidence_reference_file_ids.add(document.file_id)
+                            uncertain_reference_file_ids.add(document.file_id)
+                            continue
                         if proposal.decision == "MATCH":
+                            accepted_mapping_count += 1
                             mapping_records.append(
                                 {
                                     **proposal.model_dump(mode="json"),
@@ -2063,11 +2865,10 @@ class DraftReviewWorkflowExecutor:
                                 "缺失要求引用了无法回查的目标事实，未生成正式报告",
                             )
                         if requirement.confidence < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE:
-                            raise WorkflowError(
-                                "DYNAMIC_CHECK_INCOMPLETE",
-                                "缺失要求置信度不足，未生成正式报告",
-                                details={"failure_code": "MAPPING_CONFIDENCE_INVALID"},
-                            )
+                            dropped_low_confidence_count += 1
+                            low_confidence_reference_file_ids.add(document.file_id)
+                            uncertain_reference_file_ids.add(document.file_id)
+                            continue
                         required_missing.add(
                             (requirement.target_fact_id, document.file_id)
                         )
@@ -2120,6 +2921,7 @@ class DraftReviewWorkflowExecutor:
                             and review_obj.evidence_complete
                         )
                         if accepted:
+                            accepted_mapping_count += 1
                             mapping_records.append(
                                 {
                                     **proposal.model_dump(mode="json"),
@@ -2128,6 +2930,22 @@ class DraftReviewWorkflowExecutor:
                             )
                         else:
                             uncertain_reference_file_ids.add(document.file_id)
+                            if (
+                                proposal.confidence < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                                or (
+                                    decision is not None
+                                    and decision.confidence
+                                    < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                                )
+                                or review_obj.confidence
+                                < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                            ):
+                                dropped_low_confidence_count += 1
+                                low_confidence_reference_file_ids.add(document.file_id)
+                            else:
+                                non_low_confidence_uncertain_reference_file_ids.add(
+                                    document.file_id
+                                )
                     requirement_decisions = {
                         decision.target_fact_id: decision
                         for decision in review_obj.missing_requirement_decisions
@@ -2155,8 +2973,23 @@ class DraftReviewWorkflowExecutor:
                             )
                         elif decision is not None:
                             uncertain_reference_file_ids.add(document.file_id)
+                            if (
+                                requirement.confidence
+                                < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                                or decision.confidence
+                                < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                                or review_obj.confidence
+                                < self.settings.LLM_CONSENSUS_MIN_CONFIDENCE
+                            ):
+                                dropped_low_confidence_count += 1
+                                low_confidence_reference_file_ids.add(document.file_id)
+                            else:
+                                non_low_confidence_uncertain_reference_file_ids.add(
+                                    document.file_id
+                                )
                 else:
                     uncertain_reference_file_ids.add(document.file_id)
+                    non_low_confidence_uncertain_reference_file_ids.add(document.file_id)
                 model_runs.append(
                     {
                         "file_id": document.file_id,
@@ -2255,11 +3088,14 @@ class DraftReviewWorkflowExecutor:
                                 "目标事实与辅助资料事实的业务对应关系"
                                 "无法由模型可靠确认。"
                             ),
-                            "source_evidence": [target_evidence, {
-                                "file_id": source_file_id,
-                                "text": candidate.get("evidence_text"),
-                                "location": candidate.get("location"),
-                            }],
+                            "source_evidence": [
+                                target_evidence,
+                                {
+                                    "file_id": source_file_id,
+                                    "text": candidate.get("evidence_text"),
+                                    "location": candidate.get("location"),
+                                },
+                            ],
                             "related_diff_ids": [],
                             "related_rule_ids": [],
                             "requires_manual_action": True,
@@ -2355,6 +3191,12 @@ class DraftReviewWorkflowExecutor:
                 if (
                     reference_file_id in mapping_skipped_reference_file_ids
                     and not diagnostic_mode
+                ):
+                    continue
+                if (
+                    reference_file_id in low_confidence_reference_file_ids
+                    and reference_file_id
+                    not in non_low_confidence_uncertain_reference_file_ids
                 ):
                     continue
                 fact_reviews.append(
@@ -2713,6 +3555,10 @@ class DraftReviewWorkflowExecutor:
                     else "NOT_RUN"
                 ),
                 "reviewed_files": sorted(strict_review_files),
+                "mapping_diagnostics": {
+                    "accepted_mapping_count": accepted_mapping_count,
+                    "dropped_low_confidence_count": dropped_low_confidence_count,
+                },
                 "semantic_concepts": public_semantic_concepts,
                 "validation_specs": public_validation_specs,
                 "comparison_diagnostics": template_review.diagnostics.comparison.model_dump(

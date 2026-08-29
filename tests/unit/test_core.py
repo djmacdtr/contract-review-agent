@@ -27,8 +27,9 @@ def test_llm_configuration_defaults() -> None:
     settings = Settings(_env_file=None, DATABASE_URL="postgresql+asyncpg://x:x@db/test")
     assert Settings.model_fields["MAX_REFERENCE_FILES"].default == 20
     assert settings.LLM_ENABLED is False
-    assert settings.LLM_EXTRACTION_MODEL == "GLM-5.2"
-    assert settings.LLM_ADVICE_MODEL == "GLM-5.2"
+    assert settings.LLM_EXTRACTION_MODEL == "GLM-5.3-Flash"
+    assert settings.LLM_REVIEW_MODEL == "GLM-5.3-Flash"
+    assert settings.LLM_ADVICE_MODEL == "GLM-5.3-Flash"
     assert settings.LLM_ENABLE_EMBEDDING is False
     assert settings.LLM_ENABLE_RERANK is False
     assert settings.LLM_REVIEW_BATCH_MAX_CHARS == 8000
@@ -115,3 +116,22 @@ def test_docx_page_location_uses_external_parser_configuration() -> None:
         OCR_AUTH_HEADER="x-api-key",
     )
     assert enabled.document_parser_configured is True
+
+
+def test_worker_stale_window_exceeds_longest_enabled_operation() -> None:
+    settings = Settings(
+        _env_file=None,
+        WORKER_STALE_AFTER_SECONDS=120,
+        WORKER_HEARTBEAT_INTERVAL_SECONDS=15,
+        LLM_ENABLED=True,
+        LLM_BASE_URL="https://llm.invalid",
+        LLM_API_KEY="unused",
+        LLM_TIMEOUT_SECONDS=300,
+        DOCX_PAGE_LOCATION_ENABLED=True,
+        OCR_BASE_URL="https://ocr.invalid",
+        OCR_API_KEY="unused",
+        OCR_AUTH_HEADER="x-api-key",
+        OCR_TIMEOUT_SECONDS=600,
+    )
+
+    assert settings.effective_worker_stale_after_seconds == 630

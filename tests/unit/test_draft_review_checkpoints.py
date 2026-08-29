@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 
 from app.adapters.llm.base import LlmResult
@@ -8,6 +11,10 @@ from app.draft_review.checkpoints import (
     InMemoryExtractionCheckpointStore,
 )
 from app.draft_review.extraction import extract_documents_with_map_reduce
+from app.workflows.draft_review import (
+    PRE_PAGE_RESULT_SNAPSHOT_VERSION,
+    DraftReviewWorkflowExecutor,
+)
 
 
 @pytest.mark.asyncio
@@ -163,3 +170,61 @@ async def test_map_reduce_reuses_succeeded_batch_checkpoint() -> None:
 
     assert first_llm.batch_calls == 1
     assert second_llm.batch_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_pre_page_result_snapshot_is_content_addressed_and_page_free() -> None:
+    store = InMemoryExtractionCheckpointStore()
+    executor = DraftReviewWorkflowExecutor(
+        Settings(_env_file=None),
+        checkpoint_store=store,
+    )
+    result = {
+        "files": [{"file_id": "fil_page_snapshot"}],
+        "risk_items": [],
+        "diff_items": [],
+    }
+    document = ParsedDocument(
+        file_id="fil_page_snapshot",
+        role="TARGET",
+        file_name="target.docx",
+        sha256="a" * 64,
+        page_count=4,
+        parser_name="fixture",
+        blocks=[],
+    )
+
+    await executor._save_pre_page_result_snapshot(
+        task_id="task_page_snapshot",
+        result=result,
+        documents=[document],
+    )
+
+    identity = {
+        "version": PRE_PAGE_RESULT_SNAPSHOT_VERSION,
+        "file_sha256": "a" * 64,
+        "result": result,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    checkpoint = await store.load(
+        f"page_result_{digest[:32]}",
+        task_id="task_page_snapshot",
+        file_sha256="a" * 64,
+        extraction_version=PRE_PAGE_RESULT_SNAPSHOT_VERSION,
+        payload_digest=digest,
+    )
+
+    assert checkpoint is not None
+    assert checkpoint.value == {
+        "file_id": "fil_page_snapshot",
+        "result": result,
+    }
+    result["files"][0]["page_count"] = 99
+    assert checkpoint.value["result"]["files"][0].get("page_count") is None

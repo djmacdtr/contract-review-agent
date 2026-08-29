@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from typing import Any
+from dataclasses import replace
+from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -41,10 +43,42 @@ from app.draft_review.facts import (
     expand_numeric_candidate_response,
     expand_text_fact_response,
     location_key,
+    numeric_candidate_indexes,
 )
 
 JsonValidator = Callable[[Any], dict[str, Any]]
 Sleeper = Callable[[float], Awaitable[None]]
+ResponseFormat = Literal["prompt_only", "json_object", "json_schema"]
+
+_HTTP_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_HTTP_MAX_RETRIES = 4
+_HTTP_TIMEOUT_MAX_ATTEMPTS = 2
+_HTTP_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+
+_PROFILE_MAX_OUTPUT_TOKENS = 2048
+_TEXT_MAX_OUTPUT_TOKENS = 8192
+_MAPPING_MAX_OUTPUT_TOKENS = 12288
+_ADVICE_MAX_OUTPUT_TOKENS = 8192
+
+
+def _numeric_max_output_tokens(payload: dict[str, Any]) -> int:
+    """Keep numeric wire requests proportional to their candidate count."""
+
+    candidate_count = len(payload.get("numeric_candidates", []))
+    return min(8192, max(2048, 512 + candidate_count * 256))
+
+
+def _safe_usage_summary(value: Any) -> dict[str, int]:
+    """Keep only aggregate token counters from a provider usage object."""
+
+    if not isinstance(value, dict):
+        return {}
+    allowed = {"prompt_tokens", "completion_tokens", "total_tokens"}
+    return {
+        key: int(item)
+        for key, item in value.items()
+        if key in allowed and type(item) is int and item >= 0
+    }
 
 EXTRACTION_SYSTEM_PROMPT = (
     "你是合同事实抽取器。只返回一个 JSON 对象，不要 Markdown。"
@@ -80,6 +114,7 @@ FACT_BATCH_SYSTEM_PROMPT = (
 NUMERIC_CANDIDATE_SYSTEM_PROMPT = (
     "你是开放式合同数值候选分类器。只返回 JSON 对象，不要 Markdown。"
     "逐项处理输入 numeric_candidates，每个 candidate_index 必须恰好返回一次。"
+    "candidate_index 是必填整数，只能使用本批输入中实际给出的候选索引。"
     "只返回 semantic_key、display_name、value_type、decision、reason_code、confidence。"
     "不得返回原值、证据、位置、文件身份或任何未要求字段。"
     "不得使用固定合同类型或字段清单；无法可靠识别业务价值时返回 IGNORE。"
@@ -89,13 +124,15 @@ TEXT_FACT_SYSTEM_PROMPT = (
     "你是开放式合同非数值事实抽取器。只返回 JSON 对象，不要 Markdown。"
     "逐个扫描输入 units，事实只能引用输入中的候选 unit_id。quote 必须是该 unit 原文的精确子串。"
     "readonly_context 仅用于理解标题、字段标签和表头，绝不能作为事实来源或 quote 来源。"
-    "只返回 unit_id、semantic_key、display_name、value_type、quote、confidence。"
+    "只返回 has_more，以及 unit_id、semantic_key、display_name、value_type、quote、confidence。"
     "数值、日期和标识类事实由 numeric-v2 处理；本链只返回 TEXT、ENTITY 或 UNKNOWN。"
     "不得返回文件身份、位置、证据副本、稳定事实 ID 或原文外的推测。"
-    "没有可可靠识别的非数值事实时，必须返回 JSON {\"items\":[]}，不得返回解释、拒绝语或自然语言。"
-    "无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {\"items\":[]}，不得猜测或改写。"
-    "一次最多返回输入 requirements.max_items 指定的项目数；如果可能还有更多事实，"
-    "不要遗漏，程序会继续拆分。"
+    "没有可可靠识别的非数值事实时，必须返回 JSON {\"items\":[],\"has_more\":false}，"
+    "不得返回解释、拒绝语或自然语言。"
+    "无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {\"items\":[],\"has_more\":false}，"
+    "不得猜测或改写。"
+    "一次最多返回输入 requirements.max_items 指定的项目数；如果仍有更多可靠事实，"
+    "返回 has_more=true；如果本批事实已经完整，即使恰好达到上限也返回 has_more=false。"
     "严格遵守 TextFactExtraction。"
 )
 SEMANTIC_PLAN_SYSTEM_PROMPT = (
@@ -147,6 +184,13 @@ class LlmClientError(Exception):
         request_attempts: int = 0,
         structure_retries: int = 0,
         finish_reason: str | None = None,
+        content_chars: int | None = None,
+        code_fence: bool | None = None,
+        json_error_position: int | None = None,
+        reasoning_content_chars: int | None = None,
+        usage: dict[str, int] | None = None,
+        max_tokens: int | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.code = code
@@ -158,6 +202,13 @@ class LlmClientError(Exception):
         self.request_attempts = request_attempts
         self.structure_retries = structure_retries
         self.finish_reason = finish_reason
+        self.content_chars = content_chars
+        self.code_fence = code_fence
+        self.json_error_position = json_error_position
+        self.reasoning_content_chars = reasoning_content_chars
+        self.usage = usage
+        self.max_tokens = max_tokens
+        self.http_status = http_status
 
 
 def completion_body(
@@ -171,6 +222,7 @@ def completion_body(
     correction: bool = False,
     correction_message: str | None = None,
     response_schema: dict[str, Any] | None = None,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     schema_definition = response_schema or schema.model_json_schema()
     schema_json = json.dumps(schema_definition, ensure_ascii=False, separators=(",", ":"))
@@ -199,6 +251,8 @@ def completion_body(
         "temperature": 0,
         "max_tokens": max_tokens,
     }
+    if disable_thinking:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     if response_format == "json_schema":
         body["response_format"] = {
             "type": "json_schema",
@@ -226,7 +280,12 @@ def _json_object(content: str) -> dict[str, Any]:
     try:
         value = json.loads(stripped)
     except json.JSONDecodeError as exc:
-        raise LlmClientError("LLM_INVALID_JSON", "模型未返回有效 JSON") from exc
+        error = LlmClientError(
+            "LLM_INVALID_JSON",
+            "模型未返回有效 JSON",
+            json_error_position=exc.pos,
+        )
+        raise error from exc
     if not isinstance(value, dict):
         raise LlmClientError("LLM_INVALID_JSON", "模型返回值不是 JSON 对象")
     return value
@@ -362,6 +421,7 @@ def _validate_fact_batch(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_numeric_candidates(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    index_summary = _numeric_candidate_response_summary(value, payload)
     try:
         response = NumericCandidateExtraction.model_validate(value)
         expand_numeric_candidate_response(payload, response)
@@ -374,9 +434,13 @@ def _validate_numeric_candidates(value: Any, payload: dict[str, Any]) -> dict[st
                 "不要输出原值、位置或证据。"
             ),
             failure_code=exc.code,
+            validation_summary=index_summary,
         ) from exc
     except ValidationError as exc:
-        summary = _safe_validation_summary(exc)
+        summary = {
+            **index_summary,
+            "schema_error_summary": _safe_validation_summary(exc),
+        }
         raise LlmClientError(
             "LLM_SCHEMA_INVALID",
             "模型数值候选结果不符合结构约束",
@@ -431,7 +495,76 @@ def _text_fact_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
     items_schema = schema.get("properties", {}).get("items")
     if isinstance(items_schema, dict):
         items_schema["maxItems"] = max_items
+    schema["required"] = ["items", "has_more"]
     return schema
+
+
+def _numeric_candidate_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    """Require one wire decision for every candidate in this exact batch."""
+
+    candidates = payload.get("numeric_candidates", [])
+    candidate_count = len(candidates) if isinstance(candidates, list) else 0
+    if candidate_count == 0:
+        raise ValueError("numeric candidate response schema requires at least one candidate")
+    expected_indices = numeric_candidate_indexes(payload)
+    schema = NumericCandidateExtraction.model_json_schema()
+    items_schema = schema.get("properties", {}).get("items")
+    if isinstance(items_schema, dict):
+        items_schema["minItems"] = candidate_count
+        items_schema["maxItems"] = candidate_count
+    item_definition = schema.get("$defs", {}).get("NumericCandidateItem")
+    if isinstance(item_definition, dict):
+        properties = item_definition.get("properties")
+        if isinstance(properties, dict):
+            wire_properties = {
+                key: properties[key]
+                for key in (
+                    "candidate_index",
+                    "semantic_key",
+                    "display_name",
+                    "value_type",
+                    "decision",
+                    "reason_code",
+                    "confidence",
+                )
+                if key in properties
+            }
+            wire_properties["candidate_index"] = {
+                "type": "integer",
+                "enum": expected_indices,
+            }
+            item_definition["properties"] = wire_properties
+            item_definition["required"] = list(wire_properties)
+    return schema
+
+
+def _numeric_candidate_response_summary(
+    value: Any, payload: dict[str, Any]
+) -> dict[str, int]:
+    """Return only count/index diagnostics for a numeric response."""
+
+    candidates = payload.get("numeric_candidates", [])
+    expected_count = len(candidates) if isinstance(candidates, list) else 0
+    expected_indices = set(numeric_candidate_indexes(payload))
+    items = value.get("items") if isinstance(value, dict) else None
+    returned_items = items if isinstance(items, list) else []
+    valid_indices: list[int] = []
+    invalid_index_count = 0
+    for item in returned_items:
+        index = item.get("candidate_index") if isinstance(item, dict) else None
+        if type(index) is not int or index not in expected_indices:
+            invalid_index_count += 1
+            continue
+        valid_indices.append(index)
+    duplicate_index_count = len(valid_indices) - len(set(valid_indices))
+    missing_index_count = len(expected_indices - set(valid_indices))
+    return {
+        "expected_count": expected_count,
+        "returned_count": len(returned_items),
+        "missing_index_count": missing_index_count,
+        "duplicate_index_count": duplicate_index_count,
+        "invalid_index_count": invalid_index_count,
+    }
 
 
 def _text_evidence_correction_message(failure_code: str | None) -> str:
@@ -905,12 +1038,39 @@ class OpenAIContractLlmClient:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         sleeper: Sleeper = asyncio.sleep,
+        text_response_format_override: ResponseFormat | None = None,
+        text_model_override: str | None = None,
+        numeric_model_override: str | None = None,
+        advice_response_format_override: ResponseFormat | None = None,
     ) -> None:
         if not settings.LLM_BASE_URL.strip() or not settings.LLM_API_KEY.strip():
             raise ValueError("LLM base URL and API key are required")
+        if text_response_format_override is not None and text_response_format_override not in {
+            "prompt_only",
+            "json_object",
+            "json_schema",
+        }:
+            raise ValueError("unsupported Text response format override")
+        if text_model_override is not None and not text_model_override.strip():
+            raise ValueError("Text model override must not be empty")
+        if numeric_model_override is not None and not numeric_model_override.strip():
+            raise ValueError("Numeric model override must not be empty")
+        if advice_response_format_override is not None and advice_response_format_override not in {
+            "prompt_only",
+            "json_object",
+            "json_schema",
+        }:
+            raise ValueError("unsupported Advice response format override")
         self.settings = settings
         self.transport = transport
         self.sleeper = sleeper
+        self.text_response_format_override = text_response_format_override
+        self.text_model_override = text_model_override
+        self.numeric_model_override = numeric_model_override
+        self.advice_response_format_override = advice_response_format_override
+        self._request_semaphore = asyncio.Semaphore(
+            max(1, settings.LLM_MAX_CONCURRENCY)
+        )
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -920,16 +1080,17 @@ class OpenAIContractLlmClient:
         }
 
     async def probe_models(self) -> list[str]:
-        async with httpx.AsyncClient(
-            transport=self.transport,
-            timeout=self.settings.LLM_TIMEOUT_SECONDS,
-            trust_env=False,
-        ) as client:
-            response = await self._request(
-                client,
-                "GET",
-                _endpoint(self.settings.LLM_BASE_URL, "models"),
-            )
+        async with self._request_semaphore:
+            async with httpx.AsyncClient(
+                transport=self.transport,
+                timeout=self.settings.LLM_TIMEOUT_SECONDS,
+                trust_env=False,
+            ) as client:
+                response = await self._request(
+                    client,
+                    "GET",
+                    _endpoint(self.settings.LLM_BASE_URL, "models"),
+                )
         data = response.json().get("data") if isinstance(response.json(), dict) else None
         if not isinstance(data, list):
             raise LlmClientError("LLM_RESPONSE_INVALID", "模型列表响应格式无效")
@@ -943,6 +1104,7 @@ class OpenAIContractLlmClient:
             validator=lambda value: _validate_document_overview(value, payload),
             schema=CompactDocumentOverview,
             max_structure_retries=1,
+            max_output_tokens=_PROFILE_MAX_OUTPUT_TOKENS,
         )
 
     async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult:
@@ -953,34 +1115,83 @@ class OpenAIContractLlmClient:
             validator=lambda value: _validate_fact_batch(value, payload),
             schema=CompactFactBatchExtraction,
             max_structure_retries=1,
+            max_output_tokens=_numeric_max_output_tokens(payload),
         )
 
     async def extract_numeric_candidates(
         self, payload: dict[str, Any], *, allow_structure_correction: bool = True
     ) -> LlmResult:
-        return await self._structured_completion(
-            model=self.settings.LLM_EXTRACTION_MODEL,
-            system=NUMERIC_CANDIDATE_SYSTEM_PROMPT,
-            payload=payload,
-            validator=lambda value: _validate_numeric_candidates(value, payload),
-            schema=NumericCandidateExtraction,
-            max_structure_retries=1 if allow_structure_correction else 0,
-            invalid_json_structure_correction=False,
-        )
+        candidates = payload.get("numeric_candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return LlmResult(
+                value={"items": []},
+                configured_model=(
+                    self.numeric_model_override or self.settings.LLM_EXTRACTION_MODEL
+                ),
+                actual_model=None,
+                mock=True,
+                duration_ms=0,
+                request_attempts=0,
+                structure_retries=0,
+                finish_reason=None,
+                response_format=self._response_format(),
+            )
+        model = self.numeric_model_override or self.settings.LLM_EXTRACTION_MODEL
+        try:
+            return await self._structured_completion(
+                model=model,
+                system=NUMERIC_CANDIDATE_SYSTEM_PROMPT,
+                payload=payload,
+                validator=lambda value: _validate_numeric_candidates(value, payload),
+                schema=NumericCandidateExtraction,
+                response_schema=_numeric_candidate_response_schema(payload),
+                max_structure_retries=1 if allow_structure_correction else 0,
+                invalid_json_structure_correction=False,
+                max_output_tokens=_numeric_max_output_tokens(payload),
+                disable_thinking=True,
+            )
+        except LlmClientError as first_error:
+            # Some gateways reject chat_template_kwargs.  Only a singleton
+            # Numeric request may use the explicit compatibility fallback;
+            # all other failures retain their original error and retry policy.
+            if len(candidates) != 1 or first_error.http_status != 400:
+                raise
+            try:
+                result = await self._structured_completion(
+                    model=model,
+                    system=NUMERIC_CANDIDATE_SYSTEM_PROMPT,
+                    payload=payload,
+                    validator=lambda value: _validate_numeric_candidates(value, payload),
+                    schema=NumericCandidateExtraction,
+                    response_schema=_numeric_candidate_response_schema(payload),
+                    max_structure_retries=1 if allow_structure_correction else 0,
+                    invalid_json_structure_correction=False,
+                    max_output_tokens=8192,
+                    disable_thinking=False,
+                )
+            except LlmClientError as fallback_error:
+                fallback_error.request_attempts += first_error.request_attempts
+                raise
+            return replace(
+                result,
+                request_attempts=result.request_attempts + first_error.request_attempts,
+            )
 
     async def extract_text_facts(
         self, payload: dict[str, Any], *, allow_structure_correction: bool = True
     ) -> LlmResult:
         return await self._structured_completion(
-            model=self.settings.LLM_EXTRACTION_MODEL,
+            model=self.text_model_override or self.settings.LLM_EXTRACTION_MODEL,
             system=TEXT_FACT_SYSTEM_PROMPT,
             payload=payload,
             validator=lambda value: _validate_text_facts(value, payload),
             schema=TextFactExtraction,
             response_schema=_text_fact_response_schema(payload),
+            response_format_override=self.text_response_format_override,
             max_structure_retries=1 if allow_structure_correction else 0,
             allow_evidence_correction=allow_structure_correction,
             invalid_json_structure_correction=False,
+            max_output_tokens=_TEXT_MAX_OUTPUT_TOKENS,
         )
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
@@ -1032,6 +1243,7 @@ class OpenAIContractLlmClient:
             payload=payload,
             validator=_validate_mapping,
             schema=FactMappingResponse,
+            max_output_tokens=_MAPPING_MAX_OUTPUT_TOKENS,
         )
 
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult:
@@ -1041,6 +1253,7 @@ class OpenAIContractLlmClient:
             payload=payload,
             validator=_validate_mapping_review,
             schema=FactMappingReview,
+            max_output_tokens=_MAPPING_MAX_OUTPUT_TOKENS,
         )
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
@@ -1050,6 +1263,8 @@ class OpenAIContractLlmClient:
             payload=payload,
             validator=_validate_advice,
             schema=AdviceResponse,
+            response_format_override=self.advice_response_format_override,
+            max_output_tokens=_ADVICE_MAX_OUTPUT_TOKENS,
         )
 
     async def _structured_completion(
@@ -1061,10 +1276,47 @@ class OpenAIContractLlmClient:
         validator: JsonValidator,
         schema: type[BaseModel],
         response_schema: dict[str, Any] | None = None,
+        response_format_override: ResponseFormat | None = None,
         max_structure_retries: int | None = None,
+        max_output_tokens: int | None = None,
         allow_structure_correction: bool = True,
         allow_evidence_correction: bool = True,
         invalid_json_structure_correction: bool = True,
+        disable_thinking: bool = False,
+    ) -> LlmResult:
+        async with self._request_semaphore:
+            return await self._structured_completion_unbounded(
+                model=model,
+                system=system,
+                payload=payload,
+                validator=validator,
+                schema=schema,
+                response_schema=response_schema,
+                response_format_override=response_format_override,
+                max_structure_retries=max_structure_retries,
+                max_output_tokens=max_output_tokens,
+                allow_structure_correction=allow_structure_correction,
+                allow_evidence_correction=allow_evidence_correction,
+                invalid_json_structure_correction=invalid_json_structure_correction,
+                disable_thinking=disable_thinking,
+            )
+
+    async def _structured_completion_unbounded(
+        self,
+        *,
+        model: str,
+        system: str,
+        payload: dict[str, Any],
+        validator: JsonValidator,
+        schema: type[BaseModel],
+        response_schema: dict[str, Any] | None = None,
+        response_format_override: ResponseFormat | None = None,
+        max_structure_retries: int | None = None,
+        max_output_tokens: int | None = None,
+        allow_structure_correction: bool = True,
+        allow_evidence_correction: bool = True,
+        invalid_json_structure_correction: bool = True,
+        disable_thinking: bool = False,
     ) -> LlmResult:
         started = time.perf_counter()
         request_attempts = 0
@@ -1082,19 +1334,24 @@ class OpenAIContractLlmClient:
             if not allow_structure_correction:
                 retry_limit = 0
             for structure_attempt in range(retry_limit + 1):
-                response_format = self._response_format()
+                response_format = response_format_override or self._response_format()
                 body = completion_body(
                     model=model,
                     system=system,
                     payload=payload,
                     schema=schema,
-                    max_tokens=self.settings.LLM_MAX_OUTPUT_TOKENS,
+                    max_tokens=(
+                        max_output_tokens
+                        if max_output_tokens is not None
+                        else self.settings.LLM_MAX_OUTPUT_TOKENS
+                    ),
                     response_format=response_format,
                     correction=bool(structure_attempt),
                     correction_message=(
                         last_error.correction_message if last_error is not None else None
                     ),
                     response_schema=response_schema,
+                    disable_thinking=disable_thinking,
                 )
                 try:
                     response, attempts = await self._request_with_count(
@@ -1112,16 +1369,58 @@ class OpenAIContractLlmClient:
                     response_body = response.json()
                     choice = response_body["choices"][0]
                     finish_reason = choice.get("finish_reason")
+                    message = choice.get("message")
+                    if not isinstance(message, dict):
+                        raise LlmClientError(
+                            "LLM_RESPONSE_INVALID", "模型响应缺少消息对象"
+                        )
+                    content = message.get("content")
+                    reasoning_content = message.get("reasoning_content")
+                    content_chars = len(content) if isinstance(content, str) else 0
+                    reasoning_content_chars = (
+                        len(reasoning_content)
+                        if isinstance(reasoning_content, str)
+                        else 0
+                    )
+                    usage = _safe_usage_summary(response_body.get("usage"))
+                    actual_max_tokens = (
+                        max_output_tokens
+                        if max_output_tokens is not None
+                        else self.settings.LLM_MAX_OUTPUT_TOKENS
+                    )
+                    code_fence = isinstance(content, str) and "```" in content
                     if finish_reason == "length":
                         raise LlmClientError(
                             "LLM_OUTPUT_TRUNCATED",
                             "模型输出达到长度上限",
                             finish_reason="length",
+                            content_chars=content_chars,
+                            code_fence=code_fence,
+                            reasoning_content_chars=reasoning_content_chars,
+                            usage=usage,
+                            max_tokens=actual_max_tokens,
                         )
-                    content = choice["message"]["content"]
                     if not isinstance(content, str):
-                        raise LlmClientError("LLM_RESPONSE_INVALID", "模型响应缺少文本内容")
-                    value = validator(_json_object(content))
+                        raise LlmClientError(
+                            "LLM_RESPONSE_INVALID",
+                            "模型响应缺少文本内容",
+                            content_chars=content_chars,
+                            code_fence=code_fence,
+                            reasoning_content_chars=reasoning_content_chars,
+                            usage=usage,
+                            max_tokens=actual_max_tokens,
+                        )
+                    try:
+                        value = validator(_json_object(content))
+                    except LlmClientError as exc:
+                        exc.content_chars = content_chars
+                        exc.code_fence = code_fence
+                        exc.reasoning_content_chars = reasoning_content_chars
+                        exc.usage = usage
+                        exc.max_tokens = actual_max_tokens
+                        if exc.finish_reason is None:
+                            exc.finish_reason = finish_reason
+                        raise
                     return LlmResult(
                         value=value,
                         configured_model=model,
@@ -1132,6 +1431,14 @@ class OpenAIContractLlmClient:
                         structure_retries=structure_attempt,
                         finish_reason=finish_reason,
                         response_format=response_format,
+                        response_metadata={
+                            "content_chars": content_chars,
+                            "code_fence": code_fence,
+                            "json_error_position": None,
+                            "reasoning_content_chars": reasoning_content_chars,
+                            "usage": usage,
+                            "max_tokens": actual_max_tokens,
+                        },
                     )
                 except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                     last_error = LlmClientError("LLM_RESPONSE_INVALID", "模型响应结构无效")
@@ -1150,6 +1457,12 @@ class OpenAIContractLlmClient:
                     last_error = exc
                     exc.request_attempts = request_attempts
                     exc.structure_retries = structure_attempt
+                    if exc.max_tokens is None:
+                        exc.max_tokens = (
+                            max_output_tokens
+                            if max_output_tokens is not None
+                            else self.settings.LLM_MAX_OUTPUT_TOKENS
+                        )
                     if isinstance(exc, LlmClientError) and exc.code == "LLM_OUTPUT_TRUNCATED":
                         exc.finish_reason = "length"
                         exc.request_attempts = request_attempts
@@ -1216,7 +1529,9 @@ class OpenAIContractLlmClient:
         url: str,
         **kwargs: Any,
     ) -> tuple[httpx.Response, int]:
-        max_attempts = 2
+        max_retries = getattr(self.settings, "LLM_HTTP_RETRY_ATTEMPTS", _HTTP_MAX_RETRIES)
+        max_retries = max(0, min(int(max_retries), _HTTP_MAX_RETRIES))
+        max_attempts = max_retries + 1
         for attempt in range(1, max_attempts + 1):
             try:
                 response = await client.request(
@@ -1226,7 +1541,7 @@ class OpenAIContractLlmClient:
                     **kwargs,
                 )
             except httpx.TimeoutException as exc:
-                if attempt < max_attempts:
+                if attempt < _HTTP_TIMEOUT_MAX_ATTEMPTS:
                     await self.sleeper(0.5 * attempt)
                     continue
                 raise LlmClientError(
@@ -1245,14 +1560,20 @@ class OpenAIContractLlmClient:
             if response.status_code < 400:
                 return response, attempt
             code, message, retryable = self._http_error(response.status_code)
-            if response.status_code in {502, 503} and attempt < max_attempts:
-                await self.sleeper(0.5 * attempt)
+            if (
+                response.status_code in _HTTP_RETRYABLE_STATUSES
+                and attempt < max_attempts
+            ):
+                backoff_index = min(attempt - 1, len(_HTTP_RETRY_BACKOFF_SECONDS) - 1)
+                backoff = _HTTP_RETRY_BACKOFF_SECONDS[backoff_index]
+                await self.sleeper(backoff + random.uniform(0.0, 0.25))
                 continue
             raise LlmClientError(
                 code,
                 message,
                 retryable=retryable,
                 request_attempts=attempt,
+                http_status=response.status_code,
             )
         raise AssertionError("unreachable")
 

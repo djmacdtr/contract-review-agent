@@ -54,21 +54,22 @@ class Settings(BaseSettings):
     LLM_PROTOCOL: str = "openai"
     LLM_BASE_URL: str = ""
     LLM_API_KEY: str = ""
-    LLM_EXTRACTION_MODEL: str = "GLM-5.2"
-    LLM_REVIEW_MODEL: str = "GLM-5.2-reviewer"
-    LLM_ADVICE_MODEL: str = "GLM-5.2"
+    LLM_EXTRACTION_MODEL: str = "GLM-5.3-Flash"
+    LLM_REVIEW_MODEL: str = "GLM-5.3-Flash"
+    LLM_ADVICE_MODEL: str = "GLM-5.3-Flash"
     LLM_EMBEDDING_MODEL: str = "embedding"
     LLM_RERANK_MODEL: str = "rerank"
     LLM_TIMEOUT_SECONDS: float = 180.0
-    LLM_MAX_CONCURRENCY: int = 1
-    LLM_MAX_OUTPUT_TOKENS: int = 4096
+    LLM_HTTP_RETRY_ATTEMPTS: int = Field(default=4, ge=0, le=4)
+    LLM_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=4)
+    LLM_MAX_OUTPUT_TOKENS: int = 8192
     LLM_RESPONSE_FORMAT: Literal["prompt_only", "json_object", "json_schema"] = "prompt_only"
     LLM_CHUNK_MAX_CHARS: int = Field(default=12000, ge=1000, le=100000)
-    LLM_EXTRACTION_PAYLOAD_MAX_CHARS: int = Field(default=12000, ge=4000, le=200000)
+    LLM_EXTRACTION_PAYLOAD_MAX_CHARS: int = Field(default=24000, ge=4000, le=200000)
     LLM_EXTRACTION_MAX_NUMERIC_CANDIDATES: int = Field(default=24, ge=1, le=128)
     # Keep numeric requests small enough that a dense table cannot consume the
     # entire structured-output budget before every candidate is classified.
-    LLM_EXTRACTION_MAX_NUMERIC_UNITS: int = Field(default=6, ge=1, le=6)
+    LLM_EXTRACTION_MAX_NUMERIC_UNITS: int = Field(default=12, ge=1, le=12)
     LLM_EXTRACTION_MAX_FACTS: int = Field(default=24, ge=1, le=64)
     # Compatibility planner setting; the v2 paired protocol uses the explicit
     # simplified limit below.
@@ -85,7 +86,7 @@ class Settings(BaseSettings):
     LLM_EXTRACTION_WAVE_SIZE: int = Field(default=6, ge=1, le=8)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TARGET: int = Field(default=40, ge=1, le=128)
     LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL: int = Field(default=256, ge=1, le=256)
-    LLM_EXTRACTION_TASK_CONCURRENCY: int = Field(default=2, ge=1, le=8)
+    LLM_EXTRACTION_TASK_CONCURRENCY: int = Field(default=3, ge=1, le=8)
     LLM_EXTRACTION_MAX_SPLIT_DEPTH: int = Field(default=8, ge=0, le=12)
     LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT: int = Field(
         default=128, ge=1, le=512
@@ -130,6 +131,18 @@ class Settings(BaseSettings):
         return self.LLM_ENABLED and all(
             value.strip() for value in (self.LLM_BASE_URL, self.LLM_API_KEY)
         )
+
+    @property
+    def effective_worker_stale_after_seconds(self) -> float:
+        """Keep live tasks owned beyond the longest configured operation."""
+
+        longest_operation = max(
+            self.DOWNLOAD_TIMEOUT_SECONDS,
+            self.LLM_TIMEOUT_SECONDS if self.LLM_ENABLED else 0.0,
+            self.OCR_TIMEOUT_SECONDS if self.document_parser_configured else 0.0,
+        )
+        heartbeat_margin = 2 * self.WORKER_HEARTBEAT_INTERVAL_SECONDS
+        return max(self.WORKER_STALE_AFTER_SECONDS, longest_operation + heartbeat_margin)
 
     @model_validator(mode="after")
     def validate_llm_review_mode(self) -> Self:

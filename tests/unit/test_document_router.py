@@ -4,6 +4,8 @@ import pytest
 
 from app.core.errors import WorkflowError
 from app.documents.models import DocumentBlock, DocumentLocation, ParsedDocument
+from app.documents.page_location_cache import InMemoryPageLocationSidecarCache
+from app.documents.page_locations import DocxPageLocationSidecar, build_docx_page_location_sidecar
 from app.documents.router import DocumentParsingRouter
 from app.services.downloader import DOCX_MIME, PDF_MIME, LocalFile
 
@@ -205,6 +207,41 @@ async def test_docx_page_location_keeps_local_document_and_records_sidecar(
     assert router.page_location_sidecars["fil_target"].page_count == 1
 
 
+async def test_docx_parse_does_not_retain_stale_sidecar_on_cache_miss(
+    tmp_path: Path,
+) -> None:
+    local_document = parsed().model_copy(
+        update={
+            "file_id": "fil_target",
+            "role": "TARGET",
+            "file_name": "target.docx",
+            "page_count": None,
+        }
+    )
+    router = DocumentParsingRouter(
+        local=LocalParser(local_document),
+        external=None,
+        page_location_cache=InMemoryPageLocationSidecarCache(),
+        docx_page_location_enabled=True,
+    )
+    router.page_location_sidecars["fil_target"] = DocxPageLocationSidecar(
+        file_id="fil_target",
+        page_count=1,
+        mappings={},
+        required_location_count=0,
+        candidate_mapping_count=0,
+        local_structure_count=0,
+        external_structure_count=0,
+        external_detail_page_count=1,
+    )
+
+    with pytest.raises(WorkflowError) as caught:
+        await router.parse_draft_review_file(docx_file(tmp_path, "TARGET"))
+
+    assert caught.value.code == "DOCX_PAGE_LOCATION_INCOMPLETE"
+    assert "fil_target" not in router.page_location_sidecars
+
+
 async def test_docx_page_location_preserves_safe_external_failure_chain(
     tmp_path: Path,
 ) -> None:
@@ -252,6 +289,112 @@ async def test_docx_page_location_preserves_safe_external_failure_chain(
         "unmapped_location_count": 0,
     }
     assert external.calls == [("fil_target", "auto")]
+
+
+async def test_docx_page_location_sidecar_cache_rebinds_without_external_parse(
+    tmp_path: Path,
+) -> None:
+    local_document = ParsedDocument(
+        file_id="fil_target",
+        role="TARGET",
+        file_name="target.docx",
+        sha256="d" * 64,
+        page_count=None,
+        blocks=[
+            DocumentBlock(
+                block_id="fil_target_p0",
+                type="PARAGRAPH",
+                order=0,
+                raw_text="合同金额为100万元。",
+                normalized_text="合同金额为100万元。",
+                location={"paragraph_index": 0},
+            )
+        ],
+        parser_name="python-docx",
+    )
+    external_document = local_document.model_copy(
+        deep=True,
+        update={
+            "blocks": [
+                local_document.blocks[0].model_copy(
+                    update={
+                        "location": DocumentLocation(paragraph_index=0, page=2)
+                    }
+                )
+            ],
+            "page_count": 2,
+        },
+    )
+    external_document.parser_metadata["page_ids"] = [1, 2]
+    cache = InMemoryPageLocationSidecarCache()
+    await cache.save(
+        file_sha256="d" * 64,
+        sidecar=build_docx_page_location_sidecar(local_document, external_document),
+    )
+    local = LocalParser(local_document)
+    external = DocxPageExternalParser(external_document)
+    router = DocumentParsingRouter(
+        local=local,
+        external=external,
+        page_location_cache=cache,
+        docx_page_location_enabled=True,
+    )
+
+    parsed = await router.parse_draft_review([docx_file(tmp_path, "TARGET")])
+
+    assert parsed[0].blocks[0].location.page == 2
+    assert external.calls == []
+    assert router.page_location_sidecars["fil_target"].file_id == "fil_target"
+
+
+async def test_docx_page_location_sidecar_cache_saves_external_result(
+    tmp_path: Path,
+) -> None:
+    local_document = ParsedDocument(
+        file_id="fil_target",
+        role="TARGET",
+        file_name="target.docx",
+        sha256="d" * 64,
+        page_count=None,
+        blocks=[
+            DocumentBlock(
+                block_id="fil_target_p0",
+                type="PARAGRAPH",
+                order=0,
+                raw_text="合同金额为100万元。",
+                normalized_text="合同金额为100万元。",
+                location={"paragraph_index": 0},
+            )
+        ],
+        parser_name="python-docx",
+    )
+    external_document = local_document.model_copy(
+        deep=True,
+        update={
+            "blocks": [
+                local_document.blocks[0].model_copy(
+                    update={
+                        "location": DocumentLocation(paragraph_index=0, page=1)
+                    }
+                )
+            ],
+            "page_count": 1,
+        },
+    )
+    external_document.parser_metadata["page_ids"] = [1]
+    cache = InMemoryPageLocationSidecarCache()
+    external = DocxPageExternalParser(external_document)
+    router = DocumentParsingRouter(
+        local=LocalParser(local_document),
+        external=external,
+        page_location_cache=cache,
+        docx_page_location_enabled=True,
+    )
+
+    await router.parse_draft_review([docx_file(tmp_path, "TARGET")])
+
+    assert external.calls == [("fil_target", "auto")]
+    assert await cache.load(file_sha256="d" * 64, file_id="fil_target") is not None
 
 
 async def test_draft_review_pdf_requires_external_parser(tmp_path: Path) -> None:

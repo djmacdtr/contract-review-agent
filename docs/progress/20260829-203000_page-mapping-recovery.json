@@ -1,0 +1,84 @@
+{
+  "status": "FAILED",
+  "task_id": "tsk_01M16QQ6WG4S4D73ME0QF13HSH",
+  "source_task_id": "tsk_01M16MWEMN7SAVK42HER1NRNVB",
+  "source_checkpoint_count": 55,
+  "new_task_checkpoint_count": 6,
+  "worker_claimed": true,
+  "elapsed_seconds": 150.719,
+  "llm_http_calls": 8,
+  "llm_status_counts": {
+    "200": 8
+  },
+  "text_response_format": "json_schema",
+  "text_model_override": null,
+  "numeric_model_override": null,
+  "advice_response_format": "json_object",
+  "llm_call_metadata": [
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_schema",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    },
+    {
+      "http_status": 200,
+      "configured_model": "GLM-5.3-Flash",
+      "response_format": "json_object",
+      "actual_model": "GLM-5.3-Flash",
+      "finish_reason": "stop"
+    }
+  ],
+  "console_tasks_path": "/console/#/tasks",
+  "console_report_path": "/console/#/tasks/tsk_01M16QQ6WG4S4D73ME0QF13HSH/report",
+  "stage": "GENERATING_ADVICE",
+  "progress": 92,
+  "error_code": "DOCX_PAGE_LOCATION_INCOMPLETE",
+  "failure": {
+    "failure_code": "PUBLIC_LOCATION_UNMAPPED",
+    "failure_stage": "PUBLIC_EVIDENCE_MAPPING"
+  }
+}

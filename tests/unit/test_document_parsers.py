@@ -1,3 +1,5 @@
+import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -80,3 +82,45 @@ async def test_text_pdf_parser_has_page_locations_and_rejects_empty_pdf(tmp_path
             local_file(empty_path, mime="application/pdf", file_id="fil_empty")
         )
     assert caught.value.code == "OCR_REQUIRED"
+
+
+async def test_local_parser_does_not_block_asyncio_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "slow.docx"
+    document = Document()
+    document.add_paragraph("测试内容")
+    document.save(path)
+    parser = DocxParser()
+    original = parser._parse_sync
+
+    def slow_parse(file: LocalFile):
+        time.sleep(0.05)
+        return original(file)
+
+    monkeypatch.setattr(parser, "_parse_sync", slow_parse)
+    ticks = 0
+    running = True
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        await parser.parse(
+            local_file(
+                path,
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            )
+        )
+    finally:
+        running = False
+        await task
+
+    assert ticks >= 5

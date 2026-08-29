@@ -1,0 +1,28 @@
+{
+  "advice_coverage": {
+    "fallback_count": 0,
+    "model_count": 39,
+    "nonempty_count": 39,
+    "risk_count": 39
+  },
+  "diff_count": 39,
+  "llm_calls": 0,
+  "ocr_calls": 0,
+  "page_counts": {
+    "REFERENCE": 2,
+    "TARGET": 46,
+    "TEMPLATE": 24
+  },
+  "page_coverage": {
+    "covered_evidence_count": 120,
+    "missing_evidence_count": 0,
+    "required_evidence_count": 120
+  },
+  "passed_check_count": 4,
+  "risk_count": 39,
+  "sidecar_count": 3,
+  "snapshot_hash": "630a125466ff06d68700e826039d7fce",
+  "snapshot_version": "draft-result-pre-page-v1",
+  "status": "READY_TO_APPLY",
+  "task_id": "tsk_01M16QQ6WG4S4D73ME0QF13HSH"
+}

@@ -1,0 +1,45 @@
+{
+  "status": "SNAPSHOT_OK",
+  "task_id": "tsk_01M167E69YV0MGNHENB9HW10DG",
+  "source_task_id": "tsk_01M161GFY6Q7YSP07R877XQM2B",
+  "failure_stage": null,
+  "failure_code": null,
+  "external_calls": 0,
+  "snapshot_reuse": {
+    "required_count": 3,
+    "source_snapshot_count": 3,
+    "formal_context_count": 3,
+    "evidence_rebound_count": 3,
+    "materialized_count": 3,
+    "formal_page_sidecar_count": 0,
+    "documents": [
+      {
+        "role": "TARGET",
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DH",
+        "status": "HIT",
+        "batch_id": "document_88a9b661962416e1b0250f2c",
+        "payload_digest": "88a9b661962416e1b0250f2c",
+        "fact_count": 264,
+        "evidence_rebound": true
+      },
+      {
+        "role": "TEMPLATE",
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DJ",
+        "status": "HIT",
+        "batch_id": "document_491ee1f8b405011d6bc4f322",
+        "payload_digest": "491ee1f8b405011d6bc4f322",
+        "fact_count": 0,
+        "evidence_rebound": true
+      },
+      {
+        "role": "REFERENCE",
+        "file_id": "fil_01M167E69YV0MGNHENB9HW10DK",
+        "status": "HIT",
+        "batch_id": "document_5ea3c16c147bb00c267d3178",
+        "payload_digest": "5ea3c16c147bb00c267d3178",
+        "fact_count": 23,
+        "evidence_rebound": true
+      }
+    ]
+  }
+}

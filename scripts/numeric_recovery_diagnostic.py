@@ -1,9 +1,9 @@
 """Run a safe, read-only numeric recovery Canary.
 
-The Canary does not guess a failed historical batch. It parses only the
-supplied local DOCX, reads source-task/checkpoint metadata, and sends at most
-one request for each of the three largest exact-cache-miss numeric batches.
-It never writes checkpoints or creates/retries a task.
+The diagnostic parses only the supplied local DOCX, reads source-task and
+checkpoint metadata, and never writes checkpoints or creates/retries a task.
+When ``--batch-id`` is provided, exactly that failure batch is reconstructed;
+no fallback selection is allowed.
 """
 
 from __future__ import annotations
@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from app.adapters.llm.base import ContractLlmClient
-from app.adapters.llm.openai_client import OpenAIContractLlmClient
+from app.adapters.llm.openai_client import (
+    LlmClientError,
+    OpenAIContractLlmClient,
+    _numeric_candidate_response_summary,
+)
 from app.core.config import Settings
 from app.core.errors import WorkflowError
 from app.db.models import CheckTask
@@ -53,7 +57,15 @@ SAFE_FAILURE_KEYS = {
     "batch_depth",
     "unit_count",
     "batch_id",
+    "numeric_candidate_count",
     "failure_code",
+}
+SAFE_RESPONSE_METADATA_KEYS = {
+    "finish_reason",
+    "content_chars",
+    "reasoning_content_chars",
+    "usage",
+    "max_tokens",
 }
 
 
@@ -72,7 +84,47 @@ def safe_task_details(value: Any) -> dict[str, Any]:
     return {key: value[key] for key in SAFE_FAILURE_KEYS if key in value}
 
 
-def prepare_numeric_plans(document, settings: Settings) -> list[dict[str, Any]]:
+def safe_response_metadata(value: Any) -> dict[str, Any]:
+    """Expose only aggregate response diagnostics, never response content."""
+
+    if not isinstance(value, dict):
+        return {}
+    metadata = {
+        key: value[key]
+        for key in SAFE_RESPONSE_METADATA_KEYS
+        if key in value
+    }
+    usage = metadata.get("usage")
+    if isinstance(usage, dict):
+        metadata["usage"] = {
+            key: int(item)
+            for key, item in usage.items()
+            if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            and type(item) is int
+            and item >= 0
+        }
+    elif usage is not None:
+        metadata.pop("usage", None)
+    return metadata
+
+
+def safe_llm_error_metadata(exc: BaseException) -> dict[str, Any]:
+    if not isinstance(exc, LlmClientError):
+        return {}
+    return safe_response_metadata(
+        {
+            "finish_reason": exc.finish_reason,
+            "content_chars": exc.content_chars,
+            "reasoning_content_chars": exc.reasoning_content_chars,
+            "usage": exc.usage,
+            "max_tokens": exc.max_tokens,
+        }
+    )
+
+
+def prepare_numeric_plans(
+    document, settings: Settings, *, include_empty: bool = False
+) -> list[dict[str, Any]]:
     plans = plan_numeric_document_batches(
         document,
         max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
@@ -81,19 +133,84 @@ def prepare_numeric_plans(document, settings: Settings) -> list[dict[str, Any]]:
         estimated_output_token_limit=min(
             settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
         ),
+        include_empty=include_empty,
     )
     for plan in plans:
-        plan["planned_batch_count"] = len(plans)
+        planned_batch_count = int(
+            plan.get("checkpoint_planned_batch_count", len(plans))
+        )
+        plan["planned_batch_count"] = planned_batch_count
         plan["payload"].update(
             {
                 "batch_depth": 0,
                 "parent_batch_id": None,
-                "planned_batch_count": len(plans),
+                "planned_batch_count": planned_batch_count,
                 "extraction_version": plan["extraction_version"],
             }
         )
         _with_checkpoint_identity(plan, document)
     return plans
+
+
+def reconstruct_exact_numeric_plan(
+    document,
+    plans: list[dict[str, Any]],
+    requested_batch_id: str,
+) -> list[dict[str, Any]]:
+    """Rebuild an exact historical singleton by its deterministic batch ID.
+
+    Recovery children are not part of the current initial planner output.  A
+    singleton can still be reconstructed safely when its full content-derived
+    ID matches exactly; no position, order, or fuzzy text inference is used.
+    """
+
+    matches = [plan for plan in plans if plan["batch_id"] == requested_batch_id]
+    if matches:
+        return matches
+
+    candidates: list[dict[str, Any]] = []
+    seen_block_ids: set[str] = set()
+    for parent in plans:
+        for block in parent["blocks"]:
+            if block.block_id in seen_block_ids:
+                continue
+            seen_block_ids.add(block.block_id)
+            batch_id = _checkpoint_batch_id(
+                document,
+                [block],
+                NUMERIC_EXTRACTION_VERSION,
+            )
+            if batch_id != requested_batch_id:
+                continue
+            payload = build_numeric_candidate_payload(
+                document,
+                [block],
+                batch_id=batch_id,
+            )
+            payload.update(
+                {
+                    "batch_depth": 1,
+                    "parent_batch_id": None,
+                    "planned_batch_count": parent.get("planned_batch_count", 0),
+                    "extraction_version": NUMERIC_EXTRACTION_VERSION,
+                }
+            )
+            candidates.append(
+                {
+                    "batch_id": batch_id,
+                    "document_id": document.file_id,
+                    "file_sha256": document.sha256,
+                    "blocks": [block],
+                    "unit_ids": [block.block_id],
+                    "payload": payload,
+                    "numeric_candidate_count": len(payload["numeric_candidates"]),
+                    "depth": 1,
+                    "parent_batch_id": None,
+                    "planned_batch_count": parent.get("planned_batch_count", 0),
+                    "extraction_version": NUMERIC_EXTRACTION_VERSION,
+                }
+            )
+    return candidates
 
 
 async def checkpoint_counts(
@@ -225,6 +342,7 @@ async def run_numeric_canary(
 
     selected = worst_numeric_plans(plans, limit=3)
     attempted: list[dict[str, Any]] = []
+    llm_calls = 0
     for plan in selected:
         payload = plan["payload"]
         attempted.append(
@@ -234,7 +352,10 @@ async def run_numeric_canary(
                 "candidate_count": int(plan.get("numeric_candidate_count", 0)),
             }
         )
+        if int(plan.get("numeric_candidate_count", 0)) == 0:
+            continue
         try:
+            llm_calls += 1
             result = await client.extract_numeric_candidates(
                 payload, allow_structure_correction=False
             )
@@ -246,7 +367,7 @@ async def run_numeric_canary(
             return {
                 "status": "FAILED",
                 "canary_batches": attempted,
-                "llm_calls": len(attempted),
+                "llm_calls": llm_calls,
                 "failure_stage": "NUMERIC_CANARY",
                 "failure_code": _safe_failure_code(exc),
             }
@@ -254,16 +375,87 @@ async def run_numeric_canary(
         return {
             "status": "SAFE_STOP",
             "canary_batches": attempted,
-            "llm_calls": len(attempted),
+            "llm_calls": llm_calls,
             "failure_stage": "NUMERIC_CANARY_SELECTION",
             "failure_code": "NUMERIC_CANARY_INSUFFICIENT_NEW_BATCHES",
+        }
+    if not any(int(plan.get("numeric_candidate_count", 0)) > 0 for plan in selected):
+        return {
+            "status": "SKIPPED_EMPTY",
+            "canary_batches": attempted,
+            "llm_calls": llm_calls,
+            "failure_stage": None,
+            "failure_code": None,
         }
     return {
         "status": "SUCCEEDED",
         "canary_batches": attempted,
-        "llm_calls": len(attempted),
+        "llm_calls": llm_calls,
         "failure_stage": None,
         "failure_code": None,
+    }
+
+
+async def run_exact_numeric_canary(
+    client: ContractLlmClient,
+    document,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Send one validated request for one explicitly identified batch."""
+
+    attempted = {
+        "batch_id": plan["batch_id"],
+        "unit_count": len(plan["blocks"]),
+        "candidate_count": int(plan.get("numeric_candidate_count", 0)),
+    }
+    if int(plan.get("numeric_candidate_count", 0)) == 0:
+        return {
+            "status": "SKIPPED_EMPTY",
+            "canary_batches": [attempted],
+            "llm_calls": 0,
+            "failure_stage": None,
+            "failure_code": None,
+        }
+    try:
+        result = await client.extract_numeric_candidates(
+            plan["payload"], allow_structure_correction=False
+        )
+        facts, _classified = expand_numeric_candidate_response(plan["payload"], result.value)
+        rehydrate_numeric_fact_evidence(document, facts)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        response_summary = getattr(exc, "validation_summary", None)
+        if not isinstance(response_summary, dict):
+            response_summary = _numeric_candidate_response_summary({}, plan["payload"])
+        return {
+            "status": "FAILED",
+            "canary_batches": [attempted],
+            "llm_calls": 1,
+                "failure_stage": "NUMERIC_CANARY",
+                "failure_code": _safe_failure_code(exc),
+                **safe_llm_error_metadata(exc),
+                **{
+                key: int(response_summary.get(key, 0))
+                for key in (
+                    "expected_count",
+                    "returned_count",
+                    "missing_index_count",
+                    "duplicate_index_count",
+                    "invalid_index_count",
+                )
+            },
+        }
+    return {
+        "status": "SUCCEEDED",
+        "canary_batches": [attempted],
+        "llm_calls": 1,
+        "failure_stage": None,
+        "failure_code": None,
+        **safe_response_metadata(result.response_metadata),
+        "configured_model": result.configured_model,
+        "actual_model": result.actual_model,
+        "request_attempts": result.request_attempts,
     }
 
 
@@ -323,12 +515,18 @@ async def run_numeric_probe(
     }
 
 
-async def diagnose(path: Path, source_task_id: str) -> dict[str, Any]:
+async def diagnose(
+    path: Path,
+    source_task_id: str,
+    requested_batch_id: str | None = None,
+    model_override: str | None = None,
+) -> dict[str, Any]:
     raw = path.read_bytes()
     settings = Settings(
         DOCX_PAGE_LOCATION_ENABLED=False,
         OCR_ENABLED=False,
         OCR_HTTP_RETRY_ATTEMPTS=0,
+        LLM_HTTP_RETRY_ATTEMPTS=0,
     )
     database_url = host_database_url(settings.DATABASE_URL)
     engine = create_async_engine(database_url, pool_pre_ping=True)
@@ -365,6 +563,7 @@ async def diagnose(path: Path, source_task_id: str) -> dict[str, Any]:
         )
         document = await DocxParser().parse(local_file)
         plans = prepare_numeric_plans(document, settings)
+        all_plans = prepare_numeric_plans(document, settings, include_empty=True)
         store = SqlAlchemyExtractionCheckpointStore(session_factory)
         hits, misses, profile_hit = await strict_hit_counts(
             store, document, plans, source_task_id
@@ -373,11 +572,48 @@ async def diagnose(path: Path, source_task_id: str) -> dict[str, Any]:
             store, document, plans, source_task_id
         )
         counts = await checkpoint_counts(session_factory, source_task_id)
-        result = await run_numeric_canary(
-            OpenAIContractLlmClient(settings), document, miss_plans
-        )
+        if requested_batch_id is not None:
+            failure_batch_id = task_info["failure"].get("batch_id")
+            if failure_batch_id != requested_batch_id:
+                result = {
+                    "status": "SAFE_STOP",
+                    "canary_batches": [],
+                    "llm_calls": 0,
+                    "failure_stage": "NUMERIC_CANARY_SELECTION",
+                    "failure_code": "NUMERIC_CANARY_FAILURE_BATCH_MISMATCH",
+                }
+            else:
+                exact_plans = reconstruct_exact_numeric_plan(
+                    document,
+                    all_plans,
+                    requested_batch_id,
+                )
+                if len(exact_plans) != 1:
+                    result = {
+                        "status": "SAFE_STOP",
+                        "canary_batches": [],
+                        "llm_calls": 0,
+                        "failure_stage": "NUMERIC_CANARY_SELECTION",
+                        "failure_code": "NUMERIC_CANARY_BATCH_NOT_UNIQUE",
+                    }
+                else:
+                    result = await run_exact_numeric_canary(
+                        OpenAIContractLlmClient(
+                            settings, numeric_model_override=model_override
+                        ),
+                        document,
+                        exact_plans[0],
+                    )
+        else:
+            result = await run_numeric_canary(
+                OpenAIContractLlmClient(
+                    settings, numeric_model_override=model_override
+                ),
+                document,
+                miss_plans,
+            )
         return {
-            "ok": result["status"] == "SUCCEEDED",
+            "ok": result["status"] in {"SUCCEEDED", "SKIPPED_EMPTY"},
             "status": result["status"],
             "source_task": task_info,
             "source_file_id": source_file.id,
@@ -393,6 +629,20 @@ async def diagnose(path: Path, source_task_id: str) -> dict[str, Any]:
             "canary_batches": result["canary_batches"],
             "failure_stage": result["failure_stage"],
             "failure_code": result["failure_code"],
+            **{
+                key: result[key]
+                for key in (
+                    "finish_reason",
+                    "content_chars",
+                    "reasoning_content_chars",
+                    "usage",
+                    "max_tokens",
+                    "configured_model",
+                    "actual_model",
+                    "request_attempts",
+                )
+                if key in result
+            },
         }
     finally:
         await engine.dispose()
@@ -402,13 +652,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=Path)
     parser.add_argument("--source-task-id", default=DEFAULT_SOURCE_TASK_ID)
+    parser.add_argument("--batch-id")
+    parser.add_argument("--model")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     path = args.path.resolve()
     if not path.is_file() or path.suffix.casefold() != ".docx":
         parser.error("diagnostic file must be an existing DOCX")
     try:
-        result = asyncio.run(diagnose(path, args.source_task_id))
+        result = asyncio.run(
+            diagnose(path, args.source_task_id, args.batch_id, args.model)
+        )
     except WorkflowError as exc:
         result = {
             "ok": False,

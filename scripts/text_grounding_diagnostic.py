@@ -1,4 +1,4 @@
-"""Diagnose and optionally checkpoint one exact text extraction batch.
+"""Diagnose one exact text extraction batch without mutating task state.
 
 The command is deliberately narrow: it parses one local DOCX with
 ``python-docx``, reconstructs one deterministic batch identity, and performs
@@ -26,15 +26,13 @@ from app.core.config import Settings
 from app.core.errors import WorkflowError
 from app.db.models import CheckTask
 from app.documents.parsers import DocxParser
-from app.draft_review.checkpoints import (
-    ExtractionCheckpoint,
-    SqlAlchemyExtractionCheckpointStore,
-)
+from app.draft_review.checkpoints import SqlAlchemyExtractionCheckpointStore
 from app.draft_review.extraction import (
     _checkpoint_payload_digest,
     _safe_failure_code,
     _split_text_structure_unit,
     _with_checkpoint_identity,
+    text_recovery_blocks,
 )
 from app.draft_review.facts import (
     TEXT_EXTRACTION_VERSION,
@@ -45,8 +43,8 @@ from app.draft_review.facts import (
 )
 from app.services.downloader import DOCX_MIME, LocalFile
 
-DEFAULT_SOURCE_TASK_ID = "tsk_01M113Z6XJAAF7AFE41HPV8YQF"
-DEFAULT_BATCH_ID = "batch_f194945649fc1f6e0613557c"
+DEFAULT_SOURCE_TASK_ID = "tsk_01M15X5XTYWVJ6MMBY7B47VKNS"
+DEFAULT_BATCH_ID = "batch_161ca9fd8a106e60d1fcc815"
 
 
 def host_database_url(database_url: str) -> str:
@@ -69,8 +67,21 @@ def safe_task_details(value: Any) -> dict[str, Any]:
         "unit_count",
         "batch_id",
         "failure_code",
+        "underlying_failure_code",
     }
     return {key: value[key] for key in keys if key in value}
+
+
+def safe_response_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "finish_reason",
+        "content_chars",
+        "code_fence",
+        "json_error_position",
+    }
+    return {key: value[key] for key in allowed if key in value}
 
 
 def _decorate_initial_plan(
@@ -168,7 +179,7 @@ def reconstruct_text_batch(
     initial = plan_text_document_batches(
         document,
         max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-        max_text_units=1,
+        max_text_units=min(settings.LLM_EXTRACTION_MAX_TEXT_UNITS, 16),
         max_text_facts=min(settings.LLM_EXTRACTION_MAX_TEXT_FACTS, 12),
         estimated_output_token_limit=min(
             settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
@@ -178,6 +189,8 @@ def reconstruct_text_batch(
         _decorate_initial_plan(plan, planned_batch_count=len(initial))
         for plan in initial
     ]
+    for plan in initial:
+        _with_checkpoint_identity(plan, document)
     pending = list(initial)
     visited: set[str] = set()
     while pending:
@@ -187,29 +200,24 @@ def reconstruct_text_batch(
         visited.add(plan["batch_id"])
         if plan["batch_id"] == batch_id:
             return plan
-        if len(plan["blocks"]) != 1 or int(plan.get("depth", 0)) >= 3:
+        if int(plan.get("depth", 0)) >= 2:
             continue
-        block = plan["blocks"][0]
-        if block.table is not None:
-            children = split_table_text_unit(block)
+        blocks = plan["blocks"]
+        if len(blocks) > 1:
+            child_groups = text_recovery_blocks(blocks)
         else:
-            children = _split_text_structure_unit(block)
-        for child_block in children:
+            block = blocks[0]
+            if block.table is not None:
+                child_groups = [[child] for child in split_table_text_unit(block)]
+            else:
+                child_groups = [[child] for child in _split_text_structure_unit(block)]
+        for child_group in child_groups:
             pending.append(
                 _make_child_plan(
                     document,
                     plan,
-                    [child_block],
+                    child_group,
                     text_fact_limit=int(plan.get("text_fact_limit", 12)),
-                )
-            )
-        for text_fact_limit in (6, 3):
-            pending.append(
-                _make_child_plan(
-                    document,
-                    plan,
-                    [block],
-                    text_fact_limit=text_fact_limit,
                 )
             )
     return None
@@ -245,7 +253,8 @@ async def diagnose(
     *,
     source_task_id: str,
     batch_id: str,
-    write_checkpoint: bool,
+    response_format: str,
+    model_override: str | None,
 ) -> dict[str, Any]:
     raw = path.read_bytes()
     settings = Settings()
@@ -255,6 +264,7 @@ async def diagnose(
     settings.OCR_HTTP_RETRY_ATTEMPTS = 0
     settings.LLM_RESPONSE_FORMAT = "json_schema"
     settings.LLM_NATIVE_STRUCTURED_OUTPUT = True
+    settings.LLM_HTTP_RETRY_ATTEMPTS = 0
     settings.LLM_STRUCTURE_RETRY_ATTEMPTS = 0
     engine = create_async_engine(host_database_url(settings.DATABASE_URL), pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -274,6 +284,17 @@ async def diagnose(
             detected_mime_type=DOCX_MIME,
         )
         document = await DocxParser().parse(local_file)
+        if source_file.sha256 and source_file.sha256 != local_sha:
+            return {
+                "status": "SAFE_STOP",
+                "source_task_id": source_task_id,
+                "file_id": source_file.id,
+                "sha256": local_sha,
+                "batch_id": batch_id,
+                "llm_calls": 0,
+                "failure_stage": "TEXT_SOURCE_FILE_VALIDATION",
+                "failure_code": "TEXT_SOURCE_SHA_MISMATCH",
+            }
         plan = reconstruct_text_batch(document, batch_id, settings)
         if plan is None:
             return {
@@ -320,31 +341,16 @@ async def diagnose(
                 "failure_stage": None,
                 "failure_code": None,
             }
-        result = await OpenAIContractLlmClient(settings).extract_text_facts(
+        result = await OpenAIContractLlmClient(
+            settings,
+            text_response_format_override=response_format,
+            text_model_override=model_override,
+        ).extract_text_facts(
             plan["payload"], allow_structure_correction=False
         )
         facts, discarded = filter_text_fact_evidence(
             document, plan["payload"], result.value
         )
-        checkpoint_written = False
-        if write_checkpoint:
-            await store.save(
-                ExtractionCheckpoint(
-                    task_id=source_task_id,
-                    file_sha256=local_sha,
-                    extraction_version=TEXT_EXTRACTION_VERSION,
-                    batch_id=batch_id,
-                    payload_digest=digest,
-                    value={
-                        "facts": [item.model_dump(mode="json") for item in facts],
-                        "discarded_fact_count": sum(discarded.values()),
-                        "discarded_fact_codes": discarded,
-                    },
-                    status="SUCCEEDED",
-                    model_name=result.configured_model,
-                )
-            )
-            checkpoint_written = True
         return {
             "status": "SUCCEEDED",
             "source_task_id": source_task_id,
@@ -357,7 +363,11 @@ async def diagnose(
             "discarded_fact_count": sum(discarded.values()),
             "discarded_fact_codes": discarded,
             "llm_calls": 1,
-            "checkpoint_written": checkpoint_written,
+            "response_format": result.response_format,
+            "configured_model": result.configured_model,
+            "actual_model": result.actual_model,
+            **safe_response_metadata(result.response_metadata),
+            "checkpoint_written": False,
             "failure_stage": None,
             "failure_code": None,
         }
@@ -371,6 +381,18 @@ async def diagnose(
             "llm_calls": 0,
             "failure_stage": "TEXT_BATCH_DIAGNOSTIC",
             "failure_code": _safe_failure_code(exc),
+            "response_format": response_format,
+            "configured_model": model_override or settings.LLM_EXTRACTION_MODEL,
+            **safe_response_metadata(
+                {
+                    "finish_reason": getattr(exc, "finish_reason", None),
+                    "content_chars": getattr(exc, "content_chars", None),
+                    "code_fence": getattr(exc, "code_fence", None),
+                    "json_error_position": getattr(
+                        exc, "json_error_position", None
+                    ),
+                }
+            ),
         }
     finally:
         await engine.dispose()
@@ -381,7 +403,12 @@ def main() -> int:
     parser.add_argument("path", type=Path)
     parser.add_argument("--source-task-id", default=DEFAULT_SOURCE_TASK_ID)
     parser.add_argument("--batch-id", default=DEFAULT_BATCH_ID)
-    parser.add_argument("--write-checkpoint", action="store_true")
+    parser.add_argument(
+        "--response-format",
+        choices=("json_object", "json_schema"),
+        default="json_object",
+    )
+    parser.add_argument("--model", dest="model_override")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     path = args.path.resolve()
@@ -392,7 +419,8 @@ def main() -> int:
             path,
             source_task_id=args.source_task_id,
             batch_id=args.batch_id,
-            write_checkpoint=args.write_checkpoint,
+            response_format=args.response_format,
+            model_override=args.model_override,
         )
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2)

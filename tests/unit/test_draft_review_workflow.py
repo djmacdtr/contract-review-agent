@@ -470,6 +470,31 @@ class RejectedFactsLlm(ConsensusFixtureLlm):
         return await super().map_facts(payload)
 
 
+class MultiSentenceAdviceLlm(ConsensusFixtureLlm):
+    async def generate_advice(self, payload: dict) -> LlmResult:
+        result = await super().generate_advice(payload)
+        if result.value["risk_advices"]:
+            result.value["risk_advices"][0]["analysis_advice"] = (
+                "请核对固定条款乙的业务依据。\n确认固定条款甲是否同步修订。"
+            )
+        return result
+
+
+class NotSpecificThenSpecificAdviceLlm(ConsensusFixtureLlm):
+    async def generate_advice(self, payload: dict) -> LlmResult:
+        result = await super().generate_advice(payload)
+        if not result.value["risk_advices"]:
+            return result
+        if self.advice_calls == 1:
+            result.value["risk_advices"][0]["analysis_advice"] = "请核对相关内容。"
+        else:
+            target_text = payload["diff_items"][0]["target"]["text"]
+            result.value["risk_advices"][0]["analysis_advice"] = (
+                f"请核对{target_text}的业务依据。"
+            )
+        return result
+
+
 class MappingFailureLlm(ConsensusFixtureLlm):
     def __init__(self, error_factory) -> None:
         super().__init__()
@@ -508,6 +533,23 @@ class UncertainMappingLlm(ConsensusFixtureLlm):
     async def map_facts(self, payload: dict) -> LlmResult:
         result = await super().map_facts(payload)
         result.value["mappings"][0]["decision"] = "UNCERTAIN"
+        return result
+
+
+class LowConfidenceMappingLlm(ConsensusFixtureLlm):
+    async def map_facts(self, payload: dict) -> LlmResult:
+        result = await super().map_facts(payload)
+        result.value["mappings"][0]["confidence"] = 0.8
+        return result
+
+
+class LowConfidenceMissingRequirementLlm(ConsensusFixtureLlm):
+    def __init__(self) -> None:
+        super().__init__(missing_requirement=True)
+
+    async def map_facts(self, payload: dict) -> LlmResult:
+        result = await super().map_facts(payload)
+        result.value["missing_requirements"][0]["confidence"] = 0.8
         return result
 
 
@@ -1224,14 +1266,11 @@ async def test_invalid_advice_risk_id_falls_back_without_changing_result(
         llm,
     )
 
-    assert llm.advice_calls == 1
+    assert llm.advice_calls == 0
     assert result["conclusion"] == "PASS"
     assert result["review_items"] == []
     assert result["summary"]["statistics"]["review_count"] == 0
-    assert any(
-        warning["code"] == "LLM_ADVICE_UNAVAILABLE"
-        for warning in result["warnings"]
-    )
+    assert result["metadata"]["advice_coverage"]["model_rate"] == 1.0
 
 
 def test_delivery_graph_bypasses_semantic_plan_after_mapping_review(tmp_path: Path) -> None:
@@ -1246,7 +1285,8 @@ def test_delivery_graph_bypasses_semantic_plan_after_mapping_review(tmp_path: Pa
     assert ("map_cross_document_facts", "build_result") in edges
     assert ("map_cross_document_facts", "plan_semantics") not in edges
     assert ("build_result", "generate_advice") in edges
-    assert ("generate_advice", "persist_result") in edges
+    assert ("generate_advice", "page_enrich") in edges
+    assert ("page_enrich", "persist_result") in edges
 
 
 async def test_delivery_path_skips_semantic_plan_and_publishes_accepted_fact_pass(
@@ -1271,7 +1311,7 @@ async def test_mapping_payload_contains_only_accepted_facts(
 ) -> None:
     llm = ConsensusFixtureLlm()
 
-    await run_consensus_fixture(tmp_path, llm)
+    result = await run_consensus_fixture(tmp_path, llm)
 
     assert len(llm.mapping_payloads) == 1
     payload = llm.mapping_payloads[0]
@@ -1282,6 +1322,58 @@ async def test_mapping_payload_contains_only_accepted_facts(
     assert len(llm.mapping_review_payloads) == 1
     assert len(llm.mapping_review_payloads[0]["target_facts"]) == 1
     assert len(llm.mapping_review_payloads[0]["reference_facts"]) == 1
+    assert result["metadata"]["mapping_diagnostics"] == {
+        "accepted_mapping_count": 1,
+        "dropped_low_confidence_count": 0,
+    }
+
+
+async def test_low_confidence_mapping_is_dropped_without_formal_conclusion(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        LowConfidenceMappingLlm(),
+        settings_overrides={
+            "LLM_FACT_REVIEW_ENABLED": False,
+            "LLM_MAPPING_REVIEW_ENABLED": False,
+        },
+    )
+
+    TaskResultData.model_validate(result)
+    assert result["fact_matrix"][0]["status"] == "UNCERTAIN"
+    assert not any(
+        item["module_code"] == "FACT_CONSISTENCY"
+        for item in result["risk_items"] + result["passed_checks"]
+    )
+    assert result["metadata"]["mapping_diagnostics"] == {
+        "accepted_mapping_count": 0,
+        "dropped_low_confidence_count": 1,
+    }
+
+
+async def test_low_confidence_missing_requirement_is_dropped_without_risk(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        LowConfidenceMissingRequirementLlm(),
+        settings_overrides={
+            "LLM_FACT_REVIEW_ENABLED": False,
+            "LLM_MAPPING_REVIEW_ENABLED": False,
+        },
+    )
+
+    TaskResultData.model_validate(result)
+    assert result["fact_matrix"][0]["status"] == "UNCERTAIN"
+    assert not any(
+        item["change_type"] == "REQUIRED_SOURCE_MISSING"
+        for item in result["risk_items"]
+    )
+    assert result["metadata"]["mapping_diagnostics"] == {
+        "accepted_mapping_count": 0,
+        "dropped_low_confidence_count": 1,
+    }
 
 
 async def test_mapping_cannot_reference_an_unknown_target_fact(
@@ -1530,11 +1622,51 @@ async def test_advice_failure_keeps_formal_result_and_fallback_for_each_risk(
     assert llm.advice_calls == 1
     assert result["conclusion"] == "RISK_FOUND"
     assert result["risk_items"]
-    assert all(item["analysis_advice"] for item in result["risk_items"])
+    assert all(item.get("analysis_advice") for item in result["risk_items"])
     assert any(
         warning["code"] == "LLM_ADVICE_UNAVAILABLE"
         for warning in result["warnings"]
     )
+
+
+async def test_multi_sentence_advice_is_normalized_and_counted(
+    tmp_path: Path,
+) -> None:
+    result = await run_consensus_fixture(
+        tmp_path,
+        MultiSentenceAdviceLlm(),
+        target_body="固定条款乙",
+        template_body="固定条款甲",
+    )
+
+    validation = result["metadata"]["advice_validation"]
+    assert validation["accepted_count"] == 1
+    assert validation["MULTI_SENTENCE"] == 1
+    assert validation["multi_sentence_normalized_count"] == 1
+    assert validation["DUPLICATED"] == 0
+    assert validation["INTERNAL_ID"] == 0
+    assert validation["TECHNICAL_TERM"] == 0
+    assert "；" in result["risk_items"][0]["analysis_advice"]
+    assert "\n" not in result["risk_items"][0]["analysis_advice"]
+
+
+async def test_non_specific_advice_gets_one_item_compensation(
+    tmp_path: Path,
+) -> None:
+    llm = NotSpecificThenSpecificAdviceLlm()
+    result = await run_consensus_fixture(
+        tmp_path,
+        llm,
+        target_body="固定条款乙",
+        template_body="固定条款甲",
+    )
+
+    validation = result["metadata"]["advice_validation"]
+    assert llm.advice_calls == 2
+    assert validation["accepted_count"] == 1
+    assert validation["not_specific_count"] == 1
+    assert result["metadata"]["advice_coverage"]["fallback_count"] == 0
+    assert "固定条款乙" in result["risk_items"][0]["analysis_advice"]
 
 
 async def test_independent_review_receives_source_blocks(tmp_path: Path) -> None:
