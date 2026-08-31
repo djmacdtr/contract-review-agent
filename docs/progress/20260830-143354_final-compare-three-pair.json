@@ -1,0 +1,221 @@
+{
+  "cache_preflight": {
+    "all_ready": false,
+    "docx_sidecar_hits": 1,
+    "docx_sidecar_total": 3,
+    "items": [
+      {
+        "cache_mode": "auto",
+        "file_name": "融资租赁合同（回租）.docx",
+        "include_stamp_images": false,
+        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ocr_cache_hit": true,
+        "page_count": 25,
+        "page_sidecar_hit": true,
+        "pair_index": 1,
+        "pair_name": "融资租赁合同（回租）",
+        "role": "BASELINE",
+        "sha256": "b8fa0231de6e161a147a065776e81a57a73ca0903f8236848aac6ee5481c8bb3",
+        "stamp_image_count": 0
+      },
+      {
+        "cache_mode": "scan",
+        "file_name": "金坛东旭农业-融资租赁合同（回租）.pdf",
+        "include_stamp_images": true,
+        "mime_type": "application/pdf",
+        "ocr_cache_hit": false,
+        "page_count": null,
+        "page_sidecar_hit": null,
+        "pair_index": 1,
+        "pair_name": "融资租赁合同（回租）",
+        "role": "TARGET",
+        "sha256": "dd35e05f1cced16cd0ccc7c3aa43dab22ccaa767f3e39af3462bcfacdfaa4690",
+        "stamp_image_count": 0
+      },
+      {
+        "cache_mode": "auto",
+        "file_name": "租赁物转让合同（回租）.docx",
+        "include_stamp_images": false,
+        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ocr_cache_hit": false,
+        "page_count": null,
+        "page_sidecar_hit": false,
+        "pair_index": 2,
+        "pair_name": "租赁物转让合同（回租）",
+        "role": "BASELINE",
+        "sha256": "646e1a53f54415ff12ef41fb4890dd042b7f7766cf20bafbce69296c88108830",
+        "stamp_image_count": 0
+      },
+      {
+        "cache_mode": "scan",
+        "file_name": "金坛东旭农业-租赁物转让合同（回租）.pdf",
+        "include_stamp_images": true,
+        "mime_type": "application/pdf",
+        "ocr_cache_hit": false,
+        "page_count": null,
+        "page_sidecar_hit": null,
+        "pair_index": 2,
+        "pair_name": "租赁物转让合同（回租）",
+        "role": "TARGET",
+        "sha256": "8dd2f417cee13617a0c245933afe0ddf995b590e07613353d508dfc48ff4efef",
+        "stamp_image_count": 0
+      },
+      {
+        "cache_mode": "auto",
+        "file_name": "保证合同.docx",
+        "include_stamp_images": false,
+        "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ocr_cache_hit": false,
+        "page_count": null,
+        "page_sidecar_hit": false,
+        "pair_index": 3,
+        "pair_name": "保证合同",
+        "role": "BASELINE",
+        "sha256": "37a2c7030017ca28fa5a31396727393989df4f2d71027eeb95c79d0cdc6fe964",
+        "stamp_image_count": 0
+      },
+      {
+        "cache_mode": "scan",
+        "file_name": "金坛东旭农业-保证合同.pdf",
+        "include_stamp_images": true,
+        "mime_type": "application/pdf",
+        "ocr_cache_hit": false,
+        "page_count": null,
+        "page_sidecar_hit": null,
+        "pair_index": 3,
+        "pair_name": "保证合同",
+        "role": "TARGET",
+        "sha256": "c38921eeef9ef07e600f0bf44c94ea1ead40fec204502c6e068a3fb34db2aebd",
+        "stamp_image_count": 0
+      }
+    ],
+    "ocr_cache_hits": 1,
+    "ocr_cache_total": 6,
+    "preheat_failure_type": "WorkflowError",
+    "preheat_http_calls": 2,
+    "stamp_cache_hits": 0
+  },
+  "docker_worker_after_stop": {
+    "available": true,
+    "health": null,
+    "running": false
+  },
+  "docker_worker_final": {
+    "available": true,
+    "health": null,
+    "running": true
+  },
+  "docker_worker_restore": {
+    "action": "start",
+    "return_code": 0,
+    "service": "worker"
+  },
+  "docker_worker_stop": {
+    "action": "stop",
+    "return_code": 0,
+    "service": "worker"
+  },
+  "git": {
+    "dirty_files": [
+      " M app/adapters/llm/openai_client.py",
+      " M app/workflows/draft_review.py",
+      " M tests/unit/test_draft_review_workflow.py",
+      " M tests/unit/test_openai_llm_client.py",
+      "?? backups/",
+      "?? docs/progress/20260829-214905_draft-review-five-file-acceptance.md",
+      "?? docs/progress/20260829-221530_mapping-thinking-five-file-recovery.md",
+      "?? scripts/draft_review_five_file_public_acceptance.py",
+      "?? scripts/final_compare_three_pair_public_acceptance.py",
+      "?? scripts/finalize_five_file_page_enrichment_host.py",
+      "?? scripts/mapping_pdf_canary.py",
+      "?? scripts/retry_five_file_mapping_host.py",
+      "?? tmp/"
+    ],
+    "head": "6d8166dabddee45c2be541c32e7a8a7c4f13d636"
+  },
+  "inventory": [
+    {
+      "bytes": 102175,
+      "file_name": "融资租赁合同（回租）.docx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "pair_index": 1,
+      "pair_name": "融资租赁合同（回租）",
+      "role": "BASELINE",
+      "sha256": "b8fa0231de6e161a147a065776e81a57a73ca0903f8236848aac6ee5481c8bb3"
+    },
+    {
+      "bytes": 8142554,
+      "file_name": "金坛东旭农业-融资租赁合同（回租）.pdf",
+      "mime_type": "application/pdf",
+      "pair_index": 1,
+      "pair_name": "融资租赁合同（回租）",
+      "role": "TARGET",
+      "sha256": "dd35e05f1cced16cd0ccc7c3aa43dab22ccaa767f3e39af3462bcfacdfaa4690"
+    },
+    {
+      "bytes": 62209,
+      "file_name": "租赁物转让合同（回租）.docx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "pair_index": 2,
+      "pair_name": "租赁物转让合同（回租）",
+      "role": "BASELINE",
+      "sha256": "646e1a53f54415ff12ef41fb4890dd042b7f7766cf20bafbce69296c88108830"
+    },
+    {
+      "bytes": 2529679,
+      "file_name": "金坛东旭农业-租赁物转让合同（回租）.pdf",
+      "mime_type": "application/pdf",
+      "pair_index": 2,
+      "pair_name": "租赁物转让合同（回租）",
+      "role": "TARGET",
+      "sha256": "8dd2f417cee13617a0c245933afe0ddf995b590e07613353d508dfc48ff4efef"
+    },
+    {
+      "bytes": 61781,
+      "file_name": "保证合同.docx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "pair_index": 3,
+      "pair_name": "保证合同",
+      "role": "BASELINE",
+      "sha256": "37a2c7030017ca28fa5a31396727393989df4f2d71027eeb95c79d0cdc6fe964"
+    },
+    {
+      "bytes": 2061265,
+      "file_name": "金坛东旭农业-保证合同.pdf",
+      "mime_type": "application/pdf",
+      "pair_index": 3,
+      "pair_name": "保证合同",
+      "role": "TARGET",
+      "sha256": "c38921eeef9ef07e600f0bf44c94ea1ead40fec204502c6e068a3fb34db2aebd"
+    }
+  ],
+  "reason_code": "CACHE_PREFLIGHT_INCOMPLETE",
+  "script": "final_compare_three_pair_public_acceptance",
+  "service_preflight": {
+    "active_task_count": 0,
+    "docker": {
+      "api": {
+        "available": true,
+        "health": "healthy",
+        "running": true
+      },
+      "postgres": {
+        "available": true,
+        "health": "healthy",
+        "running": true
+      },
+      "worker": {
+        "available": true,
+        "health": null,
+        "running": true
+      }
+    },
+    "health_status": 200,
+    "passed": true,
+    "ready_status": 200
+  },
+  "started_at": "2026-08-30T14:33:55+08:00",
+  "status": "BLOCKED",
+  "task_creation_count": 0,
+  "task_creation_method": "POST /api/v1/final-comparisons"
+}

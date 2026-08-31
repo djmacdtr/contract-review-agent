@@ -472,10 +472,17 @@ def ensure_fallback_risk_advices(result: dict[str, Any]) -> None:
             risk["analysis_advice"] = fallback_analysis_advice(result, risk)
 
 
-def advice_payload(result: dict[str, Any]) -> dict[str, Any]:
+def advice_payload(
+    result: dict[str, Any], risk_ids: set[str] | None = None
+) -> dict[str, Any]:
+    selected_risk_items = [
+        item
+        for item in result.get("risk_items", [])
+        if risk_ids is None or str(item.get("risk_id")) in risk_ids
+    ]
     related_ids = {
         diff_id
-        for risk in result.get("risk_items", [])
+        for risk in selected_risk_items
         for diff_id in risk.get("related_diff_ids", [])
     }
     evidence_keys = {
@@ -558,7 +565,7 @@ def advice_payload(result: dict[str, Any]) -> dict[str, Any]:
                     for evidence in item.get("source_evidence", [])
                 ],
             }
-            for item in result.get("risk_items", [])
+            for item in selected_risk_items
         ],
         "diff_items": [
             {

@@ -11,7 +11,6 @@ from app.adapters.document_parser.cached_parser import (
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.adapters.llm.base import ContractLlmClient
 from app.adapters.llm.openai_client import OpenAIContractLlmClient
-from app.adapters.llm.schemas import AdviceResponse
 from app.comparison.engine import (
     CompareOptions,
     compare_documents,
@@ -26,10 +25,9 @@ from app.documents.page_locations import apply_docx_page_location_sidecars
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.results.advice import (
-    advice_payload,
     ensure_fallback_risk_advices,
-    merge_model_advice,
 )
+from app.results.advice_batches import generate_advice_in_batches
 from app.results.passed_checks import build_comparison_passed_checks
 from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
@@ -82,7 +80,10 @@ class FinalCompareWorkflowExecutor:
         if llm is not None:
             self.llm = llm
         elif settings.llm_configured:
-            self.llm = OpenAIContractLlmClient(settings)
+            self.llm = OpenAIContractLlmClient(
+                settings,
+                advice_response_format_override="json_object",
+            )
         else:
             self.llm = None
 
@@ -174,18 +175,10 @@ class FinalCompareWorkflowExecutor:
                 return {}
             await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
             try:
-                generated = await self.llm.generate_advice(advice_payload(result))
-                merge_model_advice(result, AdviceResponse.model_validate(generated.value))
-                result["metadata"].setdefault("model_runs", []).append(
-                    {
-                        "purpose": "RISK_ADVICE",
-                        "configured_model": generated.configured_model,
-                        "actual_model": generated.actual_model,
-                        "duration_ms": generated.duration_ms,
-                        "request_attempts": generated.request_attempts,
-                        "structure_retries": generated.structure_retries,
-                        "status": "SUCCEEDED",
-                    }
+                await generate_advice_in_batches(
+                    result,
+                    self.llm,
+                    require_dynamic_anchor=True,
                 )
             except Exception:
                 # Advice is supplemental and must never invalidate deterministic results.

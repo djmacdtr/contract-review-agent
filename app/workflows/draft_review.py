@@ -453,7 +453,7 @@ def _mapping_failure_details(
 ) -> dict[str, Any]:
     """Build the safe diagnostic boundary for one reference mapping request."""
 
-    return {
+    details: dict[str, Any] = {
         "failure_stage": "FACT_MAPPING",
         "chain": "mapping",
         "file": document.file_id,
@@ -464,6 +464,42 @@ def _mapping_failure_details(
         "request_attempts": max(int(getattr(exc, "request_attempts", 0) or 0), 0),
         "structure_retries": max(int(getattr(exc, "structure_retries", 0) or 0), 0),
     }
+    # Keep aggregate provider diagnostics for mapping failures so a
+    # truncation can be distinguished from schema, evidence, or transport
+    # failures.  Only bounded non-content fields cross this boundary.
+    for key, expected_type in (
+        ("finish_reason", str),
+        ("content_chars", int),
+        ("reasoning_content_chars", int),
+        ("max_tokens", int),
+        ("http_status", int),
+        ("code_fence", bool),
+        ("json_error_position", int),
+    ):
+        value = getattr(exc, key, None)
+        if expected_type is bool:
+            valid = isinstance(value, bool)
+        else:
+            valid = isinstance(value, expected_type) and not isinstance(value, bool)
+        if not valid:
+            continue
+        if expected_type is str and not value:
+            continue
+        if expected_type is int and value < 0:
+            continue
+        details[key] = value
+    usage = getattr(exc, "usage", None)
+    if isinstance(usage, dict):
+        safe_usage = {
+            key: value
+            for key, value in usage.items()
+            if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            and type(value) is int
+            and value >= 0
+        }
+        if safe_usage:
+            details["usage"] = safe_usage
+    return details
 
 
 class DraftReviewState(TypedDict, total=False):
@@ -1730,6 +1766,20 @@ class DraftReviewWorkflowExecutor:
                         failure_code=details["failure_code"],
                         request_attempts=details["request_attempts"],
                         structure_retries=details["structure_retries"],
+                        **{
+                            key: details[key]
+                            for key in (
+                                "finish_reason",
+                                "content_chars",
+                                "reasoning_content_chars",
+                                "usage",
+                                "max_tokens",
+                                "http_status",
+                                "code_fence",
+                                "json_error_position",
+                            )
+                            if key in details
+                        },
                     )
                     raise WorkflowError(
                         "DYNAMIC_CHECK_INCOMPLETE",

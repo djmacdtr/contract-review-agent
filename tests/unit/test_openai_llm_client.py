@@ -249,7 +249,7 @@ async def test_review_compact_response_rehydrates_program_owned_identity() -> No
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["max_tokens"] == 1024
+        assert body["max_tokens"] == 8192
         schema = body["response_format"]["json_schema"]["schema"]
         assert schema["title"] == "CompactFactReview"
         return httpx.Response(
@@ -1123,6 +1123,11 @@ async def test_mapping_operations_use_expanded_budget_only_for_mapping() -> None
         "json_schema",
         "json_schema",
         "json_object",
+    ]
+    assert [request.get("chat_template_kwargs") for request in requests] == [
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+        {"enable_thinking": False},
     ]
     assert openai_client_module._PROFILE_MAX_OUTPUT_TOKENS == 2048
     assert openai_client_module._TEXT_MAX_OUTPUT_TOKENS == 8192

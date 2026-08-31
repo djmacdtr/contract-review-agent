@@ -118,7 +118,7 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
     assert result["metadata"]["rules_version"] == "0.6.0"
     assert result["metadata"]["comparison_diagnostics"]["reliable"] is True
     assert result["metadata"]["primary_model"] is None
-    assert llm.calls == 1
+    assert llm.calls == 2
     assert [run["purpose"] for run in result["metadata"]["model_runs"]] == ["RISK_ADVICE"]
     assert result["conclusion"] == "RISK_FOUND"
     assert result["summary"]["statistics"]["risk_count"] >= 1

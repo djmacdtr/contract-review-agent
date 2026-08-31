@@ -11,3 +11,8 @@ frontend/dist/
 *.log
 local-fixtures/*
 !local-fixtures/.gitkeep
+
+# Local acceptance, backup, and diagnostic artifacts
+/backups/
+/tmp/
+/.real-diagnostic-temp/

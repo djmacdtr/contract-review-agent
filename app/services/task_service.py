@@ -22,6 +22,10 @@ from app.schemas.tasks import (
     TaskSummary,
 )
 from app.services.url_security import sanitize_url
+from app.workflows.final_compare_advice_regeneration import (
+    FINAL_COMPARE_ADVICE_REGENERATION_MODE,
+    FINAL_COMPARE_ADVICE_REGENERATION_VERSION,
+)
 
 
 class TaskService:
@@ -75,6 +79,177 @@ class TaskService:
             files,
             request_id,
         )
+
+    async def create_final_advice_regeneration(
+        self,
+        source_task_id: str,
+        request_id: str,
+    ) -> TaskAccepted:
+        """Create one private Advice-only child from a successful FINAL_COMPARE."""
+
+        source = await self.repository.get(self.session, source_task_id, with_files=True)
+        if source is None:
+            raise TaskNotFoundError(source_task_id)
+        if source.status != TaskStatus.SUCCEEDED or source.task_type != TaskType.FINAL_COMPARE:
+            raise AppError(
+                "ADVICE_REGENERATION_SOURCE_INVALID",
+                "Advice 再生成仅接受成功的 FINAL_COMPARE 任务",
+                status_code=409,
+                details={
+                    "failure_stage": "SOURCE_PREFLIGHT",
+                    "failure_code": "SOURCE_STATUS_INVALID",
+                },
+            )
+        result_row = (
+            await self.session.execute(
+                select(TaskResult).where(TaskResult.task_id == source_task_id)
+            )
+        ).scalar_one_or_none()
+        if result_row is None:
+            raise AppError(
+                "ADVICE_REGENERATION_SOURCE_INVALID",
+                "来源 FINAL_COMPARE 结果缺失",
+                status_code=409,
+                details={
+                    "failure_stage": "SOURCE_PREFLIGHT",
+                    "failure_code": "SOURCE_RESULT_MISSING",
+                },
+            )
+        try:
+            TaskResultData.model_validate(result_row.result)
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise AppError(
+                "ADVICE_REGENERATION_SOURCE_INVALID",
+                "来源 FINAL_COMPARE 结果不符合正式结构",
+                status_code=409,
+                details={
+                    "failure_stage": "SOURCE_PREFLIGHT",
+                    "failure_code": "SOURCE_RESULT_INVALID",
+                },
+            ) from exc
+
+        source_files = sorted(source.files, key=lambda item: item.sort_order)
+        expected_roles = [FileRole.BASELINE, FileRole.TARGET]
+        if len(source_files) != 2 or [item.role for item in source_files] != expected_roles:
+            raise AppError(
+                "ADVICE_REGENERATION_SOURCE_INVALID",
+                "来源 FINAL_COMPARE 必须包含基准文件和目标文件",
+                status_code=409,
+                details={
+                    "failure_stage": "SOURCE_PREFLIGHT",
+                    "failure_code": "SOURCE_FILE_SET_INVALID",
+                },
+            )
+
+        children = (
+            await self.session.execute(
+                select(CheckTask).where(CheckTask.source_task_id == source_task_id)
+            )
+        ).scalars().all()
+        existing = next(
+            (
+                child
+                for child in children
+                if isinstance(child.options, dict)
+                and child.options.get("_final_compare_advice_source_task_id") == source_task_id
+                and child.options.get("_final_compare_advice_regeneration_version")
+                == FINAL_COMPARE_ADVICE_REGENERATION_VERSION
+            ),
+            None,
+        )
+        if existing is not None:
+            raise AppError(
+                "ADVICE_REGENERATION_ALREADY_EXISTS",
+                "该 FINAL_COMPARE 任务已经创建过 Advice 再生报告",
+                status_code=409,
+                details={
+                    "failure_stage": "ADVICE_REGENERATION_IDEMPOTENCY",
+                    "failure_code": "REGENERATION_ALREADY_EXISTS",
+                    "existing_task_id": existing.id,
+                },
+            )
+
+        task_id = new_task_id()
+        options = {
+            "_final_compare_advice_source_task_id": source_task_id,
+            "_final_compare_advice_regeneration_version": FINAL_COMPARE_ADVICE_REGENERATION_VERSION,
+            "_final_compare_advice_regeneration_mode": FINAL_COMPARE_ADVICE_REGENERATION_MODE,
+        }
+        file_rows: list[TaskFile] = []
+        snapshot_files: list[dict] = []
+        for source_file in source_files:
+            file_id = new_file_id()
+            file_rows.append(
+                TaskFile(
+                    id=file_id,
+                    task_id=task_id,
+                    role=source_file.role,
+                    reference_type=source_file.reference_type,
+                    sort_order=source_file.sort_order,
+                    url=source_file.url,
+                    safe_url=source_file.safe_url,
+                    file_name=source_file.file_name,
+                    declared_mime_type=source_file.declared_mime_type,
+                    detected_mime_type=source_file.detected_mime_type,
+                    file_size=source_file.file_size,
+                    sha256=source_file.sha256,
+                    page_count=source_file.page_count,
+                    parser_name=source_file.parser_name,
+                    parse_status=source_file.parse_status,
+                    parse_warnings=source_file.parse_warnings or [],
+                )
+            )
+            snapshot_files.append(
+                {
+                    "role": source_file.role.value,
+                    "reference_type": (
+                        source_file.reference_type.value
+                        if source_file.reference_type
+                        else None
+                    ),
+                    "safe_url": source_file.safe_url,
+                    "file_name": source_file.file_name,
+                    "mime_type": source_file.declared_mime_type,
+                    "sort_order": source_file.sort_order,
+                }
+            )
+
+        task = CheckTask(
+            id=task_id,
+            task_type=TaskType.FINAL_COMPARE,
+            client_reference_id=(
+                f"{source.client_reference_id or source_task_id}:advice-regeneration"
+            ),
+            status=TaskStatus.PENDING,
+            stage=TaskStage.QUEUED,
+            stage_message="Advice 再生成任务已创建，等待 Worker",
+            progress=0,
+            options=options,
+            input_snapshot={"files": snapshot_files, "options": options},
+            request_id=request_id,
+            source_task_id=source_task_id,
+            max_attempts=1,
+        )
+        await self.session.rollback()
+        async with self.session.begin():
+            self.session.add(task)
+            self.session.add_all(file_rows)
+            self.session.add(
+                TaskEvent(
+                    task_id=task_id,
+                    event_type=EventType.CREATED,
+                    stage=TaskStage.QUEUED,
+                    progress=0,
+                    message="Advice 再生成任务已创建",
+                    details={
+                        "source_task_id": source_task_id,
+                        "operation": "FINAL_COMPARE_ADVICE_REGENERATION",
+                        "version": FINAL_COMPARE_ADVICE_REGENERATION_VERSION,
+                    },
+                )
+            )
+        await self.session.refresh(task)
+        return self._accepted(task)
 
     async def _create(
         self,

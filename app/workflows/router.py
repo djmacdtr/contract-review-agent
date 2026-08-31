@@ -6,6 +6,9 @@ from app.db.session import SessionFactory
 from app.draft_review.checkpoints import SqlAlchemyExtractionCheckpointStore
 from app.workflows.draft_review import DraftReviewWorkflowExecutor
 from app.workflows.final_compare import FinalCompareWorkflowExecutor
+from app.workflows.final_compare_advice_regeneration import (
+    FinalCompareAdviceRegenerationWorkflowExecutor,
+)
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
@@ -17,12 +20,22 @@ class WorkflowRouter:
         *,
         draft_review: DraftReviewWorkflowExecutor | None = None,
         final_compare: FinalCompareWorkflowExecutor | None = None,
+        final_compare_advice_regeneration=None,
+        session_factory=None,
     ) -> None:
+        checkpoint_session_factory = session_factory or SessionFactory
         self.draft_review = draft_review or DraftReviewWorkflowExecutor(
             settings,
-            checkpoint_store=SqlAlchemyExtractionCheckpointStore(SessionFactory),
+            checkpoint_store=SqlAlchemyExtractionCheckpointStore(checkpoint_session_factory),
         )
         self.final_compare = final_compare or FinalCompareWorkflowExecutor(settings)
+        self.final_compare_advice_regeneration = (
+            final_compare_advice_regeneration
+            or FinalCompareAdviceRegenerationWorkflowExecutor(
+                settings,
+                session_factory=checkpoint_session_factory,
+            )
+        )
 
     async def run(
         self,
@@ -34,6 +47,14 @@ class WorkflowRouter:
         progress_callback: ProgressCallback,
     ) -> WorkflowOutput:
         if task_type == TaskType.FINAL_COMPARE:
+            if options.get("_final_compare_advice_regeneration_mode") == "ADVICE_ONLY":
+                return await self.final_compare_advice_regeneration.run(
+                    task_id=task_id,
+                    task_type=task_type,
+                    files=files,
+                    options=options,
+                    progress_callback=progress_callback,
+                )
             return await self.final_compare.run(
                 task_id=task_id,
                 task_type=task_type,

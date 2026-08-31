@@ -1244,6 +1244,7 @@ class OpenAIContractLlmClient:
             validator=_validate_mapping,
             schema=FactMappingResponse,
             max_output_tokens=_MAPPING_MAX_OUTPUT_TOKENS,
+            disable_thinking=True,
         )
 
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult:
@@ -1254,6 +1255,7 @@ class OpenAIContractLlmClient:
             validator=_validate_mapping_review,
             schema=FactMappingReview,
             max_output_tokens=_MAPPING_MAX_OUTPUT_TOKENS,
+            disable_thinking=True,
         )
 
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
@@ -1265,6 +1267,7 @@ class OpenAIContractLlmClient:
             schema=AdviceResponse,
             response_format_override=self.advice_response_format_override,
             max_output_tokens=_ADVICE_MAX_OUTPUT_TOKENS,
+            disable_thinking=True,
         )
 
     async def _structured_completion(

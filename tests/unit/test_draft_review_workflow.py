@@ -1484,6 +1484,50 @@ async def test_mapping_failure_preserves_nested_workflow_failure_code(tmp_path: 
     assert "unsafe nested error" not in str(error.value.details)
 
 
+async def test_mapping_truncation_preserves_safe_usage_diagnostics(
+    tmp_path: Path,
+) -> None:
+    def truncated_mapping_error() -> LlmClientError:
+        return LlmClientError(
+            "LLM_OUTPUT_TRUNCATED",
+            "safe truncation",
+            finish_reason="length",
+            content_chars=37,
+            reasoning_content_chars=12000,
+            usage={
+                "prompt_tokens": 2300,
+                "completion_tokens": 12288,
+                "total_tokens": 14588,
+                "unsafe": 1,
+            },
+            max_tokens=12288,
+            http_status=200,
+            request_attempts=1,
+        )
+
+    with pytest.raises(WorkflowError) as error:
+        await run_consensus_fixture(
+            tmp_path,
+            MappingFailureLlm(truncated_mapping_error),  # type: ignore[arg-type]
+        )
+
+    details = error.value.details
+    assert details is not None
+    assert details["failure_stage"] == "FACT_MAPPING"
+    assert details["failure_code"] == "LLM_OUTPUT_TRUNCATED"
+    assert details["finish_reason"] == "length"
+    assert details["content_chars"] == 37
+    assert details["reasoning_content_chars"] == 12000
+    assert details["max_tokens"] == 12288
+    assert details["http_status"] == 200
+    assert details["usage"] == {
+        "prompt_tokens": 2300,
+        "completion_tokens": 12288,
+        "total_tokens": 14588,
+    }
+    assert "safe truncation" not in str(details)
+
+
 async def test_rejected_facts_are_not_sent_to_mapping_and_do_not_formalize_result(
     tmp_path: Path,
 ) -> None:
