@@ -203,6 +203,65 @@ class TextFactExtraction(StrictLlmSchema):
     has_more: bool
 
 
+class FinalCompareCandidateDecision(StrictLlmSchema):
+    """Internal decision for an ambiguous FINAL_COMPARE candidate."""
+
+    candidate_id: str = Field(pattern=r"^candidate_[A-Za-z0-9_-]{8,80}$")
+    decision: Literal["KEEP_CHANGE", "DUPLICATE_OF", "UNCERTAIN"]
+    duplicate_of: str | None = Field(default=None, pattern=r"^candidate_[A-Za-z0-9_-]{8,80}$")
+    reason_code: str = Field(min_length=1, max_length=80)
+    confidence: float = Field(ge=0, le=1)
+
+
+class FinalCompareCandidateValidationResponse(StrictLlmSchema):
+    """Bounded candidate review response; evidence remains program-owned."""
+
+    decisions: list[FinalCompareCandidateDecision] = Field(..., max_length=8)
+
+
+class FinalCompareDuplicateClusterDecision(StrictLlmSchema):
+    """Internal decision for one suspected logical-duplicate cluster."""
+
+    cluster_id: str = Field(pattern=r"^cluster_[A-Za-z0-9_-]{8,80}$")
+    decision: Literal["SAME_LOGICAL_DIFF", "DISTINCT_DIFFS", "UNCERTAIN"]
+    representative_candidate_id: str = Field(
+        pattern=r"^candidate_[A-Za-z0-9_-]{8,80}$"
+    )
+    duplicate_candidate_ids: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+    reason_code: str = Field(min_length=1, max_length=80)
+    confidence: float = Field(ge=0, le=1)
+
+
+class FinalCompareDuplicateClusterResponse(StrictLlmSchema):
+    """Bounded duplicate-cluster response; evidence remains program-owned."""
+
+    clusters: list[FinalCompareDuplicateClusterDecision] = Field(..., max_length=6)
+
+
+class FinalCompareLogicalGroupDecision(StrictLlmSchema):
+    """Decision for one program-built logical-change candidate group."""
+
+    group_id: str = Field(pattern=r"^group_[A-Za-z0-9_-]{8,80}$")
+    candidate_ids: list[str] = Field(min_length=2, max_length=16)
+    decision: Literal[
+        "SAME_LOGICAL_CHANGE",
+        "EQUIVALENT_NO_CHANGE",
+        "DISTINCT_CHANGES",
+        "UNCERTAIN",
+    ]
+    reason_code: str = Field(min_length=1, max_length=80)
+    confidence: float = Field(ge=0, le=1)
+
+
+class FinalCompareLogicalGroupResponse(StrictLlmSchema):
+    """Bounded logical-group response; evidence remains program-owned."""
+
+    groups: list[FinalCompareLogicalGroupDecision] = Field(..., max_length=4)
+
+
 # Descriptive aliases used by the extraction controller and tests.  Keeping
 # one canonical model avoids divergent public/internal schemas.
 NumericCandidateDecisionResponse = NumericCandidateExtraction

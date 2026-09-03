@@ -37,6 +37,11 @@ CLAUSE_SPLIT_PATTERN = re.compile(
     r"(?=(?:第[一二三四五六七八九十百千万0-9]+条|"
     r"(?<!\S)\d+(?:\.\d+)*(?:、|\.(?!\d))))"
 )
+STRUCTURAL_PREFIX_PATTERN = re.compile(
+    r"^(?:第[一二三四五六七八九十百千万0-9]+条|"
+    r"\d+(?:\.\d+)*(?:、|\.(?!\d))|"
+    r"[（(][一二三四五六七八九十百千万0-9]+[）)])\s*"
+)
 INTER_CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
 HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
 MARKDOWN_EMPHASIS = re.compile(r"\*{2,}")
@@ -81,6 +86,7 @@ class CompareOptionsLike(Protocol):
     page_missing_min_equivalent: float
     page_missing_min_anchor_similarity: float
     page_missing_min_structure_units: int
+    semantic_clause_alignment: bool
 
 
 @dataclass(frozen=True)
@@ -180,6 +186,29 @@ def comparison_normalize(text: str) -> tuple[str, str]:
 def _clause_key(text: str) -> str | None:
     match = CLAUSE_PATTERN.match(text)
     return match.group(1) if match else None
+
+
+def _strip_structural_prefix(text: str) -> str:
+    """Remove only a leading clause/list marker, never body numbers."""
+
+    normalized = comparison_normalize(text)[0]
+    return STRUCTURAL_PREFIX_PATTERN.sub("", normalized, count=1).strip()
+
+
+def _semantic_clause_key(text: str) -> str | None:
+    body = _strip_structural_prefix(text)
+    _normalized, match_text = comparison_normalize(body)
+    return match_text if len(match_text) >= 6 else None
+
+
+def _same_semantic_content(
+    left: tuple[ComparableUnit, ...], right: tuple[ComparableUnit, ...]
+) -> bool:
+    if not left or not right:
+        return False
+    left_text = comparison_normalize(_strip_structural_prefix(_join_raw(left)))[1]
+    right_text = comparison_normalize(_strip_structural_prefix(_join_raw(right)))[1]
+    return left_text == right_text
 
 
 def _confidence(locations: tuple[DocumentLocation, ...]) -> float:
@@ -407,7 +436,18 @@ def _join_raw(units: tuple[ComparableUnit, ...]) -> str:
     return "\n".join(unit.raw_text for unit in units)
 
 
-def _same_clause(left: tuple[ComparableUnit, ...], right: tuple[ComparableUnit, ...]) -> bool:
+def _same_clause(
+    left: tuple[ComparableUnit, ...],
+    right: tuple[ComparableUnit, ...],
+    *,
+    semantic: bool = False,
+) -> bool:
+    if not left or not right:
+        return False
+    if semantic:
+        left_key = _semantic_clause_key(left[0].raw_text)
+        right_key = _semantic_clause_key(right[0].raw_text)
+        return bool(left_key and left_key == right_key)
     return bool(left[0].clause_key and left[0].clause_key == right[0].clause_key)
 
 
@@ -423,7 +463,10 @@ def _same_numeric_context(
 
 
 def _unique_anchors(
-    baseline: tuple[ComparableUnit, ...], target: tuple[ComparableUnit, ...]
+    baseline: tuple[ComparableUnit, ...],
+    target: tuple[ComparableUnit, ...],
+    *,
+    semantic: bool = False,
 ) -> list[tuple[int, int]]:
     base_exact: dict[str, list[int]] = {}
     target_exact: dict[str, list[int]] = {}
@@ -438,11 +481,49 @@ def _unique_anchors(
         and len(base_positions) == 1
         and len(target_exact.get(text, [])) == 1
     ]
-    base_clause = {unit.clause_key: index for index, unit in enumerate(baseline) if unit.clause_key}
-    target_clause = {unit.clause_key: index for index, unit in enumerate(target) if unit.clause_key}
+    if semantic:
+        base_semantic: dict[str, list[int]] = {}
+        target_semantic: dict[str, list[int]] = {}
+        for index, unit in enumerate(baseline):
+            if key := _semantic_clause_key(unit.raw_text):
+                base_semantic.setdefault(key, []).append(index)
+        for index, unit in enumerate(target):
+            if key := _semantic_clause_key(unit.raw_text):
+                target_semantic.setdefault(key, []).append(index)
+        base_clause = {
+            key: positions[0]
+            for key, positions in base_semantic.items()
+            if len(positions) == 1
+        }
+        target_clause = {
+            key: positions[0]
+            for key, positions in target_semantic.items()
+            if len(positions) == 1
+        }
+    else:
+        base_clause = {
+            unit.clause_key: index
+            for index, unit in enumerate(baseline)
+            if unit.clause_key
+        }
+        target_clause = {
+            unit.clause_key: index
+            for index, unit in enumerate(target)
+            if unit.clause_key
+        }
     for key in set(base_clause) & set(target_clause):
         i, j = base_clause[key], target_clause[key]
-        if ratio(baseline[i].match_text, target[j].match_text) >= 85:
+        left_text = (
+            _strip_structural_prefix(baseline[i].raw_text)
+            if semantic
+            else baseline[i].match_text
+        )
+        right_text = (
+            _strip_structural_prefix(target[j].raw_text)
+            if semantic
+            else target[j].match_text
+        )
+        if ratio(left_text, right_text) >= 85:
             candidates.append((i, j))
     candidates = sorted(set(candidates))
     if not candidates:
@@ -463,7 +544,10 @@ def _unique_anchors(
 
 
 def _align_region(
-    baseline: tuple[ComparableUnit, ...], target: tuple[ComparableUnit, ...]
+    baseline: tuple[ComparableUnit, ...],
+    target: tuple[ComparableUnit, ...],
+    *,
+    semantic: bool = False,
 ) -> list[AlignmentStep]:
     rows, columns = len(baseline), len(target)
     negative = float("-inf")
@@ -490,7 +574,8 @@ def _align_region(
                     similarity = ratio(_join_match(left), _join_match(right)) / 100
                     minimum = (
                         0.55
-                        if _same_clause(left, right) or _same_numeric_context(left, right)
+                        if _same_clause(left, right, semantic=semantic)
+                        or _same_numeric_context(left, right)
                         else 0.72
                     )
                     if similarity < minimum:
@@ -520,22 +605,35 @@ def _align_region(
 
 
 def align_documents(
-    baseline: ComparableDocument, target: ComparableDocument
+    baseline: ComparableDocument,
+    target: ComparableDocument,
+    *,
+    semantic_clause_alignment: bool = False,
 ) -> AlignmentOutcome:
-    anchors = _unique_anchors(baseline.units, target.units)
+    anchors = _unique_anchors(
+        baseline.units, target.units, semantic=semantic_clause_alignment
+    )
     steps: list[AlignmentStep] = []
     base_start = target_start = 0
     for base_index, target_index in anchors:
         steps.extend(
             _align_region(
-                baseline.units[base_start:base_index], target.units[target_start:target_index]
+                baseline.units[base_start:base_index],
+                target.units[target_start:target_index],
+                semantic=semantic_clause_alignment,
             )
         )
         left = (baseline.units[base_index],)
         right = (target.units[target_index],)
         steps.append(AlignmentStep(left, right, ratio(_join_match(left), _join_match(right)) / 100))
         base_start, target_start = base_index + 1, target_index + 1
-    steps.extend(_align_region(baseline.units[base_start:], target.units[target_start:]))
+    steps.extend(
+        _align_region(
+            baseline.units[base_start:],
+            target.units[target_start:],
+            semantic=semantic_clause_alignment,
+        )
+    )
     unmatched_base = sum(len(step.baseline) for step in steps if not step.target)
     unmatched_target = sum(len(step.target) for step in steps if not step.baseline)
     base_chars = sum(len(unit.match_text) for unit in baseline.units)
@@ -985,8 +1083,9 @@ def _candidate_diffs(
     target: ParsedDocument,
     options: CompareOptionsLike,
     missing_ranges: list[MissingRange],
-) -> list[DiffItem]:
+) -> tuple[list[DiffItem], int]:
     differences = []
+    semantic_number_shift_count = 0
     missing_by_start = {item.start_step: item for item in missing_ranges}
     skipped_steps = {
         index
@@ -1002,8 +1101,14 @@ def _candidate_diffs(
             continue
         if step_index in skipped_steps:
             continue
-        if step.baseline and step.target and _join_match(step.baseline) == _join_match(step.target):
-            continue
+        if step.baseline and step.target:
+            if _join_match(step.baseline) == _join_match(step.target):
+                continue
+            if getattr(options, "semantic_clause_alignment", False) and _same_semantic_content(
+                step.baseline, step.target
+            ):
+                semantic_number_shift_count += 1
+                continue
         if step.baseline and step.target:
             diff_type = (
                 "NUMERIC_CHANGED"
@@ -1027,7 +1132,7 @@ def _candidate_diffs(
                 options,
             )
         )
-    return differences
+    return differences, semantic_number_shift_count
 
 
 def _row_key(row: ComparableTableRow) -> str:
@@ -1222,10 +1327,17 @@ def compare_documents_reliably(
         if flat_base is not None and flat_target is not None:
             base, compared_target = flat_base, flat_target
             fallback_mode = "PAGE_FLAT"
-    outcome = align_documents(base, compared_target)
+    semantic_clause_alignment = bool(
+        getattr(options, "semantic_clause_alignment", False)
+    )
+    outcome = align_documents(
+        base,
+        compared_target,
+        semantic_clause_alignment=semantic_clause_alignment,
+    )
     missing_ranges = _missing_ranges(outcome, base, compared_target, options)
     moved_baseline_ids, moved_target_ids = _moved_unit_ids(outcome)
-    candidates = _candidate_diffs(
+    candidates, semantic_number_shift_count = _candidate_diffs(
         outcome, baseline, target, options, missing_ranges
     )
     candidates.extend(
@@ -1390,4 +1502,7 @@ def compare_documents_reliably(
         diff_items=emitted,
         warnings=aggregate_warnings(warnings),
         diagnostics=diagnostics,
+        validation_stats={
+            "semantic_number_shift_merged_count": semantic_number_shift_count
+        },
     )

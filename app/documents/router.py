@@ -142,7 +142,10 @@ class DocumentParsingRouter:
 
     async def parse_draft_review(self, files: list[LocalFile]) -> list[ParsedDocument]:
         self.page_location_sidecars = {}
-        semaphore = asyncio.Semaphore(2)
+        # The formal OCR gateway reliably accepts one document request at a
+        # time but may reset concurrent uploads before returning an HTTP
+        # status. Keep multi-document parsing ordered and bounded here.
+        semaphore = asyncio.Semaphore(1)
 
         async def parse_one(file: LocalFile) -> ParsedDocument:
             async with semaphore:

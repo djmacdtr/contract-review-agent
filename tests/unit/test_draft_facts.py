@@ -435,6 +435,35 @@ def test_document_overview_payload_is_bounded_and_identity_is_program_owned() ->
     assert "file_id" not in payload["extraction_requirements"]
 
 
+def test_document_overview_payload_keeps_head_and_tail_when_block_limit_is_reached() -> None:
+    document = ParsedDocument(
+        file_id="fil_long",
+        role="TARGET",
+        file_name="target.docx",
+        sha256="b" * 64,
+        page_count=None,
+        parser_name="python-docx",
+        blocks=[
+            DocumentBlock(
+                block_id=f"fil_long_p{i:06d}",
+                type="PARAGRAPH",
+                order=i,
+                raw_text=f"第{i}条 业务约定",
+                normalized_text=f"第{i}条 业务约定",
+                location=DocumentLocation(paragraph_index=i, section=f"第{i}条"),
+            )
+            for i in range(12)
+        ],
+    )
+
+    payload = build_document_overview_payload(document, max_blocks=6, max_chars=10000)
+    unit_ids = [item["unit_id"] for item in payload["overview_blocks"]]
+
+    assert len(unit_ids) == 6
+    assert unit_ids[0] == stable_unit_id(document.blocks[0])
+    assert unit_ids[-1] == stable_unit_id(document.blocks[-1])
+
+
 def test_table_row_unit_round_trips_profile_and_fact_evidence() -> None:
     document = _table_document()
     row_unit = extraction_units(document)[0]

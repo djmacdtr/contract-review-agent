@@ -1,0 +1,425 @@
+{
+  "description": "首组 FINAL_COMPARE V2 脱敏金标分类；不保存合同正文。",
+  "source_kind": "deidentified_manual_audit",
+  "cases": [
+    {
+      "case_id": "clause_number_shift",
+      "baseline_digest": "redacted",
+      "target_digest": "redacted",
+      "expected": "ABSORB_IN_ROOT_CHANGE"
+    },
+    {
+      "case_id": "list_number_shift_after_deletion",
+      "baseline_digest": "redacted",
+      "target_digest": "redacted",
+      "expected": "ABSORB_IN_ROOT_CHANGE"
+    },
+    {
+      "case_id": "table_business_key_reorder",
+      "baseline_digest": "redacted",
+      "target_digest": "redacted",
+      "expected": "ALIGN_BY_BUSINESS_KEY"
+    },
+    {
+      "case_id": "real_numeric_change",
+      "baseline_digest": "redacted",
+      "target_digest": "redacted",
+      "expected": "KEEP_NUMERIC_CHANGE"
+    },
+    {
+      "case_id": "uncertain_table_structure",
+      "baseline_digest": "redacted",
+      "target_digest": "redacted",
+      "expected": "REVIEW_REQUIRED"
+    }
+  ],
+  "logical_gold": {
+    "description": "仅保存脱敏拓扑和动作，不保存合同正文、页码或业务字段原文。",
+    "fragment_count": 41,
+    "logical_change_count": 17,
+    "false_positive_count": 12,
+    "fragment_groups": [
+      {
+        "gold_group_id": "gold_group_01",
+        "fragment_count": 3,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "0101df67ef789fee17e74fcd"
+      },
+      {
+        "gold_group_id": "gold_group_02",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "fd1400a8b3f8772553eb161c"
+      },
+      {
+        "gold_group_id": "gold_group_03",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "bb6f73f200bdb3df6c7182f2"
+      },
+      {
+        "gold_group_id": "gold_group_04",
+        "fragment_count": 3,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "35ae814d72312c8c42709475"
+      },
+      {
+        "gold_group_id": "gold_group_05",
+        "fragment_count": 3,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "8440cc15d593cf5fd68b4650"
+      },
+      {
+        "gold_group_id": "gold_group_06",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "d3c05f3b7b79de03a4746e65"
+      },
+      {
+        "gold_group_id": "gold_group_07",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "9ad4b204bda19fde6c8f939d"
+      },
+      {
+        "gold_group_id": "gold_group_08",
+        "fragment_count": 3,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "a1b00b40bda3c940af83f814"
+      },
+      {
+        "gold_group_id": "gold_group_09",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "5c979ae175162a2e9df50b2f"
+      },
+      {
+        "gold_group_id": "gold_group_10",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "f2fb2f3b13c9bdac3a9fbe4e"
+      },
+      {
+        "gold_group_id": "gold_group_11",
+        "fragment_count": 4,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "bc4ebfa6f6332d6f2267bd50"
+      },
+      {
+        "gold_group_id": "gold_group_12",
+        "fragment_count": 3,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "a83c8d1bc703669640d786f2"
+      },
+      {
+        "gold_group_id": "gold_group_13",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "657fc6b65fe54303dce6de25"
+      },
+      {
+        "gold_group_id": "gold_group_14",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "5de84852e25b6111238ba37a"
+      },
+      {
+        "gold_group_id": "gold_group_15",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "875e2f9e2e72ae8c181db6d9"
+      },
+      {
+        "gold_group_id": "gold_group_16",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "47b92564c7c0aaf5aa5a64d2"
+      },
+      {
+        "gold_group_id": "gold_group_17",
+        "fragment_count": 2,
+        "expected": "SAME_LOGICAL_CHANGE",
+        "topology_fingerprint": "6a72ec506eb0ac118589e7fc"
+      }
+    ],
+    "equivalent_groups": [
+      {
+        "gold_group_id": "gold_equivalent_formula",
+        "source_ordinals": [
+          29,
+          30,
+          31
+        ],
+        "fragment_count": 3,
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "category": "FORMULA_EQUIVALENCE",
+        "topology_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "gold_group_id": "gold_equivalent_rent_01",
+        "source_ordinals": [
+          75,
+          88
+        ],
+        "fragment_count": 2,
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "category": "TABLE_FIELD_EQUIVALENCE",
+        "topology_fingerprint": "60593c83e4cfd626fdcf04f9"
+      },
+      {
+        "gold_group_id": "gold_equivalent_rent_02",
+        "source_ordinals": [
+          76,
+          89
+        ],
+        "fragment_count": 2,
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "category": "TABLE_FIELD_EQUIVALENCE",
+        "topology_fingerprint": "387aaa3492b4561218ae6407"
+      },
+      {
+        "gold_group_id": "gold_equivalent_rent_03",
+        "source_ordinals": [
+          77,
+          90
+        ],
+        "fragment_count": 2,
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "category": "TABLE_FIELD_EQUIVALENCE",
+        "topology_fingerprint": "3d1e7dfc8c30be82dd47f735"
+      },
+      {
+        "gold_group_id": "gold_equivalent_rent_04",
+        "source_ordinals": [
+          78,
+          91
+        ],
+        "fragment_count": 2,
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "category": "TABLE_FIELD_EQUIVALENCE",
+        "topology_fingerprint": "15a79191b4ff2ab45f2b2fbf"
+      }
+    ],
+    "boundary_noise": [
+      {
+        "gold_case_id": "gold_boundary_noise_01",
+        "source_ordinals": [
+          1
+        ],
+        "fragment_count": 1,
+        "expected": "BOUNDARY_NOISE",
+        "category": null,
+        "topology_fingerprint": "882a0604e050333468c9a5f9"
+      }
+    ],
+    "local_replay": {
+      "formal_risk_count": 57,
+      "review_required_count": 0,
+      "date_passed_conflict_count": 0,
+      "rent_payment_plan_missing_count": 1,
+      "page_coverage_required": true
+    },
+    "false_positives": [
+      {
+        "gold_case_id": "noise_01",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_formula",
+        "topology_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "gold_case_id": "noise_02",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_formula",
+        "topology_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "gold_case_id": "noise_03",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_formula",
+        "topology_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "gold_case_id": "noise_04",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_01",
+        "topology_fingerprint": "60593c83e4cfd626fdcf04f9"
+      },
+      {
+        "gold_case_id": "noise_05",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_01",
+        "topology_fingerprint": "60593c83e4cfd626fdcf04f9"
+      },
+      {
+        "gold_case_id": "noise_06",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_02",
+        "topology_fingerprint": "387aaa3492b4561218ae6407"
+      },
+      {
+        "gold_case_id": "noise_07",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_02",
+        "topology_fingerprint": "387aaa3492b4561218ae6407"
+      },
+      {
+        "gold_case_id": "noise_08",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_03",
+        "topology_fingerprint": "3d1e7dfc8c30be82dd47f735"
+      },
+      {
+        "gold_case_id": "noise_09",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_03",
+        "topology_fingerprint": "3d1e7dfc8c30be82dd47f735"
+      },
+      {
+        "gold_case_id": "noise_10",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_04",
+        "topology_fingerprint": "15a79191b4ff2ab45f2b2fbf"
+      },
+      {
+        "gold_case_id": "noise_11",
+        "expected": "EQUIVALENT_NO_CHANGE",
+        "fragment_group_ref": "gold_equivalent_rent_04",
+        "topology_fingerprint": "15a79191b4ff2ab45f2b2fbf"
+      },
+      {
+        "gold_case_id": "noise_12",
+        "expected": "BOUNDARY_NOISE",
+        "fragment_group_ref": "gold_boundary_noise_01",
+        "topology_fingerprint": "882a0604e050333468c9a5f9"
+      }
+    ]
+  },
+  "capture_metadata": {
+    "capture_version": "final-compare-v2-manual-gold-v1",
+    "source_task_id": "tsk_01M1BBHY5424N69QRDFA8N96VZ",
+    "baseline_sha256": "b8fa0231de6e161a147a065776e81a57a73ca0903f8236848aac6ee5481c8bb3",
+    "target_sha256": "dd35e05f1cced16cd0ccc7c3aa43dab22ccaa767f3e39af3462bcfacdfaa4690",
+    "baseline_parser_name": "python-docx",
+    "target_parser_name": "textin-document-parser",
+    "baseline_parser_version": null,
+    "target_parser_version": null,
+    "source_diff_count": 189,
+    "historical_candidate_count": 93,
+    "current_candidate_count": 93,
+    "candidate_binding_audit": [
+      {
+        "historical_ordinal": 1,
+        "source_ordinal": 1,
+        "match_count": 1,
+        "source_binding_digest": "d4ff5184b031d902286d762f",
+        "current_topology_fingerprint": "882a0604e050333468c9a5f9",
+        "gold_group_id": "gold_boundary_noise_01",
+        "final_group_fingerprint": "882a0604e050333468c9a5f9"
+      },
+      {
+        "historical_ordinal": 29,
+        "source_ordinal": 29,
+        "match_count": 1,
+        "source_binding_digest": "35441ec565232957dca2f519",
+        "current_topology_fingerprint": "dc88f18489bb5ded5c153112",
+        "gold_group_id": "gold_equivalent_formula",
+        "final_group_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "historical_ordinal": 30,
+        "source_ordinal": 30,
+        "match_count": 1,
+        "source_binding_digest": "916f28ef117304b6a03ff822",
+        "current_topology_fingerprint": "0a5fdef4e82492804464a69f",
+        "gold_group_id": "gold_equivalent_formula",
+        "final_group_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "historical_ordinal": 31,
+        "source_ordinal": 31,
+        "match_count": 1,
+        "source_binding_digest": "2b1e7583ded4c112ef4b236f",
+        "current_topology_fingerprint": "cbe6859aa1ab56ca55b56238",
+        "gold_group_id": "gold_equivalent_formula",
+        "final_group_fingerprint": "0c3eefdbe5e8351edb3f1a01"
+      },
+      {
+        "historical_ordinal": 75,
+        "source_ordinal": 75,
+        "match_count": 1,
+        "source_binding_digest": "5b98cec233875a8e1b4c1fce",
+        "current_topology_fingerprint": "ec64e7e754e98d578297baa4",
+        "gold_group_id": "gold_equivalent_rent_01",
+        "final_group_fingerprint": "60593c83e4cfd626fdcf04f9"
+      },
+      {
+        "historical_ordinal": 76,
+        "source_ordinal": 76,
+        "match_count": 1,
+        "source_binding_digest": "721529578265f504b2089f81",
+        "current_topology_fingerprint": "ad16b38f2a138d2354858714",
+        "gold_group_id": "gold_equivalent_rent_02",
+        "final_group_fingerprint": "387aaa3492b4561218ae6407"
+      },
+      {
+        "historical_ordinal": 77,
+        "source_ordinal": 77,
+        "match_count": 1,
+        "source_binding_digest": "2d5af7e176d03c3fcc08fb3b",
+        "current_topology_fingerprint": "78c0219f9c47dcb45bc594fb",
+        "gold_group_id": "gold_equivalent_rent_03",
+        "final_group_fingerprint": "3d1e7dfc8c30be82dd47f735"
+      },
+      {
+        "historical_ordinal": 78,
+        "source_ordinal": 78,
+        "match_count": 1,
+        "source_binding_digest": "8aacf73de2b3da5a52b23de3",
+        "current_topology_fingerprint": "a5c7cffaf09245fe47b28690",
+        "gold_group_id": "gold_equivalent_rent_04",
+        "final_group_fingerprint": "15a79191b4ff2ab45f2b2fbf"
+      },
+      {
+        "historical_ordinal": 88,
+        "source_ordinal": 88,
+        "match_count": 1,
+        "source_binding_digest": "4c87a366b4f2e39e1997c899",
+        "current_topology_fingerprint": "4eb75845d7f66b57499a3401",
+        "gold_group_id": "gold_equivalent_rent_01",
+        "final_group_fingerprint": "60593c83e4cfd626fdcf04f9"
+      },
+      {
+        "historical_ordinal": 89,
+        "source_ordinal": 89,
+        "match_count": 1,
+        "source_binding_digest": "25b308e79cdd18592e787fcb",
+        "current_topology_fingerprint": "ddf3dcb68649ca2e5336efed",
+        "gold_group_id": "gold_equivalent_rent_02",
+        "final_group_fingerprint": "387aaa3492b4561218ae6407"
+      },
+      {
+        "historical_ordinal": 90,
+        "source_ordinal": 90,
+        "match_count": 1,
+        "source_binding_digest": "acf66f607afc3e41bca2923e",
+        "current_topology_fingerprint": "c01a7726222874d94e5a5b71",
+        "gold_group_id": "gold_equivalent_rent_03",
+        "final_group_fingerprint": "3d1e7dfc8c30be82dd47f735"
+      },
+      {
+        "historical_ordinal": 91,
+        "source_ordinal": 91,
+        "match_count": 1,
+        "source_binding_digest": "89a260d3b020e03fc983632a",
+        "current_topology_fingerprint": "04f40a1408359743a1ac1451",
+        "gold_group_id": "gold_equivalent_rent_04",
+        "final_group_fingerprint": "15a79191b4ff2ab45f2b2fbf"
+      }
+    ],
+    "external_calls": {
+      "ocr": 0,
+      "llm": 0
+    }
+  },
+  "manifest_sha256": "e9f2f8813a9483f6b5cef1c043c6aa0a63cb724b0ee033f9831e36215cb69966"
+}

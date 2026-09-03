@@ -60,3 +60,30 @@ def test_changed_date_is_not_marked_as_passed() -> None:
     checks = passed("签署日期为2026年8月20日。", "签署日期为2026年9月20日。")
 
     assert "日期未发生变化" not in {item["title"] for item in checks}
+
+
+def test_chinese_numeral_date_is_not_marked_as_passed_when_changed() -> None:
+    checks = passed("签署日期为二〇二六年八月二十日。", "签署日期为二〇二六年九月二十日。")
+
+    assert "日期未发生变化" not in {item["title"] for item in checks}
+
+
+def test_pending_v2_difference_blocks_passed_checks() -> None:
+    documents = [
+        document("base", "租赁期限为二十四个月。"),
+        document("target", "租赁期限为三十六个月。"),
+    ]
+    comparison = compare_documents(documents[0], documents[1], CompareOptions())
+
+    checks = build_comparison_passed_checks(
+        documents,
+        [],
+        comparison.diagnostics,
+        check_prefix="check_fixture",
+        module_code="VERSION_CHANGE",
+        content_title="全文未发生变化",
+        numeric_sensitive=True,
+        pending_differences=comparison.diff_items,
+    )
+
+    assert "期限未发生变化" not in {item["title"] for item in checks}

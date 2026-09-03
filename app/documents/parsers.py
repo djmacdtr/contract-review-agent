@@ -72,18 +72,34 @@ class DocxParser:
                     table = Table(child, document)
                     rows: list[TableRow] = []
                     merged = False
+                    # ``id(cell._tc)`` is not a safe identity here.  python-docx
+                    # creates short-lived lxml proxy objects for table cells and
+                    # their Python ids can be reused for unrelated cells.  Use
+                    # the underlying element as the mapping key so vertical and
+                    # horizontal merges are grouped only when they are truly the
+                    # same XML cell.
+                    logical_ids: dict[object, str] = {}
+                    logical_positions: dict[str, list[tuple[int, int]]] = {}
                     for row_index, row in enumerate(table.rows):
                         seen_cells: set[int] = set()
                         cells: list[TableCell] = []
                         for column, cell in enumerate(row.cells):
-                            identity = id(cell._tc)
+                            identity = cell._tc
                             merged = merged or identity in seen_cells
                             seen_cells.add(identity)
+                            logical_cell_id = logical_ids.setdefault(
+                                identity,
+                                f"table:{table_index}:logical_cell:{len(logical_ids):06d}",
+                            )
+                            logical_positions.setdefault(logical_cell_id, []).append(
+                                (row_index, column)
+                            )
                             raw = normalize_text(cell.text)
                             cells.append(
                                 TableCell(
                                     raw_text=raw,
                                     normalized_text=normalize_text(raw),
+                                    logical_cell_id=logical_cell_id,
                                     location=DocumentLocation(
                                         table_index=table_index,
                                         row=row_index,
@@ -95,6 +111,13 @@ class DocxParser:
                                 )
                             )
                         rows.append(TableRow(row=row_index, cells=cells))
+                    for row in rows:
+                        for cell in row.cells:
+                            positions = logical_positions[cell.logical_cell_id or ""]
+                            row_values = [item[0] for item in positions]
+                            column_values = [item[1] for item in positions]
+                            cell.row_span = max(row_values) - min(row_values) + 1
+                            cell.col_span = max(column_values) - min(column_values) + 1
                     parsed_table = ParsedTable(table_index=table_index, rows=rows)
                     raw_table = "\n".join(
                         "\t".join(cell.raw_text for cell in row.cells) for row in rows

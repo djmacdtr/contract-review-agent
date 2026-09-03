@@ -23,6 +23,10 @@ class CompareOptions:
     page_missing_min_equivalent: float = 0.8
     page_missing_min_anchor_similarity: float = 0.85
     page_missing_min_structure_units: int = 2
+    comparison_mode: str = "LEGACY"
+    # FINAL_LOGICAL_V2 may opt into semantic clause alignment.  Keeping this
+    # opt-in preserves the established LEGACY comparator byte-for-byte.
+    semantic_clause_alignment: bool = False
 
 
 def _side(document: ParsedDocument, block: DocumentBlock) -> DiffSide:
@@ -381,6 +385,10 @@ def _compare_tables(
 def compare_documents(
     baseline: ParsedDocument, target: ParsedDocument, options: CompareOptions
 ) -> ComparisonResult:
+    if options.comparison_mode == "FINAL_LOGICAL_V2":
+        from app.comparison.logical_v2 import compare_documents_logical_v2
+
+        return compare_documents_logical_v2(baseline, target, options)
     from app.comparison.reliable import compare_documents_reliably
 
     return compare_documents_reliably(baseline, target, options)

@@ -2,7 +2,13 @@ export type TaskType = 'DRAFT_REVIEW' | 'FINAL_COMPARE'
 export type TaskStatus = 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
 
 export interface Envelope<T> { code: string; message: string; request_id: string; data: T; error?: unknown }
-export interface RemoteFile { url: string; file_name: string }
+export interface RemoteFile { url: string; file_name: string; mime_type?: string }
+export interface UploadResult extends RemoteFile {
+  upload_id: string
+  mime_type: string
+  size_bytes: number
+  sha256: string
+}
 export interface TaskAccepted {
   task_id: string; task_type: TaskType; status: TaskStatus; progress: number
   created_at?: string; status_url?: string; result_url?: string; source_task_id?: string
@@ -46,6 +52,9 @@ export interface DiffItem {
   review_reason?: 'OCR_SINGLE_CHAR_VARIANCE' | 'OCR_PLACEHOLDER_VARIANCE' | 'OCR_READING_ORDER_VARIANCE' | 'OCR_LOW_CONFIDENCE_VARIANCE'
   certainty?: 'CONFIRMED' | 'INFERRED'
   missing_detail?: MissingDetail
+  validation_status?: 'CONFIRMED' | 'REVIEW_REQUIRED'
+  validation_source?: 'RULE' | 'LLM' | 'RULE_AND_LLM'
+  validation_reason_code?: string
 }
 export interface ResultFile {
   file_id: string; role: string; file_name: string; safe_url: string; sha256?: string; page_count?: number
@@ -82,7 +91,8 @@ export interface ResultStatistics {
 export interface RiskItem {
   risk_id: string; module_code: string; risk_type: 'DELETION_OR_MISSING' | 'ADDITION_OR_CHANGE'
   change_type: string; title: string; description: string; source_evidence: Record<string, unknown>[]
-  related_diff_ids: string[]; related_rule_ids: string[]; requires_manual_action: boolean; analysis_advice?: string
+    related_diff_ids: string[]; related_rule_ids: string[]; requires_manual_action: boolean; analysis_advice?: string
+    validation_status?: 'CONFIRMED' | 'REVIEW_REQUIRED'; validation_source?: 'RULE' | 'LLM' | 'RULE_AND_LLM'; validation_reason_code?: string
 }
 export interface ReviewItem {
   review_id: string; module_code: string; reason_code: string; title: string; description: string

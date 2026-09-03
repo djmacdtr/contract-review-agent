@@ -75,10 +75,67 @@ async def test_downloader_rejects_private_target_without_allowlist(tmp_path: Pat
     async with TaskWorkspace(tmp_path, "tsk_private") as workspace:
         with pytest.raises(WorkflowError) as caught:
             await service.prepare(
-                [{"file_id": "fil_1", "file_name": "a.docx", "url": "http://127.0.0.1/a.docx", "safe_url": "http://127.0.0.1/a.docx", "role": "TARGET"}],
+                [
+                    {
+                        "file_id": "fil_1",
+                        "file_name": "a.docx",
+                        "url": "http://127.0.0.1/a.docx",
+                        "safe_url": "http://127.0.0.1/a.docx",
+                        "role": "TARGET",
+                    }
+                ],
                 workspace,
             )
     assert caught.value.code == "DOWNLOAD_FORBIDDEN_TARGET"
+
+
+async def test_downloader_allows_only_the_configured_console_upload_route(
+    tmp_path: Path,
+) -> None:
+    service = SafeFileDownloadService(
+        settings(
+            tmp_path,
+            DOWNLOAD_HOST_ALLOWLIST="example.com",
+            CONSOLE_UPLOAD_BASE_URL="http://127.0.0.1:8000",
+        ),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=DOCX_BYTES, request=request)
+        ),
+        resolver=private_resolver,
+    )
+    async with TaskWorkspace(tmp_path, "tsk_console_upload") as workspace:
+        files = await service.prepare(
+            [
+                {
+                    "file_id": "fil_console",
+                    "file_name": "合同.docx",
+                    "url": "http://127.0.0.1:8000/api/v1/console/uploads/upl_ABC123",
+                    "safe_url": "http://127.0.0.1:8000/api/v1/console/uploads/upl_ABC123",
+                    "role": "TARGET",
+                }
+            ],
+            workspace,
+        )
+        assert files[0].path.read_bytes() == DOCX_BYTES
+
+        for forbidden_url in (
+            "http://127.0.0.1:8000/health",
+            "http://127.0.0.1:8001/api/v1/console/uploads/upl_ABC123",
+        ):
+            with pytest.raises(WorkflowError) as caught:
+                await service.prepare(
+                    [
+                        {
+                            "file_id": "fil_forbidden",
+                            "file_name": "合同.docx",
+                            "url": forbidden_url,
+                            "safe_url": forbidden_url,
+                            "role": "TARGET",
+                        }
+                    ],
+                    workspace,
+                )
+            assert caught.value.code == "DOWNLOAD_FORBIDDEN_TARGET"
 
 
 async def test_downloader_revalidates_redirect_and_enforces_streamed_size(tmp_path: Path) -> None:
@@ -95,7 +152,15 @@ async def test_downloader_revalidates_redirect_and_enforces_streamed_size(tmp_pa
     async with TaskWorkspace(tmp_path, "tsk_redirect") as workspace:
         with pytest.raises(WorkflowError) as caught:
             await redirect_service.prepare(
-                [{"file_id": "fil_1", "file_name": "a.docx", "url": "http://example.com/a.docx", "safe_url": "http://example.com/a.docx", "role": "TARGET"}],
+                [
+                    {
+                        "file_id": "fil_1",
+                        "file_name": "a.docx",
+                        "url": "http://example.com/a.docx",
+                        "safe_url": "http://example.com/a.docx",
+                        "role": "TARGET",
+                    }
+                ],
                 workspace,
             )
     assert caught.value.code == "DOWNLOAD_FORBIDDEN_TARGET"
@@ -109,7 +174,15 @@ async def test_downloader_revalidates_redirect_and_enforces_streamed_size(tmp_pa
     async with TaskWorkspace(tmp_path, "tsk_large") as workspace:
         with pytest.raises(WorkflowError) as caught:
             await size_service.prepare(
-                [{"file_id": "fil_1", "file_name": "a.docx", "url": "http://fixture-server/a.docx", "safe_url": "http://fixture-server/a.docx", "role": "TARGET"}],
+                [
+                    {
+                        "file_id": "fil_1",
+                        "file_name": "a.docx",
+                        "url": "http://fixture-server/a.docx",
+                        "safe_url": "http://fixture-server/a.docx",
+                        "role": "TARGET",
+                    }
+                ],
                 workspace,
             )
     assert caught.value.code == "FILE_TOO_LARGE"
@@ -124,7 +197,15 @@ async def test_downloader_rejects_content_signature_mismatch(tmp_path: Path) -> 
     async with TaskWorkspace(tmp_path, "tsk_bad") as workspace:
         with pytest.raises(WorkflowError) as caught:
             await service.prepare(
-                [{"file_id": "fil_1", "file_name": "a.docx", "url": "http://fixture-server/a.docx", "safe_url": "http://fixture-server/a.docx", "role": "TARGET"}],
+                [
+                    {
+                        "file_id": "fil_1",
+                        "file_name": "a.docx",
+                        "url": "http://fixture-server/a.docx",
+                        "safe_url": "http://fixture-server/a.docx",
+                        "role": "TARGET",
+                    }
+                ],
                 workspace,
             )
     assert caught.value.code == "FILE_CONTENT_INVALID"

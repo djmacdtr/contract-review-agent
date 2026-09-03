@@ -112,3 +112,14 @@ def test_page_and_content_block_missing_are_deletion_risks() -> None:
         "DELETION_OR_MISSING",
     ]
     assert all("连续内容" in item["description"] for item in risks)
+
+
+def test_risk_items_do_not_expose_display_risk_levels() -> None:
+    numeric = difference()
+    numeric = numeric.model_copy(
+        update={"target": numeric.target.model_copy(update={"text": "金额为120万元"})}
+    )
+
+    risks = build_risk_items([numeric], module_code="VERSION_CHANGE")
+
+    assert "risk_level" not in risks[0]

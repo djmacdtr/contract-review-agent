@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -51,14 +51,29 @@ class DiffItem(BaseModel):
     segments: list[DiffSegment] = Field(default_factory=list)
     confidence: float = Field(ge=0, le=1)
     requires_manual_review: bool = True
-    review_reason: Literal[
-        "OCR_SINGLE_CHAR_VARIANCE",
-        "OCR_PLACEHOLDER_VARIANCE",
-        "OCR_READING_ORDER_VARIANCE",
-        "OCR_LOW_CONFIDENCE_VARIANCE",
-    ] | None = None
+    review_reason: (
+        Literal[
+            "OCR_SINGLE_CHAR_VARIANCE",
+            "OCR_PLACEHOLDER_VARIANCE",
+            "OCR_READING_ORDER_VARIANCE",
+            "OCR_LOW_CONFIDENCE_VARIANCE",
+        ]
+        | None
+    ) = None
     certainty: Literal["CONFIRMED", "INFERRED"] | None = None
     missing_detail: MissingDetail | None = None
+    validation_status: Literal["CONFIRMED", "REVIEW_REQUIRED"] = Field(
+        default="CONFIRMED", exclude=True
+    )
+    validation_source: Literal["RULE", "LLM", "RULE_AND_LLM"] = Field(default="RULE", exclude=True)
+    validation_reason_code: str | None = Field(default=None, exclude=True)
+    # Candidate identity is internal to FINAL_LOGICAL_V2.  It is deliberately
+    # excluded from the public result while remaining available to the
+    # candidate validator before result materialisation.
+    candidate_id: str | None = Field(default=None, exclude=True)
+    # Opaque logical-area identity used only while FINAL_LOGICAL_V2 converges
+    # repeated physical references to one merged region.
+    logical_area_key: str | None = Field(default=None, exclude=True)
 
 
 class ComparisonDiagnostics(BaseModel):
@@ -86,3 +101,9 @@ class ComparisonResult(BaseModel):
     diff_items: list[DiffItem]
     warnings: list[ProcessingWarning] = Field(default_factory=list)
     diagnostics: ComparisonDiagnostics
+    # Internal V2 candidate catalog and safe convergence counters.  These are
+    # consumed by the workflow and never serialized into TaskResultData.
+    candidate_records: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+    validation_stats: dict[str, int] = Field(default_factory=dict, exclude=True)
+    validation_metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    dedup_groups: list[dict[str, Any]] = Field(default_factory=list, exclude=True)

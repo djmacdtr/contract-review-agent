@@ -11,6 +11,10 @@ from app.adapters.document_parser.cached_parser import (
 from app.adapters.document_parser.textin_parser import TextInDocumentParser
 from app.adapters.llm.base import ContractLlmClient
 from app.adapters.llm.openai_client import OpenAIContractLlmClient
+from app.comparison.duplicate_clusters import (
+    apply_deterministic_final_compare_filters,
+    validate_final_compare_duplicate_clusters,
+)
 from app.comparison.engine import (
     CompareOptions,
     compare_documents,
@@ -21,7 +25,10 @@ from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
 from app.db.session import SessionFactory
 from app.documents.models import ParsedDocument, ProcessingWarning
-from app.documents.page_locations import apply_docx_page_location_sidecars
+from app.documents.page_locations import (
+    apply_docx_page_location_sidecars,
+    validate_public_page_coverage,
+)
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
 from app.results.advice import (
@@ -29,15 +36,21 @@ from app.results.advice import (
 )
 from app.results.advice_batches import generate_advice_in_batches
 from app.results.passed_checks import build_comparison_passed_checks
-from app.results.risk_model import build_risk_items, build_statistics
+from app.results.risk_model import (
+    build_comparison_review_items,
+    build_risk_items,
+    build_statistics,
+)
 from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import DOCX_MIME, LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
 from app.workflows.types import WorkflowOutput
 
-FINAL_COMPARE_WORKFLOW_VERSION = "0.6.0"
-FINAL_COMPARE_RULES_VERSION = "0.6.0"
+FINAL_COMPARE_WORKFLOW_VERSION = "0.7.0"
+FINAL_COMPARE_RULES_VERSION = "0.7.0"
+FINAL_COMPARE_LEGACY_WORKFLOW_VERSION = "0.6.0"
+FINAL_COMPARE_LEGACY_RULES_VERSION = "0.6.0"
 
 
 class FinalCompareState(TypedDict, total=False):
@@ -132,6 +145,11 @@ class FinalCompareWorkflowExecutor:
             if "BASELINE" not in by_role or "TARGET" not in by_role:
                 raise WorkflowError("COMPARISON_FAILED", "比对任务缺少基准文件或目标文件")
             raw_options = state.get("options", {})
+            comparison_mode = (
+                "FINAL_LOGICAL_V2"
+                if self.settings.FINAL_COMPARE_LOGICAL_V2_ENABLED
+                else "LEGACY"
+            )
             compared = compare_documents(
                 by_role["BASELINE"],
                 by_role["TARGET"],
@@ -140,21 +158,41 @@ class FinalCompareWorkflowExecutor:
                     ignore_headers_footers=raw_options.get("ignore_headers_footers", True),
                     numeric_sensitive=raw_options.get("numeric_sensitive", True),
                     ocr_low_confidence_threshold=self.settings.OCR_LOW_CONFIDENCE_THRESHOLD,
-                    page_missing_min_equivalent=(
-                        self.settings.PAGE_MISSING_MIN_EQUIVALENT
-                    ),
+                    page_missing_min_equivalent=(self.settings.PAGE_MISSING_MIN_EQUIVALENT),
                     page_missing_min_anchor_similarity=(
                         self.settings.PAGE_MISSING_MIN_ANCHOR_SIMILARITY
                     ),
                     page_missing_min_structure_units=(
                         self.settings.PAGE_MISSING_MIN_STRUCTURE_UNITS
                     ),
+                    comparison_mode=comparison_mode,
                 ),
             )
             if not compared.diagnostics.reliable:
                 raise WorkflowError(
                     "COMPARISON_UNRELIABLE",
                     "两份合同的内容对齐覆盖率不足，未生成正式报告",
+                )
+            if (
+                comparison_mode == "FINAL_LOGICAL_V2"
+                and self.settings.FINAL_COMPARE_EQUIVALENT_FILTER_ENABLED
+            ):
+                await callback(TaskStage.VERSION_COMPARE, 72, "正在应用确定性安全降重")
+                compared = apply_deterministic_final_compare_filters(
+                    compared,
+                    baseline=by_role["BASELINE"],
+                    target=by_role["TARGET"],
+                )
+            if (
+                comparison_mode == "FINAL_LOGICAL_V2"
+                and self.settings.FINAL_COMPARE_LLM_ADJUDICATION_ENABLED
+            ):
+                await callback(TaskStage.VERSION_COMPARE, 72, "正在收敛歧义差异候选")
+                compared = await validate_final_compare_duplicate_clusters(
+                    compared,
+                    self.llm,
+                    baseline=by_role["BASELINE"],
+                    target=by_role["TARGET"],
                 )
             return {"comparison": compared}
 
@@ -195,9 +233,18 @@ class FinalCompareWorkflowExecutor:
         async def persist_result(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.PERSISTING_RESULT, 97, "正在保存确定性比对结果")
             result = state["result"]
-            apply_docx_page_location_sidecars(
-                result, state.get("page_location_sidecars", {})
-            )
+            apply_docx_page_location_sidecars(result, state.get("page_location_sidecars", {}))
+            if (
+                self.settings.DOCX_PAGE_LOCATION_ENABLED
+                and result.get("metadata", {}).get("comparison_mode")
+                == "FINAL_LOGICAL_V2"
+            ):
+                page_coverage = validate_public_page_coverage(
+                    result, state.get("page_location_sidecars", {})
+                )
+                result.setdefault("metadata", {})[
+                    "page_location_coverage"
+                ] = page_coverage
             return {"result": result}
 
         graph.add_node("download_files", download_files)
@@ -250,7 +297,24 @@ class FinalCompareWorkflowExecutor:
             }
             for document in documents
         ]
-        diffs = [item.model_dump(mode="json") for item in comparison.diff_items]
+        is_logical_v2 = comparison.diagnostics.fallback_mode == "FINAL_LOGICAL_V2"
+        public_comparison_diffs = (
+            [
+                item
+                for item in comparison.diff_items
+                if item.validation_status == "CONFIRMED"
+            ]
+            if is_logical_v2
+            else list(comparison.diff_items)
+        )
+        review_items = (
+            build_comparison_review_items(
+                comparison.diff_items, module_code="VERSION_CHANGE"
+            )
+            if is_logical_v2
+            else []
+        )
+        diffs = [item.model_dump(mode="json") for item in public_comparison_diffs]
         stamp_images = [
             {
                 "file_name": document.file_name,
@@ -261,18 +325,19 @@ class FinalCompareWorkflowExecutor:
             for stamp in document.stamp_images
         ]
         risk_items = build_risk_items(
-            comparison.diff_items, module_code="VERSION_CHANGE"
+            public_comparison_diffs, module_code="VERSION_CHANGE"
         )
         passed_checks = build_comparison_passed_checks(
             documents,
-            comparison.diff_items,
+            public_comparison_diffs,
             comparison.diagnostics,
             check_prefix="check_final",
             module_code="VERSION_CHANGE",
             content_title="合同内容未发生变化",
             numeric_sensitive=(options or {}).get("numeric_sensitive", True),
+            pending_differences=comparison.diff_items if is_logical_v2 else None,
         )
-        statistics = build_statistics(risk_items, [], passed_checks)
+        statistics = build_statistics(risk_items, review_items, passed_checks)
         conclusion = "RISK_FOUND" if risk_items else "PASS"
         warnings = [warning.model_dump(mode="json") for warning in comparison.warnings]
         warnings.append(
@@ -300,7 +365,7 @@ class FinalCompareWorkflowExecutor:
             "files": files,
             "stamp_images": stamp_images,
             "risk_items": risk_items,
-            "review_items": [],
+            "review_items": review_items,
             "passed_checks": passed_checks,
             "diff_items": diffs,
             "fact_matrix": [],
@@ -314,11 +379,25 @@ class FinalCompareWorkflowExecutor:
             },
             "metadata": {
                 "execution_mode": "RULE_BASED",
-                "workflow_version": FINAL_COMPARE_WORKFLOW_VERSION,
-                "rules_version": FINAL_COMPARE_RULES_VERSION,
+                "workflow_version": (
+                    FINAL_COMPARE_WORKFLOW_VERSION
+                    if is_logical_v2
+                    else FINAL_COMPARE_LEGACY_WORKFLOW_VERSION
+                ),
+                "rules_version": (
+                    FINAL_COMPARE_RULES_VERSION
+                    if is_logical_v2
+                    else FINAL_COMPARE_LEGACY_RULES_VERSION
+                ),
                 "primary_model": None,
-                "model_runs": [],
+                "model_runs": (
+                    [comparison.validation_metadata]
+                    if comparison.validation_metadata.get("purpose")
+                    else []
+                ),
                 "comparison_diagnostics": comparison.diagnostics.model_dump(mode="json"),
+                "comparison_mode": comparison.diagnostics.fallback_mode,
+                "candidate_validation": comparison.validation_stats,
             },
             "mock": False,
         }

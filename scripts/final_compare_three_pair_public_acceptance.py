@@ -188,6 +188,9 @@ def runtime_settings(base: Settings) -> Settings:
             "LLM_EXTRACTION_TASK_CONCURRENCY": 2,
             "LLM_HTTP_RETRY_ATTEMPTS": 1,
             "WORKER_MAX_CONCURRENT_TASKS": 1,
+            "FINAL_COMPARE_LOGICAL_V2_ENABLED": True,
+            "FINAL_COMPARE_EQUIVALENT_FILTER_ENABLED": True,
+            "FINAL_COMPARE_LLM_ADJUDICATION_ENABLED": False,
         }
     )
 
@@ -1049,11 +1052,11 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     f"http://127.0.0.1:{port}/"
                     f"{quote(path.relative_to(FILE_ROOT).as_posix(), safe='/')}"
                 )
-                for pair_index, pair in enumerate(PAIR_SPECS, start=1)
+                for pair_index, pair in enumerate(PAIR_SPECS[: args.pair_limit], start=1)
                 for role, path in (("BASELINE", pair["baseline"]), ("TARGET", pair["target"]))
             }
             async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
-                for pair_index, pair in enumerate(PAIR_SPECS, start=1):
+                for pair_index, pair in enumerate(PAIR_SPECS[: args.pair_limit], start=1):
                     if pair_index > 1:
                         health = await client.get(f"{args.api_base_url}/health")
                         if health.status_code != 200:
@@ -1078,7 +1081,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                                 "cache_preflight": pair_cache,
                             }
                         )
-                        continue
+                        report["stop_reason"] = "FIRST_PAIR_CACHE_PREFLIGHT_FAILED"
+                        break
                     item = await run_one_pair(
                         client=client,
                         api_base_url=args.api_base_url,
@@ -1093,6 +1097,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     report.setdefault("tasks", []).append(item)
                     report["task_creation_count"] += int(item.get("create_status") == 202)
+                    if item.get("status") != "SUCCEEDED":
+                        report["stop_reason"] = "FIRST_FAILED_PAIR"
+                        break
         finally:
             server.shutdown()
             server.server_close()
@@ -1107,7 +1114,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         tasks = report.get("tasks", [])
         report["status"] = (
             "SUCCEEDED"
-            if len(tasks) == 3 and all(item.get("status") == "SUCCEEDED" for item in tasks)
+            if len(tasks) == args.pair_limit
+            and all(item.get("status") == "SUCCEEDED" for item in tasks)
             else "PARTIAL" if tasks else "BLOCKED"
         )
         return report
@@ -1125,6 +1133,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markdown-output", type=Path)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--ocr-canary-only", action="store_true")
+    parser.add_argument(
+        "--pair-limit",
+        type=int,
+        choices=range(1, len(PAIR_SPECS) + 1),
+        default=len(PAIR_SPECS),
+        help="本次最多串行执行的配对数量；正式收口首轮使用 1。",
+    )
     parser.add_argument("--task-timeout", type=float, default=900.0)
     return parser.parse_args()
 

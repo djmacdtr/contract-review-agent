@@ -49,6 +49,8 @@ async def test_client_sends_binary_auth_and_fixed_parameters(tmp_path: Path) -> 
     async def handler(request: httpx.Request) -> httpx.Response:
         observed["auth"] = request.headers.get("x-api-key")
         observed["content_type"] = request.headers.get("content-type")
+        observed["content_length"] = request.headers.get("content-length")
+        observed["transfer_encoding"] = request.headers.get("transfer-encoding")
         observed["query"] = dict(request.url.params)
         observed["body"] = await request.aread()
         return httpx.Response(200, json=success_payload())
@@ -61,6 +63,8 @@ async def test_client_sends_binary_auth_and_fixed_parameters(tmp_path: Path) -> 
     assert response._response_size_bytes > 0
     assert observed["auth"] == "unit-test-secret"
     assert observed["content_type"] == "application/octet-stream"
+    assert observed["content_length"] == str(len(b"%PDF-1.7\nsynthetic"))
+    assert observed["transfer_encoding"] is None
     assert observed["body"] == b"%PDF-1.7\nsynthetic"
     query = observed["query"]
     assert query["parse_mode"] == "auto"

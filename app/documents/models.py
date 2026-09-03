@@ -25,6 +25,11 @@ class TableCell(BaseModel):
     raw_text: str
     normalized_text: str
     location: DocumentLocation
+    # Parser-owned logical-cell metadata.  It is internal structure data and
+    # is not copied into the public result schema.
+    logical_cell_id: str | None = None
+    row_span: int = Field(default=1, ge=1)
+    col_span: int = Field(default=1, ge=1)
 
 
 class TableRow(BaseModel):

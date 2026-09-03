@@ -59,6 +59,33 @@ async def test_docx_parser_preserves_paragraph_table_order_and_locations(tmp_pat
     assert parsed.page_count is None
 
 
+async def test_docx_parser_keeps_vertical_merge_identity_stable(tmp_path: Path) -> None:
+    path = tmp_path / "merged.docx"
+    document = Document()
+    table = document.add_table(rows=3, cols=2)
+    table.cell(0, 0).text = "位置"
+    table.cell(0, 0).merge(table.cell(1, 0)).merge(table.cell(2, 0))
+    table.cell(0, 1).text = "名称"
+    table.cell(1, 1).text = "设备A"
+    table.cell(2, 1).text = "设备B"
+    document.save(path)
+
+    parsed = await DocxParser().parse(
+        local_file(
+            path,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        )
+    )
+
+    rows = parsed.blocks[0].table.rows if parsed.blocks[0].table else []
+    assert rows[0].cells[0].logical_cell_id == rows[1].cells[0].logical_cell_id
+    assert rows[1].cells[0].row_span == 3
+    assert rows[1].cells[0].location.column == 0
+
+
 async def test_text_pdf_parser_has_page_locations_and_rejects_empty_pdf(tmp_path: Path) -> None:
     text_path = tmp_path / "text.pdf"
     canvas = Canvas(str(text_path))

@@ -1992,6 +1992,37 @@ def validate_public_page_coverage(
                     sidecar=sidecars.get(first_evidence_location(evidence)[0]),
                 ),
             )
+    # FINAL_LOGICAL_V2 publishes uncertain candidates through review_items
+    # rather than risk_items.  Their evidence is still public and must obey
+    # the same physical-page gate.  Legacy review records without evidence
+    # remain informational and do not acquire a new blocking requirement.
+    for review in result.get("review_items", []):
+        if not isinstance(review, dict):
+            continue
+        evidence_items = review.get("source_evidence", [])
+        if not isinstance(evidence_items, list):
+            continue
+        for evidence in evidence_items:
+            if not isinstance(evidence, dict):
+                continue
+            pairs = evidence_pages(evidence)
+            if not pairs:
+                continue
+            required += 1
+            if all(valid_page(file_id, page) for file_id, page in pairs):
+                covered += 1
+                continue
+            _fail(
+                "PUBLIC_EVIDENCE_MAPPING",
+                "PUBLIC_REVIEW_EVIDENCE_PAGE_MISSING",
+                **_public_coverage_failure_details(
+                    required_evidence_count=required,
+                    covered_evidence_count=covered,
+                    file_id=first_evidence_location(evidence)[0],
+                    location=first_evidence_location(evidence)[1],
+                    sidecar=sidecars.get(first_evidence_location(evidence)[0]),
+                ),
+            )
     return {
         "required_evidence_count": required,
         "covered_evidence_count": covered,

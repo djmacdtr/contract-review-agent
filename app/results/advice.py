@@ -201,9 +201,7 @@ def extract_dynamic_advice_anchors(
     return list(anchors.items())
 
 
-def advice_has_dynamic_anchor(
-    result: dict[str, Any], risk: dict[str, Any], advice: str
-) -> bool:
+def advice_has_dynamic_anchor(result: dict[str, Any], risk: dict[str, Any], advice: str) -> bool:
     normalized_advice = " ".join(advice.split())
     lowered = normalized_advice.casefold()
     if any(phrase in lowered for phrase in GENERIC_ADVICE_PHRASES):
@@ -314,11 +312,7 @@ def validate_advice_item(
 
     if require_dynamic_anchor and not advice_has_dynamic_anchor(
         result,
-        next(
-            risk
-            for risk in result.get("risk_items", [])
-            if str(risk.get("risk_id")) == risk_id
-        ),
+        next(risk for risk in result.get("risk_items", []) if str(risk.get("risk_id")) == risk_id),
         normalized_advice,
     ):
         return AdviceItemValidation(False, normalized_advice, "NOT_SPECIFIC")
@@ -364,8 +358,7 @@ def _short(value: str, limit: int = 100) -> str:
 
 def _risk_context(result: dict[str, Any], risk: dict[str, Any]) -> tuple[str, str, str]:
     file_names = {
-        item.get("file_id"): item.get("file_name", "相关文件")
-        for item in result.get("files", [])
+        item.get("file_id"): item.get("file_name", "相关文件") for item in result.get("files", [])
     }
     diff_by_id = {item.get("diff_id"): item for item in result.get("diff_items", [])}
     locations: list[str] = []
@@ -403,10 +396,17 @@ def _risk_context(result: dict[str, Any], risk: dict[str, Any]) -> tuple[str, st
 
 def fallback_analysis_advice(result: dict[str, Any], risk: dict[str, Any]) -> str:
     file_names = {
-        item.get("file_id"): item.get("file_name", "相关文件")
-        for item in result.get("files", [])
+        item.get("file_id"): item.get("file_name", "相关文件") for item in result.get("files", [])
     }
     diff_by_id = {item.get("diff_id"): item for item in result.get("diff_items", [])}
+    if risk.get("validation_status") == "REVIEW_REQUIRED":
+        location, deleted, inserted = _risk_context(result, risk)
+        detail = "；".join(item for item in (deleted, inserted) if item)
+        detail_text = f"，涉及“{detail}”" if detail else ""
+        return (
+            f"该项差异需要人工复核，请核对双方原文及对应位置（{location}）"
+            f"{detail_text}，确认是否构成实际版本变化。"
+        )
     missing_diff = next(
         (
             diff_by_id.get(diff_id)
@@ -472,18 +472,14 @@ def ensure_fallback_risk_advices(result: dict[str, Any]) -> None:
             risk["analysis_advice"] = fallback_analysis_advice(result, risk)
 
 
-def advice_payload(
-    result: dict[str, Any], risk_ids: set[str] | None = None
-) -> dict[str, Any]:
+def advice_payload(result: dict[str, Any], risk_ids: set[str] | None = None) -> dict[str, Any]:
     selected_risk_items = [
         item
         for item in result.get("risk_items", [])
         if risk_ids is None or str(item.get("risk_id")) in risk_ids
     ]
     related_ids = {
-        diff_id
-        for risk in selected_risk_items
-        for diff_id in risk.get("related_diff_ids", [])
+        diff_id for risk in selected_risk_items for diff_id in risk.get("related_diff_ids", [])
     }
     evidence_keys = {
         (

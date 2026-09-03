@@ -7,7 +7,16 @@ from app.comparison.models import ComparisonDiagnostics, DiffItem
 from app.documents.models import ParsedDocument
 
 CONTENT_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
-    ("date", "日期", re.compile(r"\d{4}[年./-]\d{1,2}(?:[月./-]\d{1,2}日?)?")),
+    (
+        "date",
+        "日期",
+        re.compile(
+            r"(?:\d{4}[年./-]\d{1,2}(?:[月./-]\d{1,2}日?)?|"
+            r"[零〇一二三四五六七八九十百千万]{2,4}年"
+            r"[零〇一二三四五六七八九十百千万0-9]{1,2}月"
+            r"(?:[零〇一二三四五六七八九十百千万0-9]{1,2}日)?)"
+        ),
+    ),
     (
         "duration",
         "期限",
@@ -60,11 +69,20 @@ def build_comparison_passed_checks(
     module_code: str,
     content_title: str,
     numeric_sensitive: bool,
+    pending_differences: list[DiffItem] | None = None,
 ) -> list[dict[str, Any]]:
     if not diagnostics.reliable:
         return []
+    all_differences = (
+        list(pending_differences)
+        if pending_differences is not None
+        else list(differences)
+    )
+    # A pending/uncertain candidate is evidence that the corresponding
+    # category was not conclusively checked.  It must not be reported as a
+    # passed check merely because it was excluded from formal risks.
     checks: list[dict[str, Any]] = []
-    if not differences:
+    if not all_differences:
         checks.append(
             {
                 "check_id": f"{check_prefix}_content",
@@ -78,7 +96,7 @@ def build_comparison_passed_checks(
         for code, label, pattern in CONTENT_PATTERNS:
             if not all(pattern.search(text) for text in document_texts):
                 continue
-            if any(pattern.search(_diff_text(diff)) for diff in differences):
+            if any(pattern.search(_diff_text(diff)) for diff in all_differences):
                 continue
             checks.append(
                 {
@@ -89,7 +107,7 @@ def build_comparison_passed_checks(
                 }
             )
     if diagnostics.compatible_table_count and not any(
-        diff.diff_type in TABLE_DIFF_TYPES for diff in differences
+        diff.diff_type in TABLE_DIFF_TYPES for diff in all_differences
     ):
         count = diagnostics.compatible_table_count
         checks.append(

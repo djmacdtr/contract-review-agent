@@ -14,6 +14,7 @@ from app.documents.models import (
 )
 from app.draft_review.extraction import extract_documents_with_independent_map_reduce
 from app.draft_review.facts import (
+    EvidenceValidationError,
     build_text_fact_payload,
     filter_text_fact_evidence,
     plan_text_document_batches,
@@ -130,6 +131,48 @@ def test_text_evidence_filter_all_invalid_candidates_returns_empty() -> None:
                     "display_name": "虚构主体",
                     "value_type": "ENTITY",
                     "quote": "乙方",
+                    "confidence": 0.9,
+                }
+            ],
+            "has_more": False,
+        },
+    )
+
+    assert facts == []
+    assert discarded == {"FACT_QUOTE_NOT_GROUNDED": 1}
+
+
+def test_text_evidence_filter_keeps_document_identity_strict() -> None:
+    document = paragraph_document()
+    payload = build_text_fact_payload(document, document.blocks, batch_id="batch_text")
+    payload["file_id"] = "different_file"
+
+    with pytest.raises(EvidenceValidationError) as caught:
+        filter_text_fact_evidence(
+            document,
+            payload,
+            {"items": [], "has_more": False},
+        )
+
+    assert caught.value.code == "FACT_SOURCE_FILE_MISMATCH"
+
+
+def test_text_evidence_filter_discards_missing_quote_without_raising() -> None:
+    document = paragraph_document()
+    payload = build_text_fact_payload(document, document.blocks, batch_id="batch_text")
+    unit_id = payload["units"][0]["unit_id"]
+
+    facts, discarded = filter_text_fact_evidence(
+        document,
+        payload,
+        {
+            "items": [
+                {
+                    "unit_id": unit_id,
+                    "semantic_key": "guarantor",
+                    "display_name": "保证人",
+                    "value_type": "ENTITY",
+                    "quote": None,
                     "confidence": 0.9,
                 }
             ],

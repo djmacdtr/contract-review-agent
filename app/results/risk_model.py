@@ -13,7 +13,6 @@ DELETION_CHANGE_TYPES = {
     "CONTENT_BLOCK_MISSING",
 }
 
-
 def _diff_evidence(diff: DiffItem) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     for side_name, side in (("BASELINE", diff.baseline), ("TARGET", diff.target)):
@@ -62,6 +61,9 @@ def build_risk_items(
                 "related_diff_ids": [diff.diff_id],
                 "related_rule_ids": [],
                 "requires_manual_action": True,
+                "validation_status": diff.validation_status,
+                "validation_source": diff.validation_source,
+                "validation_reason_code": diff.validation_reason_code,
             }
         )
     for rule in failed_rules or []:
@@ -132,6 +134,37 @@ def build_review_items(
                     }
                 ],
                 "related_diff_ids": [],
+                "requires_manual_action": True,
+            }
+        )
+    return reviews
+
+
+def build_comparison_review_items(
+    differences: list[DiffItem],
+    *,
+    module_code: str,
+) -> list[dict[str, Any]]:
+    """Materialize V2 uncertain comparison candidates for manual review.
+
+    This helper is deliberately separate from the legacy OCR review builder:
+    FINAL_LOGICAL_V2 keeps uncertain table/paragraph alignments out of formal
+    risks while retaining their complete evidence in ``review_items``.
+    """
+
+    reviews: list[dict[str, Any]] = []
+    for diff in differences:
+        if diff.validation_status != "REVIEW_REQUIRED":
+            continue
+        reviews.append(
+            {
+                "review_id": f"review_{diff.diff_id}",
+                "module_code": module_code,
+                "reason_code": diff.validation_reason_code or "REVIEW_REQUIRED",
+                "title": diff.title,
+                "description": "该条款或表格对应关系无法可靠确认，已保留原始证据供人工复核。",
+                "source_evidence": _diff_evidence(diff),
+                "related_diff_ids": [diff.diff_id],
                 "requires_manual_action": True,
             }
         )

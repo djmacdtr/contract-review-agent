@@ -19,6 +19,7 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
 WORKDIR /opt/app
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app
+RUN mkdir -p /var/lib/contract-review/uploads && chown -R app:app /var/lib/contract-review
 COPY --from=python-builder /wheels /wheels
 RUN python -m pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 COPY --chown=app:app app/ ./app/

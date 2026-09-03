@@ -177,7 +177,11 @@ class TextInDocumentParserClient:
                         "POST",
                         f"{base_url}{TEXTIN_ENGINE_PATH}",
                         params=request_parameters,
-                        headers={header: key, "Content-Type": "application/octet-stream"},
+                        headers={
+                            header: key,
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(file.file_size),
+                        },
                         content=self._body(file),
                     ) as response:
                         if response.status_code in TRANSIENT_STATUSES and attempt + 1 < attempts:

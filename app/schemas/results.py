@@ -88,6 +88,9 @@ class RiskItem(BaseModel):
     related_rule_ids: list[str] = Field(default_factory=list)
     requires_manual_action: bool = True
     analysis_advice: str | None = None
+    validation_status: Literal["CONFIRMED", "REVIEW_REQUIRED"] = "CONFIRMED"
+    validation_source: Literal["RULE", "LLM", "RULE_AND_LLM"] = "RULE"
+    validation_reason_code: str | None = None
 
 
 class ReviewItem(BaseModel):

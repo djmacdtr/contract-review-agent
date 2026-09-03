@@ -235,9 +235,7 @@ async def test_review_retries_once_with_missing_candidate_identities() -> None:
     assert len(result.value["decisions"]) == 2
     assert len(bodies) == 2
     for body in bodies:
-        decisions = body["response_format"]["json_schema"]["schema"]["properties"][
-            "decisions"
-        ]
+        decisions = body["response_format"]["json_schema"]["schema"]["properties"]["decisions"]
         assert decisions["minItems"] == decisions["maxItems"] == 2
     correction = bodies[1]["messages"][-1]["content"]
     assert "missing_candidate_identities" in correction
@@ -299,6 +297,187 @@ async def test_review_compact_response_rehydrates_program_owned_identity() -> No
     assert result.value["decisions"][1]["decision"] == "REJECT"
 
 
+async def test_final_compare_candidate_validation_uses_strict_json_schema() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["model"] == "reviewer"
+        assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["strict"] is True
+        return httpx.Response(
+            200,
+            json={
+                "model": "reviewer",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "decisions": [
+                                        {
+                                            "candidate_id": "candidate_12345678",
+                                            "decision": "KEEP_CHANGE",
+                                            "duplicate_of": None,
+                                            "reason_code": "REAL_CHANGE",
+                                            "confidence": 0.95,
+                                        }
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_REVIEW_MODEL="reviewer", LLM_NATIVE_STRUCTURED_OUTPUT=True),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.validate_final_compare_candidates(
+        {
+            "candidates": [
+                {
+                    "candidate_id": "candidate_12345678",
+                    "diff_type": "MODIFIED",
+                    "baseline": {"file_id": "base", "text": "旧"},
+                    "target": {"file_id": "target", "text": "新"},
+                }
+            ]
+        }
+    )
+
+    assert result.value["decisions"][0]["decision"] == "KEEP_CHANGE"
+    assert result.response_format == "json_schema"
+
+
+async def test_final_compare_duplicate_cluster_validation_uses_strict_json_schema() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["model"] == "reviewer"
+        assert body["max_tokens"] == 4096
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        assert body["response_format"]["type"] == "json_schema"
+        assert body["response_format"]["json_schema"]["strict"] is True
+        return httpx.Response(
+            200,
+            json={
+                "model": "reviewer",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "clusters": [
+                                        {
+                                            "cluster_id": "cluster_12345678",
+                                            "decision": "SAME_LOGICAL_DIFF",
+                                            "representative_candidate_id": "candidate_12345678",
+                                            "duplicate_candidate_ids": [
+                                                "candidate_87654321"
+                                            ],
+                                            "reason_code": "MERGED_CELL_GRID_EXPANSION",
+                                            "confidence": 0.98,
+                                        }
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_REVIEW_MODEL="reviewer", LLM_NATIVE_STRUCTURED_OUTPUT=True),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.validate_final_compare_duplicate_clusters(
+        {
+            "clusters": [
+                {
+                    "cluster_id": "cluster_12345678",
+                    "candidate_ids": [
+                        "candidate_12345678",
+                        "candidate_87654321",
+                    ],
+                    "candidates": [],
+                }
+            ]
+        }
+    )
+
+    assert result.value["clusters"][0]["decision"] == "SAME_LOGICAL_DIFF"
+    assert result.response_format == "json_schema"
+
+
+async def test_final_compare_logical_group_validation_uses_four_state_contract() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert body["response_format"]["type"] == "json_schema"
+        assert body["max_tokens"] == 4096
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "groups" in schema["properties"]
+        return httpx.Response(
+            200,
+            json={
+                "model": "reviewer",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "groups": [
+                                        {
+                                            "group_id": "group_12345678",
+                                            "candidate_ids": [
+                                                "candidate_12345678",
+                                                "candidate_87654321",
+                                            ],
+                                            "decision": "DISTINCT_CHANGES",
+                                            "reason_code": "KEEP_BOTH",
+                                            "confidence": 0.99,
+                                        }
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_REVIEW_MODEL="reviewer", LLM_NATIVE_STRUCTURED_OUTPUT=True),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.validate_final_compare_duplicate_clusters(
+        {
+            "groups": [
+                {
+                    "group_id": "group_12345678",
+                    "candidate_ids": [
+                        "candidate_12345678",
+                        "candidate_87654321",
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert result.value["groups"][0]["decision"] == "DISTINCT_CHANGES"
+    assert result.response_format == "json_schema"
+
+
 async def test_real_http_clients_do_not_read_environment_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -311,9 +490,7 @@ async def test_real_http_clients_do_not_read_environment_proxy(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/models"):
-            return httpx.Response(
-                200, json={"data": [{"id": "GLM-5.3-Flash"}]}
-            )
+            return httpx.Response(200, json={"data": [{"id": "GLM-5.3-Flash"}]})
         return httpx.Response(
             200,
             json={
@@ -338,9 +515,7 @@ async def test_probe_models_and_valid_fenced_json() -> None:
         assert request.headers["authorization"] == "Bearer secret-key"
         assert "secret-key" not in str(request.url)
         if request.url.path.endswith("/models"):
-            return httpx.Response(
-                200, json={"data": [{"id": "GLM-5.3-Flash"}]}
-            )
+            return httpx.Response(200, json={"data": [{"id": "GLM-5.3-Flash"}]})
         request_body = json.loads(request.content)
         assert "CompactDocumentFactExtraction" in request_body["messages"][0]["content"]
         return httpx.Response(
@@ -370,7 +545,7 @@ async def test_compact_extraction_preserves_safe_evidence_failure_code() -> None
             200,
             json={
                 "model": "extractor",
-                "choices":[{"message": {"content": json.dumps(invalid, ensure_ascii=False)}}],
+                "choices": [{"message": {"content": json.dumps(invalid, ensure_ascii=False)}}],
             },
         )
 
@@ -396,7 +571,7 @@ async def test_compact_extraction_schema_failure_has_safe_code() -> None:
             200,
             json={
                 "model": "extractor",
-                "choices":[{"message": {"content": '{"profile": {}, "facts": []}'}}],
+                "choices": [{"message": {"content": '{"profile": {}, "facts": []}'}}],
             },
         )
 
@@ -413,6 +588,50 @@ async def test_compact_extraction_schema_failure_has_safe_code() -> None:
     assert len(requests) == 1
 
 
+async def test_document_profile_disables_thinking() -> None:
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "document_kind": "项目方案确认函",
+                                    "title": "项目方案确认函",
+                                    "confidence": 0.9,
+                                    "evidence_locations": [{"paragraph_index": 0}],
+                                },
+                                ensure_ascii=False,
+                            )
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_NATIVE_STRUCTURED_OUTPUT=True),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    await client.extract_document_profile(
+        {
+            "file_id": "fil_reference",
+            "overview_blocks": [{"location": {"paragraph_index": 0}}],
+        }
+    )
+
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 async def test_compact_schema_summary_is_safe_and_normalized() -> None:
     invalid = json.loads(extraction_content())
     invalid["facts"][0]["value_type"] = "NOT_A_VALUE"
@@ -423,7 +642,7 @@ async def test_compact_schema_summary_is_safe_and_normalized() -> None:
             200,
             json={
                 "model": "extractor",
-                "choices":[{"message": {"content": json.dumps(invalid)}}],
+                "choices": [{"message": {"content": json.dumps(invalid)}}],
             },
         )
 
@@ -464,7 +683,7 @@ async def test_compact_schema_summary_drives_one_safe_correction() -> None:
             200,
             json={
                 "model": "extractor",
-                "choices":[{"message": {"content": next(responses)}}],
+                "choices": [{"message": {"content": next(responses)}}],
             },
         )
 
@@ -774,7 +993,7 @@ async def test_text_fact_prompt_requires_empty_json_object_when_no_fact_is_groun
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert "{\"items\":[],\"has_more\":false}" in body["messages"][0]["content"]
+        assert '{"items":[],"has_more":false}' in body["messages"][0]["content"]
         assert body["response_format"]["json_schema"]["schema"]["required"] == [
             "items",
             "has_more",
@@ -801,6 +1020,8 @@ async def test_text_fact_prompt_requires_empty_json_object_when_no_fact_is_groun
     result = await client.extract_text_facts(payload)
 
     assert result.value == {"items": [], "has_more": False}
+
+
 async def test_text_schema_uses_payload_fact_limit() -> None:
     payload = {
         "file_id": "fil_synthetic",
@@ -812,13 +1033,13 @@ async def test_text_schema_uses_payload_fact_limit() -> None:
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["response_format"]["json_schema"]["schema"]["properties"]["items"][
-            "maxItems"
-        ] == 6
+        assert (
+            body["response_format"]["json_schema"]["schema"]["properties"]["items"]["maxItems"] == 6
+        )
         assert "has_more" in body["response_format"]["json_schema"]["schema"]["required"]
-        item_properties = body["response_format"]["json_schema"]["schema"]["$defs"][
-            "TextFactItem"
-        ]["properties"]
+        item_properties = body["response_format"]["json_schema"]["schema"]["$defs"]["TextFactItem"][
+            "properties"
+        ]
         assert set(item_properties) == {
             "unit_id",
             "semantic_key",
@@ -909,9 +1130,7 @@ async def test_text_response_override_is_local_and_keeps_numeric_schema() -> Non
         {
             "file_id": "fil_synthetic",
             "batch_id": "batch_numeric",
-            "units": [
-                {"text": "金额为100元", "location": {"paragraph_index": 0}}
-            ],
+            "units": [{"text": "金额为100元", "location": {"paragraph_index": 0}}],
             "numeric_candidates": [
                 {
                     "candidate_index": 1,
@@ -932,7 +1151,7 @@ async def test_text_response_override_is_local_and_keeps_numeric_schema() -> Non
 
 
 async def test_invalid_text_json_exposes_only_safe_response_metadata() -> None:
-    content = "```json\n{\"items\": [\n"
+    content = '```json\n{"items": [\n'
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1137,9 +1356,7 @@ async def test_mapping_operations_use_expanded_budget_only_for_mapping() -> None
 def test_numeric_response_summary_contains_only_safe_index_counts() -> None:
     payload = {"numeric_candidates": [{"candidate_index": 1}]}
 
-    summary = _numeric_candidate_response_summary(
-        {"items": [{"candidate_index": 2}]}, payload
-    )
+    summary = _numeric_candidate_response_summary({"items": [{"candidate_index": 2}]}, payload)
 
     assert summary == {
         "expected_count": 1,
@@ -1217,7 +1434,7 @@ async def test_numeric_request_includes_required_decision_count_and_dynamic_sche
     assert result.value["items"][0]["candidate_index"] == 1
 
 
-async def test_text_evidence_subcode_survives_malformed_correction() -> None:
+async def test_text_client_defers_quote_grounding_to_extraction_layer() -> None:
     unit_id = "unit_aaaaaaaa"
     payload = {
         "file_id": "fil_synthetic",
@@ -1245,9 +1462,45 @@ async def test_text_evidence_subcode_survives_malformed_correction() -> None:
         ],
         "has_more": False,
     }
-    responses = iter(
-        [json.dumps(invalid_evidence, ensure_ascii=False), "无法严格回查。"]
+    requests = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            json={
+                "model": "extractor",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(invalid_evidence, ensure_ascii=False)},
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
     )
+
+    result = await client.extract_text_facts(payload)
+
+    assert result.value == invalid_evidence
+    assert requests == 1
+    assert result.structure_retries == 0
+
+
+async def test_text_client_keeps_has_more_saturation_strict() -> None:
+    payload = {
+        "file_id": "fil_synthetic",
+        "batch_id": "batch_synthetic_text",
+        "units": [],
+        "readonly_context": [],
+        "requirements": {"max_items": 2},
+    }
 
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1257,7 +1510,9 @@ async def test_text_evidence_subcode_survives_malformed_correction() -> None:
                 "choices": [
                     {
                         "finish_reason": "stop",
-                        "message": {"content": next(responses)},
+                        "message": {
+                            "content": '{"items": [], "has_more": true}',
+                        },
                     }
                 ],
             },
@@ -1272,9 +1527,8 @@ async def test_text_evidence_subcode_survives_malformed_correction() -> None:
     with pytest.raises(LlmClientError) as caught:
         await client.extract_text_facts(payload)
 
-    assert caught.value.code == "LLM_INVALID_JSON"
-    assert caught.value.failure_code == "FACT_QUOTE_NOT_GROUNDED"
-    assert caught.value.structure_retries == 1
+    assert caught.value.code == "LLM_EXTRACTION_EVIDENCE_INVALID"
+    assert caught.value.failure_code == "FACT_BATCH_SATURATED"
 
 
 async def test_length_finish_reason_is_not_structure_corrected() -> None:
@@ -1287,9 +1541,7 @@ async def test_length_finish_reason_is_not_structure_corrected() -> None:
             200,
             json={
                 "model": "extractor",
-                "choices": [
-                    {"finish_reason": "length", "message": {"content": "{"}}
-                ],
+                "choices": [{"finish_reason": "length", "message": {"content": "{"}}],
             },
         )
 
@@ -1326,7 +1578,7 @@ async def test_truncation_diagnostics_include_safe_reasoning_and_usage_metadata(
                     {
                         "finish_reason": "length",
                         "message": {
-                            "content": "{\"",
+                            "content": '{"',
                             "reasoning_content": "internal reasoning",
                         },
                     }

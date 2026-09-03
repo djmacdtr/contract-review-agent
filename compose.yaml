@@ -9,7 +9,10 @@ x-app: &app
     - .env
   environment:
     ALLOW_HTTP_DOWNLOADS: ${ALLOW_HTTP_DOWNLOADS:-false}
-    DOWNLOAD_HOST_ALLOWLIST: ${DOWNLOAD_HOST_ALLOWLIST:-}
+    DOWNLOAD_HOST_ALLOWLIST: api,${DOWNLOAD_HOST_ALLOWLIST:-}
+    UPLOAD_ROOT: ${UPLOAD_ROOT:-/var/lib/contract-review/uploads}
+    CONSOLE_UPLOAD_BASE_URL: ${CONSOLE_UPLOAD_BASE_URL:-http://api:8000}
+    CONSOLE_UPLOAD_RETENTION_DAYS: ${CONSOLE_UPLOAD_RETENTION_DAYS:-7}
     MAX_REFERENCE_FILES: ${MAX_REFERENCE_FILES:-20}
     PDF_MIN_TEXT_CHARS_PER_PAGE: ${PDF_MIN_TEXT_CHARS_PER_PAGE:-20}
     OCR_ENABLED: ${OCR_ENABLED:-false}
@@ -52,6 +55,8 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - upload_data:${UPLOAD_ROOT:-/var/lib/contract-review/uploads}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 5s
@@ -61,6 +66,11 @@ services:
   worker:
     <<: *app
     command: ["python", "-m", "app.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
 
   fixture-server:
     profiles: ["fixtures"]
@@ -90,7 +100,17 @@ services:
       TEST_ADMIN_DATABASE_URL: postgresql://${POSTGRES_USER:-contract}:${POSTGRES_PASSWORD:-contract}@postgres:5432/${POSTGRES_DB:-contract_review}
       MOCK_STAGE_DELAY_SECONDS: "0"
       LLM_ENABLED: "false"
+      LLM_HTTP_RETRY_ATTEMPTS: "4"
+      LLM_MAX_CONCURRENCY: "3"
+      LLM_RESPONSE_FORMAT: prompt_only
+      LLM_TEXT_RESPONSE_FORMAT: json_object
+      LLM_ADVICE_RESPONSE_FORMAT: json_object
+      LLM_NATIVE_STRUCTURED_OUTPUT: "false"
+      LLM_EXTRACTION_TASK_CONCURRENCY: "3"
       OCR_ENABLED: "false"
+      DOCX_PAGE_LOCATION_ENABLED: "false"
+      ALLOW_HTTP_DOWNLOADS: "false"
+      DOWNLOAD_HOST_ALLOWLIST: ""
     depends_on:
       postgres:
         condition: service_healthy
@@ -99,3 +119,5 @@ services:
 volumes:
   postgres_data:
     name: contract-review-postgres-data
+  upload_data:
+    name: contract-review-upload-data

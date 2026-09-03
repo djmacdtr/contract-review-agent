@@ -18,6 +18,17 @@
 - FastAPI：`app.main:app`
 - 初始迁移：`alembic/versions/0001_initial.py`
 
+### 控制台文件上传
+
+控制台的起草检查和放款比对页面支持直接上传 DOCX/PDF。上传文件写入 API 的
+`upload_data` 命名卷，随后以内部 URL 交给原有任务接口；甲方程序仍可继续提交正式文件 URL。
+单文件默认上限为 `MAX_FILE_SIZE_MB`（200MB），上传文件默认保留 7 天。
+若 Worker 使用 Compose 默认的 `http://api:8000` 内部地址，部署环境需要显式开启
+`ALLOW_HTTP_DOWNLOADS=true` 并保留 `api` 在下载白名单；宿主机 Worker 应将基址和白名单改为
+`127.0.0.1`。外部正式文件域名仍需单独加入白名单。
+反向代理需要允许至少 200MB 请求体，并将上传超时设置为覆盖慢速内网连接；部署前应按磁盘容量规划
+`upload_data`，并保留足够空间用于临时 `.part` 文件。
+
 ## Docker 首次启动
 
 需要 Docker Desktop/Engine 和 Docker Compose，不要求宿主机安装 Python 或 Node.js。
@@ -87,7 +98,7 @@ http://fixture-server:8080/保证合同1.docx
 http://fixture-server:8080/保证合同3.docx
 ```
 
-也可以在控制台的“放款阶段比对”页面手工输入上述 URL。fixture-server 不映射宿主机端口，挂载目录为只读。验证结束后如不需要文件服务，可以只停止该 profile 服务：
+也可以通过现有 API 提交上述 URL；控制台的“放款阶段比对”页面支持直接上传文件。fixture-server 不映射宿主机端口，挂载目录为只读。验证结束后如不需要文件服务，可以只停止该 profile 服务：
 
 ```powershell
 docker compose --profile fixtures stop fixture-server
@@ -211,7 +222,7 @@ docker compose logs worker
 
 已实现 FINAL_COMPARE 的受控下载、任务级一致解析计划、同步外部 PDF 解析，以及文字/数值/基础表格差异。DRAFT_REVIEW 已复用可靠正文对齐并增加模板填写区过滤、未填标记和保守的表格检查。对齐引擎会处理中文空格、换行、`<br>`、零宽字符和已确认的解析器展示噪声，支持 1–4 对 1–4 条款合并/拆分、严格的 OCR 表格续行合并、表格兼容门控及页面文本 fallback；不可靠对齐会令任务失败。下载器执行协议、allowlist、DNS/IP、重定向、超时、大小和内容签名校验，但正式部署仍应使用甲方文件域名 allowlist，并评估 DNS rebinding、出口代理和网络策略。外部解析响应会校验业务码、有效页数、逐页内容覆盖、页面状态、段落和表格单元格完整性；不完整结果不会生成正式报告。
 
-尚未实现旧版 DOC、异步 OCR、Embedding/Rerank、复杂模板表格语义、印章、上传、报告文件导出、鉴权和模板库。真实 LLM 网关仍需能力探测和单文档人工验收；完整事实矩阵效果仍需更多真实样本评测和外部 OCR 恢复。现有黄金标注只是回归质量门，不定义生产支持的文档、字段或规则范围。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
+尚未实现旧版 DOC、异步 OCR、Embedding/Rerank、复杂模板表格语义、报告文件导出、鉴权和模板库。控制台上传仅支持本地持久化命名卷中的 DOCX/PDF，正式接口仍支持 URL；真实 LLM 网关仍需能力探测和单文档人工验收；完整事实矩阵效果仍需更多真实样本评测和外部 OCR 恢复。现有黄金标注只是回归质量门，不定义生产支持的文档、字段或规则范围。正式 PDF 解析未配置外部解析器时会明确以 `OCR_NOT_CONFIGURED` 安全失败，不会用本地文本抽取假装完成。
 
 ### 已确认的后续业务边界
 

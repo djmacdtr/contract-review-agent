@@ -5,7 +5,7 @@ import pytest
 from docx import Document
 
 from app.adapters.llm.base import LlmResult
-from app.adapters.llm.openai_client import LlmClientError
+from app.adapters.llm.openai_client import LlmClientError, OpenAIContractLlmClient
 from app.adapters.llm.schemas import SemanticPlanResponse
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
@@ -1287,6 +1287,24 @@ def test_delivery_graph_bypasses_semantic_plan_after_mapping_review(tmp_path: Pa
     assert ("build_result", "generate_advice") in edges
     assert ("generate_advice", "page_enrich") in edges
     assert ("page_enrich", "persist_result") in edges
+
+
+def test_standard_executor_uses_production_text_and_advice_response_modes() -> None:
+    settings = Settings(
+        _env_file=None,
+        LLM_ENABLED=True,
+        LLM_BASE_URL="http://llm.test/v1",
+        LLM_API_KEY="test-key",
+        LLM_RESPONSE_FORMAT="json_schema",
+        LLM_TEXT_RESPONSE_FORMAT="json_object",
+        LLM_ADVICE_RESPONSE_FORMAT="json_object",
+    )
+
+    executor = DraftReviewWorkflowExecutor(settings)
+
+    assert isinstance(executor.llm, OpenAIContractLlmClient)
+    assert executor.llm.text_response_format_override == "json_object"
+    assert executor.llm.advice_response_format_override == "json_object"
 
 
 async def test_delivery_path_skips_semantic_plan_and_publishes_accepted_fact_pass(

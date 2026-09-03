@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import re
 import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 import httpx
 
@@ -19,6 +20,7 @@ Resolver = Callable[[str, int], Awaitable[list[str]]]
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PDF_MIME = "application/pdf"
+_CONSOLE_UPLOAD_PATH_PATTERN = re.compile(r"^/api/v1/console/uploads/upl_[A-Za-z0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,29 @@ class SafeFileDownloadService:
             for host in settings.DOWNLOAD_HOST_ALLOWLIST.split(",")
             if host.strip()
         }
+        self.console_upload_base = urlsplit(settings.CONSOLE_UPLOAD_BASE_URL.rstrip("/"))
+
+    @staticmethod
+    def _effective_port(parsed: SplitResult) -> int | None:
+        if parsed.port is not None:
+            return parsed.port
+        if parsed.scheme == "https":
+            return 443
+        if parsed.scheme == "http":
+            return 80
+        return None
+
+    def _is_trusted_console_upload(self, parsed: SplitResult) -> bool:
+        base = self.console_upload_base
+        if not parsed.hostname or not base.hostname:
+            return False
+        return (
+            parsed.scheme == base.scheme
+            and parsed.hostname.lower().rstrip(".") == base.hostname.lower().rstrip(".")
+            and self._effective_port(parsed) == self._effective_port(base)
+            and parsed.query == ""
+            and _CONSOLE_UPLOAD_PATH_PATTERN.fullmatch(parsed.path) is not None
+        )
 
     async def _validate_url(self, url: str) -> None:
         parsed = urlsplit(url)
@@ -68,11 +93,13 @@ class SafeFileDownloadService:
         if parsed.scheme == "http" and not self.settings.ALLOW_HTTP_DOWNLOADS:
             raise WorkflowError("DOWNLOAD_FORBIDDEN_TARGET", "当前环境不允许 HTTP 文件地址")
         host = parsed.hostname.lower().rstrip(".")
-        explicitly_allowed = host in self.allowlist
+        explicitly_allowed = host in self.allowlist or self._is_trusted_console_upload(parsed)
         if self.allowlist and not explicitly_allowed:
             raise WorkflowError("DOWNLOAD_FORBIDDEN_TARGET", "文件地址主机不在允许列表")
         try:
-            addresses = await self.resolver(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+            addresses = await self.resolver(
+                host, parsed.port or (443 if parsed.scheme == "https" else 80)
+            )
         except (OSError, socket.gaierror) as exc:
             raise WorkflowError("DOWNLOAD_FAILED", "文件地址 DNS 解析失败", retryable=True) from exc
         if not addresses:
@@ -103,7 +130,11 @@ class SafeFileDownloadService:
     @staticmethod
     def _validate_signature(path: Path, expected_mime: str) -> None:
         signature = path.read_bytes()[:8]
-        valid = signature.startswith(b"PK\x03\x04") if expected_mime == DOCX_MIME else signature.startswith(b"%PDF-")
+        valid = (
+            signature.startswith(b"PK\x03\x04")
+            if expected_mime == DOCX_MIME
+            else signature.startswith(b"%PDF-")
+        )
         if not valid:
             raise WorkflowError("FILE_CONTENT_INVALID", "文件内容与声明的格式不一致")
 
@@ -131,7 +162,11 @@ class SafeFileDownloadService:
                         redirects += 1
                         continue
                     if response.status_code >= 400:
-                        raise WorkflowError("DOWNLOAD_FAILED", "文件服务返回下载失败", retryable=response.status_code >= 500)
+                        raise WorkflowError(
+                            "DOWNLOAD_FAILED",
+                            "文件服务返回下载失败",
+                            retryable=response.status_code >= 500,
+                        )
                     declared_length = response.headers.get("content-length")
                     if declared_length and int(declared_length) > max_bytes:
                         raise WorkflowError("FILE_TOO_LARGE", "文件超过允许大小")

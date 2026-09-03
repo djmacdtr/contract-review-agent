@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,28 @@ async def test_draft_review_routes_each_docx_locally_and_each_pdf_external_auto(
         ("fil_reference", "auto"),
         ("fil_reference-2", "auto"),
     ]
+
+
+async def test_draft_review_serializes_external_document_parsing(tmp_path: Path) -> None:
+    class SerialProbeParser(ExternalParser):
+        active = 0
+        max_active = 0
+
+        async def parse(self, file: LocalFile, *, mode: str) -> ParsedDocument:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0)
+                return await super().parse(file, mode=mode)
+            finally:
+                self.active -= 1
+
+    external = SerialProbeParser(parsed())
+    router = DocumentParsingRouter(local=LocalParser(parsed()), external=external)
+
+    files = [scan_file(tmp_path, f"REFERENCE-{index}") for index in range(3)]
+    assert len(await router.parse_draft_review(files)) == 3
+    assert external.max_active == 1
 
 
 async def test_docx_page_location_keeps_local_document_and_records_sidecar(

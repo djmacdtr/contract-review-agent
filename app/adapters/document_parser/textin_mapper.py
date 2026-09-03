@@ -396,6 +396,11 @@ def map_textin_document(
                     TableCell(
                         raw_text=cell.text,
                         normalized_text=normalize_text(cell.text),
+                        logical_cell_id=(
+                            f"table:{table_index}:logical_cell:{cell.row}:{cell.col}"
+                        ),
+                        row_span=cell.row_span,
+                        col_span=cell.col_span,
                         location=DocumentLocation(
                             page=detail.page_id,
                             paragraph_index=detail.paragraph_id,

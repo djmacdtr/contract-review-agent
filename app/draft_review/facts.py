@@ -1352,6 +1352,12 @@ def filter_text_fact_evidence(
     independently safe candidate set.
     """
 
+    if payload.get("file_id") != document.file_id:
+        raise EvidenceValidationError(
+            "text fact payload does not belong to the parsed document",
+            code="FACT_SOURCE_FILE_MISMATCH",
+        )
+
     response = TextFactExtraction.model_validate(value)
     response = response.model_copy(
         update={
@@ -1400,6 +1406,9 @@ def filter_text_fact_evidence(
         if not isinstance(source_text, str):
             discard("FACT_QUOTE_NOT_GROUNDED")
             continue
+        if not isinstance(item.quote, str) or not item.quote:
+            discard("FACT_QUOTE_NOT_GROUNDED")
+            continue
         grounded_quote = match_quote_to_source(source_text, item.quote)
         if grounded_quote is None:
             discard("FACT_QUOTE_NOT_GROUNDED")
@@ -1445,27 +1454,41 @@ def filter_text_fact_evidence(
     return accepted, discarded
 
 
-def build_document_overview_payload(document: ParsedDocument) -> dict[str, Any]:
+def build_document_overview_payload(
+    document: ParsedDocument,
+    *,
+    max_blocks: int = 64,
+    max_chars: int = 6000,
+) -> dict[str, Any]:
     """Build a bounded outline for the one-time document profile call."""
 
     if not document.blocks:
         raise EvidenceValidationError("document has no structural units")
+    max_blocks = max(1, max_blocks)
+    max_chars = max(1, max_chars)
     selected: list[DocumentBlock] = []
     seen: set[str] = set()
-    candidates = [
+    # Put the opening context first so a tight profile budget never loses the
+    # document title/parties before clause headings are considered.
+    candidates = list(document.blocks[:4])
+    candidates.extend(
         block
         for block in document.blocks
         if block.location.section or block.type in {"TABLE", "HEADER"}
-    ]
-    candidates.extend(document.blocks[:4])
+    )
     candidates.extend(document.blocks[-4:])
     for block in candidates:
         if block.block_id in seen:
             continue
         seen.add(block.block_id)
         selected.append(block)
+    if len(selected) > max_blocks:
+        # Keep both the opening/title context and the closing/signature context
+        # when a document contains many clause headings.
+        head_count = (max_blocks + 1) // 2
+        selected = selected[:head_count] + selected[-(max_blocks - head_count) :]
     overview_blocks: list[dict[str, Any]] = []
-    remaining = 6000
+    remaining = max_chars
     for block in selected:
         text = block.raw_text[: max(1, min(len(block.raw_text), remaining))]
         if not text:

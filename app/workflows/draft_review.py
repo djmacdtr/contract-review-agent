@@ -557,7 +557,11 @@ class DraftReviewWorkflowExecutor:
         if llm is not None:
             self.llm = llm
         elif settings.llm_configured:
-            self.llm = OpenAIContractLlmClient(settings)
+            self.llm = OpenAIContractLlmClient(
+                settings,
+                text_response_format_override=settings.LLM_TEXT_RESPONSE_FORMAT,
+                advice_response_format_override=settings.LLM_ADVICE_RESPONSE_FORMAT,
+            )
         else:
             self.llm = None
         self.checkpoint_store = checkpoint_store

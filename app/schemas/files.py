@@ -26,6 +26,17 @@ class RemoteFile(BaseModel):
     )
 
 
+class ConsoleUploadResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    upload_id: str
+    url: HttpUrl
+    file_name: str = Field(min_length=1, max_length=500)
+    mime_type: str = Field(min_length=1, max_length=200)
+    size_bytes: int = Field(gt=0)
+    sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
 class TaskFileView(BaseModel):
     file_id: str
     role: str

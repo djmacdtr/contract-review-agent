@@ -20,7 +20,12 @@ class ContractLlmClient(Protocol):
     async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult: ...
     async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult: ...
     async def extract_numeric_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
-    async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def extract_text_facts(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_structure_correction: bool = True,
+    ) -> LlmResult: ...
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult: ...
     async def plan_semantics(self, payload: dict[str, Any]) -> LlmResult: ...
@@ -29,6 +34,10 @@ class ContractLlmClient(Protocol):
     async def map_fact_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult: ...
     async def cross_validate_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def validate_final_compare_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def validate_final_compare_duplicate_clusters(
+        self, payload: dict[str, Any]
+    ) -> LlmResult: ...
     async def generate_delivery_advice(self, payload: dict[str, Any]) -> LlmResult: ...
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult: ...
 
@@ -57,14 +66,19 @@ class MockContractLlmClient:
 
     async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult:
         return LlmResult(
-            value={"facts": [], "numeric_candidate_decisions": [
-                {
-                    "candidate_index": index,
-                    "decision": "IGNORE",
-                    "reason_code": "NO_FACT",
-                }
-                for index, _candidate in enumerate(payload.get("numeric_candidates", []), start=1)
-            ]},
+            value={
+                "facts": [],
+                "numeric_candidate_decisions": [
+                    {
+                        "candidate_index": index,
+                        "decision": "IGNORE",
+                        "reason_code": "NO_FACT",
+                    }
+                    for index, _candidate in enumerate(
+                        payload.get("numeric_candidates", []), start=1
+                    )
+                ],
+            },
             configured_model=self.model,
             actual_model=None,
             mock=True,
@@ -93,7 +107,12 @@ class MockContractLlmClient:
             mock=True,
         )
 
-    async def extract_text_facts(self, payload: dict[str, Any]) -> LlmResult:
+    async def extract_text_facts(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_structure_correction: bool = True,
+    ) -> LlmResult:
         return LlmResult(
             value={"items": [], "has_more": False},
             configured_model=self.model,
@@ -188,6 +207,51 @@ class MockContractLlmClient:
             configured_model=self.model,
             actual_model=None,
             mock=True,
+        )
+
+    async def validate_final_compare_candidates(self, payload: dict[str, Any]) -> LlmResult:
+        decisions = [
+            {
+                "candidate_id": item["candidate_id"],
+                "decision": "KEEP_CHANGE",
+                "duplicate_of": None,
+                "reason_code": "MOCK_KEEP",
+                "confidence": 1.0,
+            }
+            for item in payload.get("candidates", [])
+            if isinstance(item, dict) and item.get("candidate_id")
+        ]
+        return LlmResult(
+            value={"decisions": decisions},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+            response_format="json_schema",
+        )
+
+    async def validate_final_compare_duplicate_clusters(
+        self, payload: dict[str, Any]
+    ) -> LlmResult:
+        groups = []
+        for cluster in payload.get("groups", payload.get("clusters", [])):
+            candidate_ids = cluster.get("candidate_ids", [])
+            if not candidate_ids:
+                continue
+            groups.append(
+                {
+                    "group_id": cluster.get("group_id", cluster.get("cluster_id")),
+                    "candidate_ids": candidate_ids,
+                    "decision": "DISTINCT_CHANGES",
+                    "reason_code": "MOCK_KEEP",
+                    "confidence": 1.0,
+                }
+            )
+        return LlmResult(
+            value={"groups": groups},
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+            response_format="json_schema",
         )
 
     async def generate_delivery_advice(self, payload: dict[str, Any]) -> LlmResult:

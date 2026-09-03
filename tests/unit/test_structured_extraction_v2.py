@@ -139,8 +139,7 @@ def test_numeric_candidates_must_be_exactly_once_and_program_rehydrates() -> Non
                     "reason_code": "BUSINESS_VALUE",
                     "confidence": 0.9,
                 }
-            ],
-            "has_more": False,
+            ]
         },
     )
     assert classified == {1}
@@ -1454,7 +1453,7 @@ async def test_failed_reduce_does_not_save_document_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_document_snapshot_is_saved_before_later_document_failure() -> None:
+async def test_document_snapshot_is_not_saved_when_the_extraction_round_fails() -> None:
     reference = document().model_copy(
         update={"file_id": "reference_first", "sha256": "b" * 64}
     )
@@ -1497,7 +1496,7 @@ async def test_successful_document_snapshot_is_saved_before_later_document_failu
         for item in store._records.values()
         if item.extraction_version == DOCUMENT_EXTRACTION_CHECKPOINT_VERSION
     ]
-    assert [item.file_sha256 for item in document_snapshots] == [reference.sha256]
+    assert document_snapshots == []
 
 
 @pytest.mark.asyncio
@@ -1594,6 +1593,60 @@ async def test_multi_unit_truncation_bisects_without_exhausting_recovery_budget(
     assert llm.unit_counts == [16, 8, 8, 4, 4, 4, 4]
     assert max(llm.unit_counts) == 16
     assert result["file_a"]["recovery_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_text_saturation_splits_do_not_consume_error_recovery_budget() -> None:
+    blocks = [
+        DocumentBlock(
+            block_id=f"saturated_{index}",
+            type="PARAGRAPH",
+            order=index,
+            raw_text=f"密集业务资料第{index + 1}项包含可核验文本内容",
+            normalized_text=f"密集业务资料第{index + 1}项包含可核验文本内容",
+            location=DocumentLocation(paragraph_index=index),
+        )
+        for index in range(32)
+    ]
+    doc = document().model_copy(update={"role": "TARGET", "blocks": blocks})
+
+    class SaturationAwareLlm(WaveLlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unit_counts: list[int] = []
+
+        async def extract_text_facts(self, payload: dict) -> LlmResult:
+            self.text_calls += 1
+            unit_count = len(payload["units"])
+            self.unit_counts.append(unit_count)
+            if unit_count > 4:
+                raise LlmClientError(
+                    "LLM_EXTRACTION_EVIDENCE_INVALID",
+                    "synthetic saturation",
+                    failure_code="FACT_BATCH_SATURATED",
+                )
+            return LlmResult(
+                value={"items": [], "has_more": False},
+                configured_model="saturation",
+                actual_model="saturation",
+                mock=False,
+            )
+
+    llm = SaturationAwareLlm()
+    result, _ = await extract_documents_with_independent_map_reduce(
+        settings=Settings(
+            _env_file=None,
+            LLM_ENABLED=False,
+            LLM_EXTRACTION_MAX_TEXT_UNITS=8,
+            LLM_EXTRACTION_WAVE_SIZE=8,
+        ),
+        documents=[doc],
+        llm=llm,  # type: ignore[arg-type]
+    )
+
+    assert llm.unit_counts.count(8) == 4
+    assert llm.unit_counts.count(4) == 8
+    assert result["file_a"]["recovery_count"] == 4
 
 
 @pytest.mark.asyncio
@@ -1740,7 +1793,11 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
 
     source = with_file_id(document(), "file_source")
     retry = with_file_id(document(), "file_retry")
-    settings = Settings(_env_file=None, LLM_ENABLED=False)
+    settings = Settings(
+        _env_file=None,
+        LLM_ENABLED=False,
+        LLM_EXTRACTION_MAX_TEXT_UNITS=1,
+    )
     store = InMemoryExtractionCheckpointStore()
     source_task_id = "task_legacy_source"
 
@@ -1833,11 +1890,13 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error_factory", "expected_code"),
+    ("error_factory", "expected_code", "expected_depth", "expected_unit_count"),
     [
         (
             lambda: LlmClientError("LLM_INVALID_JSON", "safe failure"),
             "LLM_INVALID_JSON",
+            1,
+            1,
         ),
         (
             lambda: LlmClientError(
@@ -1846,6 +1905,8 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
                 failure_code="LLM_RESPONSE_SCHEMA_INVALID",
             ),
             "LLM_RESPONSE_SCHEMA_INVALID",
+            0,
+            2,
         ),
         (
             lambda: LlmClientError(
@@ -1854,6 +1915,8 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
                 failure_code="FACT_QUOTE_NOT_GROUNDED",
             ),
             "FACT_QUOTE_NOT_GROUNDED",
+            1,
+            1,
         ),
         (
             lambda: LlmClientError(
@@ -1862,20 +1925,28 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
                 failure_code="FACT_VALUE_NOT_GROUNDED",
             ),
             "FACT_VALUE_NOT_GROUNDED",
+            1,
+            1,
         ),
         (
             lambda: LlmClientError("LLM_TIMEOUT", "safe failure"),
             "LLM_TIMEOUT",
+            0,
+            2,
         ),
         (
             lambda: LlmClientError("LLM_UPSTREAM_ERROR", "safe failure"),
             "LLM_UPSTREAM_ERROR",
+            0,
+            2,
         ),
         (
             lambda: EvidenceValidationError(
                 "unsafe evidence body", code="FACT_QUOTE_NOT_GROUNDED"
             ),
             "FACT_QUOTE_NOT_GROUNDED",
+            1,
+            1,
         ),
         (
             lambda: WorkflowError(
@@ -1884,11 +1955,16 @@ async def test_independent_checkpoint_recovery_reads_legacy_source_identity() ->
                 details={"failure_code": "LLM_UPSTREAM_ERROR"},
             ),
             "LLM_UPSTREAM_ERROR",
+            0,
+            2,
         ),
     ],
 )
 async def test_independent_text_terminal_failure_preserves_safe_context(
-    error_factory, expected_code: str
+    error_factory,
+    expected_code: str,
+    expected_depth: int,
+    expected_unit_count: int,
 ) -> None:
     class FailingText(CheckpointLlm):
         async def extract_text_facts(self, payload: dict) -> LlmResult:
@@ -1908,8 +1984,8 @@ async def test_independent_text_terminal_failure_preserves_safe_context(
         "chain": "text",
         "file": "file_a",
         "file_id": "file_a",
-        "batch_depth": 0,
-        "unit_count": 1,
+        "batch_depth": expected_depth,
+        "unit_count": expected_unit_count,
         "batch_id": caught.value.details["batch_id"],
         "failure_code": expected_code,
     }
@@ -1946,7 +2022,7 @@ async def test_independent_checkpoint_failure_preserves_safe_context() -> None:
     assert caught.value.details["chain"] in {"numeric", "text"}
     assert caught.value.details["file"] == "file_a"
     assert caught.value.details["file_id"] == "file_a"
-    assert caught.value.details["unit_count"] == 1
+    assert caught.value.details["unit_count"] == 2
     assert caught.value.details["failure_code"] == "FACT_QUOTE_NOT_GROUNDED"
     assert caught.value.details["batch_id"].startswith("batch_")
 

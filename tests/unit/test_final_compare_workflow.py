@@ -114,8 +114,8 @@ async def test_final_compare_graph_returns_rule_based_traceable_result_and_clean
     assert result["mock"] is False
     assert result["metadata"]["execution_mode"] == "RULE_BASED"
     assert result["schema_version"] == "2.1"
-    assert result["metadata"]["workflow_version"] == "0.6.0"
-    assert result["metadata"]["rules_version"] == "0.6.0"
+    assert result["metadata"]["workflow_version"] == "0.7.0"
+    assert result["metadata"]["rules_version"] == "0.7.0"
     assert result["metadata"]["comparison_diagnostics"]["reliable"] is True
     assert result["metadata"]["primary_model"] is None
     assert llm.calls == 2

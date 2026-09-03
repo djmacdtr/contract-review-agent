@@ -24,6 +24,9 @@ from app.adapters.llm.schemas import (
     FactMappingResponse,
     FactMappingReview,
     FactReview,
+    FinalCompareCandidateValidationResponse,
+    FinalCompareDuplicateClusterResponse,
+    FinalCompareLogicalGroupResponse,
     NumericCandidateExtraction,
     SemanticConceptPlan,
     SemanticEvidenceRef,
@@ -41,7 +44,6 @@ from app.draft_review.facts import (
     expand_document_overview,
     expand_fact_batch,
     expand_numeric_candidate_response,
-    expand_text_fact_response,
     location_key,
     numeric_candidate_indexes,
 )
@@ -79,6 +81,7 @@ def _safe_usage_summary(value: Any) -> dict[str, int]:
         for key, item in value.items()
         if key in allowed and type(item) is int and item >= 0
     }
+
 
 EXTRACTION_SYSTEM_PROMPT = (
     "你是合同事实抽取器。只返回一个 JSON 对象，不要 Markdown。"
@@ -127,9 +130,9 @@ TEXT_FACT_SYSTEM_PROMPT = (
     "只返回 has_more，以及 unit_id、semantic_key、display_name、value_type、quote、confidence。"
     "数值、日期和标识类事实由 numeric-v2 处理；本链只返回 TEXT、ENTITY 或 UNKNOWN。"
     "不得返回文件身份、位置、证据副本、稳定事实 ID 或原文外的推测。"
-    "没有可可靠识别的非数值事实时，必须返回 JSON {\"items\":[],\"has_more\":false}，"
+    '没有可可靠识别的非数值事实时，必须返回 JSON {"items":[],"has_more":false}，'
     "不得返回解释、拒绝语或自然语言。"
-    "无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {\"items\":[],\"has_more\":false}，"
+    '无法从候选 unit 原文唯一回查 quote 时，也必须返回 JSON {"items":[],"has_more":false}，'
     "不得猜测或改写。"
     "一次最多返回输入 requirements.max_items 指定的项目数；如果仍有更多可靠事实，"
     "返回 has_more=true；如果本批事实已经完整，即使恰好达到上限也返回 has_more=false。"
@@ -375,8 +378,7 @@ def _validate_document_overview(value: Any, payload: dict[str, Any]) -> dict[str
             "LLM_EXTRACTION_EVIDENCE_INVALID",
             "模型文档概况位置未通过安全校验",
             correction_message=(
-                "上一响应引用了不存在的概况位置。只返回输入大纲中的位置，"
-                "不得输出文件 ID 或解释。"
+                "上一响应引用了不存在的概况位置。只返回输入大纲中的位置，不得输出文件 ID 或解释。"
             ),
             failure_code=exc.code,
         ) from exc
@@ -415,9 +417,7 @@ def _validate_fact_batch(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
             ),
             failure_code=exc.code,
         ) from exc
-    return compact.model_dump(
-        mode="json", exclude_none=True
-    )
+    return compact.model_dump(mode="json", exclude_none=True)
 
 
 def _validate_numeric_candidates(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -457,13 +457,41 @@ def _validate_text_facts(value: Any, payload: dict[str, Any]) -> dict[str, Any]:
         response = response.model_copy(
             update={
                 "items": [
-                    item
-                    for item in response.items
-                    if item.value_type in TEXT_FACT_VALUE_TYPES
+                    item for item in response.items if item.value_type in TEXT_FACT_VALUE_TYPES
                 ]
             }
         )
-        expand_text_fact_response(payload, response)
+        try:
+            max_items = int(payload.get("requirements", {}).get("max_items", 12))
+        except (AttributeError, TypeError, ValueError):
+            max_items = 12
+        max_items = max(1, min(max_items, 12))
+        if len(response.items) > max_items:
+            raise LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "模型非数值事实结果超过当前批次上限",
+                correction_message=(
+                    "上一响应返回的事实数量超过本次输入 requirements.max_items。"
+                    "请仅返回不超过该上限的 items，并完整返回 has_more。"
+                ),
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+                validation_summary={
+                    "error_count": 1,
+                    "items": [
+                        {
+                            "path": "items",
+                            "error_type": "too_many_items",
+                            "count": len(response.items),
+                        }
+                    ],
+                    "truncated": False,
+                },
+            )
+        if response.has_more:
+            raise EvidenceValidationError(
+                "text fact batch reached its saturation limit",
+                code="FACT_BATCH_SATURATED",
+            )
     except EvidenceValidationError as exc:
         raise LlmClientError(
             "LLM_EXTRACTION_EVIDENCE_INVALID",
@@ -538,9 +566,7 @@ def _numeric_candidate_response_schema(payload: dict[str, Any]) -> dict[str, Any
     return schema
 
 
-def _numeric_candidate_response_summary(
-    value: Any, payload: dict[str, Any]
-) -> dict[str, int]:
+def _numeric_candidate_response_summary(value: Any, payload: dict[str, Any]) -> dict[str, int]:
     """Return only count/index diagnostics for a numeric response."""
 
     candidates = payload.get("numeric_candidates", [])
@@ -580,7 +606,7 @@ def _text_evidence_correction_message(failure_code: str | None) -> str:
     )
     return (
         "上一响应未通过非数值事实证据校验。"
-        f"{guidance}如果没有任何事实能严格通过校验，必须只返回 JSON {{\"items\":[]}}；"
+        f'{guidance}如果没有任何事实能严格通过校验，必须只返回 JSON {{"items":[]}}；'
         "不得输出解释、拒绝语、Markdown、原文外的推测或改写。"
     )
 
@@ -881,16 +907,10 @@ def compact_review_response_schema(payload: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def compact_review_correction_message(
-    payload: dict[str, Any], value: Any
-) -> str:
+def compact_review_correction_message(payload: dict[str, Any], value: Any) -> str:
     expected = set(range(1, len(payload.get("facts", [])) + 1))
     actual = (
-        [
-            item.get("fact_index")
-            for item in value.get("decisions", [])
-            if isinstance(item, dict)
-        ]
+        [item.get("fact_index") for item in value.get("decisions", []) if isinstance(item, dict)]
         if isinstance(value, dict) and isinstance(value.get("decisions"), list)
         else []
     )
@@ -1031,6 +1051,91 @@ def _validate_mapping_review(value: Any) -> dict[str, Any]:
         ) from exc
 
 
+def _validate_final_compare_candidates(value: Any) -> dict[str, Any]:
+    try:
+        response = FinalCompareCandidateValidationResponse.model_validate(value)
+    except ValidationError as exc:
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "比对候选评审结果不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=_safe_validation_summary(exc),
+        ) from exc
+    ids = [item.candidate_id for item in response.decisions]
+    if len(ids) != len(set(ids)):
+        raise LlmClientError(
+            "LLM_CANDIDATE_VALIDATION_INVALID",
+            "比对候选评审包含重复候选身份",
+            failure_code="LLM_CANDIDATE_VALIDATION_INVALID",
+        )
+    for decision in response.decisions:
+        if decision.decision == "DUPLICATE_OF" and not decision.duplicate_of:
+            raise LlmClientError(
+                "LLM_CANDIDATE_VALIDATION_INVALID",
+                "比对候选重复判断缺少来源身份",
+                failure_code="LLM_CANDIDATE_VALIDATION_INVALID",
+            )
+    return response.model_dump(mode="json")
+
+
+def _validate_final_compare_duplicate_clusters(value: Any) -> dict[str, Any]:
+    # The V2 production wire contract uses ``groups``.  Accepting the older
+    # ``clusters`` shape here keeps historical fixtures and non-V2 callers
+    # readable; the production request schema below remains the new contract.
+    if isinstance(value, dict) and "groups" in value:
+        try:
+            response = FinalCompareLogicalGroupResponse.model_validate(value)
+        except ValidationError as exc:
+            raise LlmClientError(
+                "LLM_SCHEMA_INVALID",
+                "逻辑候选组裁决结果不符合结构约束",
+                failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+                validation_summary=_safe_validation_summary(exc),
+            ) from exc
+        group_ids = [item.group_id for item in response.groups]
+        if len(group_ids) != len(set(group_ids)):
+            raise LlmClientError(
+                "LLM_LOGICAL_GROUP_INVALID",
+                "逻辑候选组裁决包含重复组身份",
+                failure_code="LLM_LOGICAL_GROUP_INVALID",
+            )
+        for decision in response.groups:
+            if len(decision.candidate_ids) != len(set(decision.candidate_ids)):
+                raise LlmClientError(
+                    "LLM_LOGICAL_GROUP_INVALID",
+                    "逻辑候选组裁决包含重复候选身份",
+                    failure_code="LLM_LOGICAL_GROUP_INVALID",
+                )
+        return response.model_dump(mode="json")
+
+    try:
+        response = FinalCompareDuplicateClusterResponse.model_validate(value)
+    except ValidationError as exc:
+        raise LlmClientError(
+            "LLM_SCHEMA_INVALID",
+            "重复簇裁决结果不符合结构约束",
+            failure_code="LLM_RESPONSE_SCHEMA_INVALID",
+            validation_summary=_safe_validation_summary(exc),
+        ) from exc
+    cluster_ids = [item.cluster_id for item in response.clusters]
+    if len(cluster_ids) != len(set(cluster_ids)):
+        raise LlmClientError(
+            "LLM_DUPLICATE_CLUSTER_INVALID",
+            "重复簇裁决包含重复簇身份",
+            failure_code="LLM_DUPLICATE_CLUSTER_INVALID",
+        )
+    for decision in response.clusters:
+        candidate_ids = decision.duplicate_candidate_ids
+        if decision.decision == "SAME_LOGICAL_DIFF":
+            if not candidate_ids or decision.representative_candidate_id in candidate_ids:
+                raise LlmClientError(
+                    "LLM_DUPLICATE_CLUSTER_INVALID",
+                    "重复簇裁决缺少有效候选身份",
+                    failure_code="LLM_DUPLICATE_CLUSTER_INVALID",
+                )
+    return response.model_dump(mode="json")
+
+
 class OpenAIContractLlmClient:
     def __init__(
         self,
@@ -1068,9 +1173,7 @@ class OpenAIContractLlmClient:
         self.text_model_override = text_model_override
         self.numeric_model_override = numeric_model_override
         self.advice_response_format_override = advice_response_format_override
-        self._request_semaphore = asyncio.Semaphore(
-            max(1, settings.LLM_MAX_CONCURRENCY)
-        )
+        self._request_semaphore = asyncio.Semaphore(max(1, settings.LLM_MAX_CONCURRENCY))
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -1105,6 +1208,7 @@ class OpenAIContractLlmClient:
             schema=CompactDocumentOverview,
             max_structure_retries=1,
             max_output_tokens=_PROFILE_MAX_OUTPUT_TOKENS,
+            disable_thinking=True,
         )
 
     async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult:
@@ -1258,6 +1362,55 @@ class OpenAIContractLlmClient:
             disable_thinking=True,
         )
 
+    async def validate_final_compare_candidates(self, payload: dict[str, Any]) -> LlmResult:
+        """Review only ambiguous FINAL_COMPARE candidates.
+
+        The method is intentionally separate from DRAFT_REVIEW mapping and
+        review calls.  It returns candidate identities only; all evidence is
+        re-used from the deterministic comparison result.
+        """
+
+        return await self._structured_completion(
+            model=self.settings.LLM_REVIEW_MODEL,
+            system=(
+                "你是合同版本比对候选去重评审器。仅依据输入的双方证据判断候选是否为真实变化、"
+                "与另一候选重复或无法确定。只能返回输入中的 candidate_id，不得新增文件、"
+                "位置或证据。"
+                "KEEP_CHANGE 表示保留差异；DUPLICATE_OF 必须引用输入中的另一 candidate_id；"
+                "UNCERTAIN 表示保留差异并待人工复核。严格遵守指定 JSON Schema。"
+            ),
+            payload=payload,
+            validator=_validate_final_compare_candidates,
+            schema=FinalCompareCandidateValidationResponse,
+            response_format_override="json_schema",
+            max_structure_retries=1,
+            max_output_tokens=4096,
+            disable_thinking=True,
+        )
+
+    async def validate_final_compare_duplicate_clusters(
+        self, payload: dict[str, Any]
+    ) -> LlmResult:
+        """Review only conservative logical-change groups in V2."""
+
+        return await self._structured_completion(
+            model=self.settings.LLM_REVIEW_MODEL,
+            system=(
+                "你是合同版本比对的逻辑候选组裁决器。只判断输入候选是否属于同一次逻辑变化，"
+                "或是否只是等价排版/移位；不得阅读全文、生成证据、修改文字、页码或位置。"
+                "不得删除真实文字、金额、日期、期限、比例或编号变化。只能返回输入中的 group_id "
+                "和 candidate_id。严格遵守四种决定：SAME_LOGICAL_CHANGE、"
+                "EQUIVALENT_NO_CHANGE、DISTINCT_CHANGES、UNCERTAIN。"
+            ),
+            payload=payload,
+            validator=_validate_final_compare_duplicate_clusters,
+            schema=FinalCompareLogicalGroupResponse,
+            response_format_override="json_schema",
+            max_structure_retries=0,
+            max_output_tokens=4096,
+            disable_thinking=True,
+        )
+
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult:
         return await self._structured_completion(
             model=self.settings.LLM_ADVICE_MODEL,
@@ -1374,16 +1527,12 @@ class OpenAIContractLlmClient:
                     finish_reason = choice.get("finish_reason")
                     message = choice.get("message")
                     if not isinstance(message, dict):
-                        raise LlmClientError(
-                            "LLM_RESPONSE_INVALID", "模型响应缺少消息对象"
-                        )
+                        raise LlmClientError("LLM_RESPONSE_INVALID", "模型响应缺少消息对象")
                     content = message.get("content")
                     reasoning_content = message.get("reasoning_content")
                     content_chars = len(content) if isinstance(content, str) else 0
                     reasoning_content_chars = (
-                        len(reasoning_content)
-                        if isinstance(reasoning_content, str)
-                        else 0
+                        len(reasoning_content) if isinstance(reasoning_content, str) else 0
                     )
                     usage = _safe_usage_summary(response_body.get("usage"))
                     actual_max_tokens = (
@@ -1563,10 +1712,7 @@ class OpenAIContractLlmClient:
             if response.status_code < 400:
                 return response, attempt
             code, message, retryable = self._http_error(response.status_code)
-            if (
-                response.status_code in _HTTP_RETRYABLE_STATUSES
-                and attempt < max_attempts
-            ):
+            if response.status_code in _HTTP_RETRYABLE_STATUSES and attempt < max_attempts:
                 backoff_index = min(attempt - 1, len(_HTTP_RETRY_BACKOFF_SECONDS) - 1)
                 backoff = _HTTP_RETRY_BACKOFF_SECONDS[backoff_index]
                 await self.sleeper(backoff + random.uniform(0.0, 0.25))

@@ -822,8 +822,13 @@ async def _extract_profile(
     document: ParsedDocument,
     llm: ContractLlmClient,
     semaphore: asyncio.Semaphore,
+    settings: Settings | None = None,
 ) -> tuple[str, DocumentFactExtraction, dict[str, Any]]:
-    payload = build_document_overview_payload(document)
+    payload = build_document_overview_payload(
+        document,
+        max_blocks=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_BLOCKS", 64),
+        max_chars=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_CHARS", 6000),
+    )
     async with semaphore:
         result = await llm.extract_document_profile(payload)
     profile_value = expand_document_overview(payload, result.value)
@@ -850,9 +855,11 @@ async def extract_documents_with_map_reduce(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Run one profile call per document and Send-based fact extraction Map–Reduce."""
 
-    profile_semaphore = asyncio.Semaphore(settings.LLM_EXTRACTION_TASK_CONCURRENCY)
+    profile_semaphore = asyncio.Semaphore(
+        getattr(settings, "LLM_PROFILE_CONCURRENCY", 1)
+    )
     profile_results = await asyncio.gather(
-        *(_extract_profile(document, llm, profile_semaphore) for document in documents)
+        *(_extract_profile(document, llm, profile_semaphore, settings) for document in documents)
     )
     profiles = {file_id: value for file_id, value, _meta in profile_results}
     profile_meta = {file_id: meta for file_id, _value, meta in profile_results}
@@ -1250,9 +1257,14 @@ async def extract_documents_with_wave_map_reduce(
     compatibility fixtures while making the production client use this path.
     """
 
-    profile_semaphore = asyncio.Semaphore(settings.LLM_EXTRACTION_TASK_CONCURRENCY)
+    profile_semaphore = asyncio.Semaphore(
+        getattr(settings, "LLM_PROFILE_CONCURRENCY", 1)
+    )
     profile_results = await asyncio.gather(
-        *(_extract_profile(document, llm, profile_semaphore) for document in documents)
+        *(
+            _extract_profile(document, llm, profile_semaphore, settings)
+            for document in documents
+        )
     )
     profiles = {file_id: value for file_id, value, _meta in profile_results}
     profile_meta = {file_id: meta for file_id, _value, meta in profile_results}
@@ -1595,6 +1607,9 @@ async def extract_documents_with_independent_map_reduce(
 
     documents_by_id = {document.file_id: document for document in documents}
     semaphore = asyncio.Semaphore(settings.LLM_EXTRACTION_TASK_CONCURRENCY)
+    profile_semaphore = asyncio.Semaphore(
+        getattr(settings, "LLM_PROFILE_CONCURRENCY", 1)
+    )
     logical_calls = 0
     document_logical_calls: Counter[str] = Counter()
     wave_count = 0
@@ -1726,7 +1741,11 @@ async def extract_documents_with_independent_map_reduce(
         document: ParsedDocument,
     ) -> tuple[str, DocumentFactExtraction, dict[str, Any]]:
         nonlocal logical_calls
-        payload = build_document_overview_payload(document)
+        payload = build_document_overview_payload(
+            document,
+            max_blocks=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_BLOCKS", 64),
+            max_chars=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_CHARS", 6000),
+        )
         batch_id = _checkpoint_batch_id(document, document.blocks, "profile-v2")
         payload["batch_id"] = batch_id
         payload["extraction_version"] = "profile-v2"
@@ -1745,7 +1764,11 @@ async def extract_documents_with_independent_map_reduce(
                 legacy_document = _source_identity_document(
                     document, document.blocks, source_file_id
                 )
-                legacy_payload = build_document_overview_payload(legacy_document)
+                legacy_payload = build_document_overview_payload(
+                    legacy_document,
+                    max_blocks=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_BLOCKS", 64),
+                    max_chars=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_CHARS", 6000),
+                )
                 legacy_payload["batch_id"] = stable_batch_id(
                     document.sha256,
                     legacy_document.blocks,
@@ -1799,7 +1822,7 @@ async def extract_documents_with_independent_map_reduce(
             )
         logical_calls += 1
         document_logical_calls[document.file_id] += 1
-        async with semaphore:
+        async with profile_semaphore:
             result = await llm.extract_document_profile(payload)
         profile_value = expand_document_overview(payload, result.value)
         if checkpoint_store is not None:
@@ -1967,14 +1990,29 @@ async def extract_documents_with_independent_map_reduce(
     async def strict_checkpoint_hit(plan: dict[str, Any]) -> bool:
         if checkpoint_store is None:
             return False
-        checkpoint = await checkpoint_store.load(
-            plan["batch_id"],
-            task_id=task_id,
-            file_sha256=plan["file_sha256"],
-            extraction_version=plan["extraction_version"],
-            payload_digest=_checkpoint_payload_digest(plan["payload"]),
-            source_task_id=source_task_id,
-        )
+        try:
+            checkpoint = await checkpoint_store.load(
+                plan["batch_id"],
+                task_id=task_id,
+                file_sha256=plan["file_sha256"],
+                extraction_version=plan["extraction_version"],
+                payload_digest=_checkpoint_payload_digest(plan["payload"]),
+                source_task_id=source_task_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            raise WorkflowError(
+                "DYNAMIC_CHECK_INCOMPLETE",
+                "事实抽取 checkpoint 预检失败",
+                details=_failure_details(
+                    {
+                        "plan": plan,
+                        "error": exc,
+                        "failure_code": _safe_failure_code(exc),
+                    }
+                ),
+            ) from exc
         return checkpoint is not None and checkpoint.status == "SUCCEEDED"
 
     async def preflight_call_budget() -> None:
@@ -1987,7 +2025,11 @@ async def extract_documents_with_independent_map_reduce(
             }
         else:
             for document in documents_without_snapshot:
-                payload = build_document_overview_payload(document)
+                payload = build_document_overview_payload(
+                    document,
+                    max_blocks=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_BLOCKS", 64),
+                    max_chars=getattr(settings, "LLM_PROFILE_MAX_OVERVIEW_CHARS", 6000),
+                )
                 payload.update(
                     {
                         "batch_id": _checkpoint_batch_id(
@@ -2403,6 +2445,9 @@ async def extract_documents_with_independent_map_reduce(
                     except TypeError as exc:
                         if "allow_structure_correction" not in str(exc):
                             raise
+                        # Compatibility adapters and test doubles written
+                        # before the keyword option remain usable. Production
+                        # clients implement the explicit protocol above.
                         result = await llm.extract_text_facts(payload)
                     facts, discarded_fact_codes = filter_text_fact_evidence(
                         documents_by_id[plan["document_id"]],
@@ -2515,6 +2560,8 @@ async def extract_documents_with_independent_map_reduce(
         all_outcomes: dict[str, dict[str, Any]] = {}
         superseded: set[str] = set()
         recovery_counts: Counter[str] = Counter()
+        budgeted_recovery_counts: Counter[str] = Counter()
+        saturation_split_counts: Counter[str] = Counter()
         first_wave: list[dict[str, Any]] = []
         nonrecoverable_streak = 0
         terminal_failure: dict[str, Any] | None = None
@@ -2709,24 +2756,34 @@ async def extract_documents_with_independent_map_reduce(
                         ]
                     children.extend(new_children)
                     recovery_counts[plan["document_id"]] += 1
-                    if (
-                        recovery_counts[plan["document_id"]]
-                        > recovery_budget[plan["document_id"]]
-                    ):
-                        terminal_failure = outcome
-                        if chain == "text":
-                            details = _failure_details(
-                                outcome,
-                                failure_code="TEXT_RECOVERY_BUDGET_EXHAUSTED",
-                                underlying_failure_code=failure_code,
+                    is_text_saturation_split = (
+                        chain == "text" and failure_code == "FACT_BATCH_SATURATED"
+                    )
+                    if is_text_saturation_split:
+                        # has_more=true is a capacity signal, not a malformed
+                        # response. Its deterministic split remains bounded by
+                        # depth and the global/per-document call limits.
+                        saturation_split_counts[plan["document_id"]] += 1
+                    else:
+                        budgeted_recovery_counts[plan["document_id"]] += 1
+                        if (
+                            budgeted_recovery_counts[plan["document_id"]]
+                            > recovery_budget[plan["document_id"]]
+                        ):
+                            terminal_failure = outcome
+                            if chain == "text":
+                                details = _failure_details(
+                                    outcome,
+                                    failure_code="TEXT_RECOVERY_BUDGET_EXHAUSTED",
+                                    underlying_failure_code=failure_code,
+                                )
+                            else:
+                                details = _failure_details(outcome)
+                            raise WorkflowError(
+                                "DYNAMIC_CHECK_INCOMPLETE",
+                                "事实抽取恢复预算已用尽",
+                                details=details,
                             )
-                        else:
-                            details = _failure_details(outcome)
-                        raise WorkflowError(
-                            "DYNAMIC_CHECK_INCOMPLETE",
-                            "事实抽取恢复预算已用尽",
-                            details=details,
-                        )
                     superseded.add(plan["batch_id"])
                     continue
                 if failure_code in {
@@ -2893,6 +2950,7 @@ async def extract_documents_with_independent_map_reduce(
             "first_wave_success_rate": first_rate,
             "wave_count": wave_count,
             "recovery_counts": dict(recovery_counts),
+            "saturation_split_counts": dict(saturation_split_counts),
             "discarded_fact_count": sum(
                 int(item.get("discarded_fact_count", 0))
                 for item in all_outcomes.values()
