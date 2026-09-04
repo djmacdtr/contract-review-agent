@@ -1153,9 +1153,11 @@ def rehydrate_fact_evidence(
     """
 
     evidence = _evidence_at(document)
+    physical_locations = _physical_locations_at(document)
     rehydrated: list[FactCandidate] = []
     for fact in facts:
-        sources = evidence.get(location_key(fact.location), [])
+        bound_location = _bind_physical_page(fact.location, physical_locations)
+        sources = evidence.get(location_key(bound_location), [])
         grounded_raw = _unique_grounded_quote(sources, fact.raw_value)
         grounded_evidence = _unique_grounded_quote(sources, fact.evidence_text)
         if grounded_raw is None:
@@ -1174,6 +1176,7 @@ def rehydrate_fact_evidence(
                     "raw_value": grounded_raw,
                     "normalized_hint": normalize_text(grounded_raw),
                     "evidence_text": grounded_evidence,
+                    "location": bound_location,
                 }
             )
         )
@@ -1194,9 +1197,11 @@ def rehydrate_numeric_fact_evidence(
     """
 
     evidence = _evidence_at(document)
+    physical_locations = _physical_locations_at(document)
     rehydrated: list[FactCandidate] = []
     for fact in facts:
-        sources = evidence.get(location_key(fact.location), [])
+        bound_location = _bind_physical_page(fact.location, physical_locations)
+        sources = evidence.get(location_key(bound_location), [])
         source = next(
             (
                 item
@@ -1215,6 +1220,7 @@ def rehydrate_numeric_fact_evidence(
                 update={
                     "normalized_hint": normalize_text(fact.raw_value),
                     "evidence_text": source,
+                    "location": bound_location,
                 }
             )
         )
@@ -2816,19 +2822,151 @@ def location_key(location: DocumentLocation | dict[str, Any]) -> tuple[object, .
     )
 
 
+def _logical_location_key(
+    location: DocumentLocation | dict[str, Any],
+) -> tuple[object, ...]:
+    if isinstance(location, dict):
+        location = DocumentLocation.model_validate(location)
+    return (
+        location.paragraph_index,
+        location.table_index,
+        location.row,
+        location.column,
+    )
+
+
+def _location_pages(location: DocumentLocation) -> set[int]:
+    pages = {
+        page
+        for page in (location.page, *location.physical_pages)
+        if isinstance(page, int) and not isinstance(page, bool) and page >= 1
+    }
+    return pages
+
+
+def _table_row_location(
+    block: DocumentBlock,
+    row: TableRow,
+) -> DocumentLocation:
+    pages: set[int] = set()
+    for cell in row.cells:
+        pages.update(_location_pages(cell.location))
+    if not pages:
+        pages.update(_location_pages(block.location))
+    page = next(iter(pages)) if len(pages) == 1 else None
+    return DocumentLocation(
+        page=page,
+        table_index=block.table.table_index if block.table is not None else None,
+        row=row.row,
+        physical_pages=(page,) if page is not None else (),
+    )
+
+
+def _physical_locations_at(
+    document: ParsedDocument,
+) -> dict[tuple[object, ...], list[DocumentLocation]]:
+    locations: dict[tuple[object, ...], list[DocumentLocation]] = defaultdict(list)
+    for block in document.blocks:
+        locations[_logical_location_key(block.location)].append(block.location)
+        if block.table is None:
+            continue
+        for row in block.table.rows:
+            row_location = _table_row_location(block, row)
+            locations[_logical_location_key(row_location)].append(row_location)
+            for cell in row.cells:
+                locations[_logical_location_key(cell.location)].append(cell.location)
+    return locations
+
+
+def _bind_physical_page(
+    location: DocumentLocation,
+    physical_locations: dict[tuple[object, ...], list[DocumentLocation]],
+) -> DocumentLocation:
+    if isinstance(location.page, int) and not isinstance(location.page, bool):
+        return location
+    candidates = physical_locations.get(_logical_location_key(location), [])
+    pages = {page for candidate in candidates for page in _location_pages(candidate)}
+    if len(pages) != 1:
+        return location
+    page = next(iter(pages))
+    return location.model_copy(update={"page": page, "physical_pages": (page,)})
+
+
+def bind_physical_page(
+    document: ParsedDocument,
+    location: DocumentLocation,
+) -> DocumentLocation:
+    """Restore one unambiguous parser-owned physical page to a logical location."""
+
+    return _bind_physical_page(location, _physical_locations_at(document))
+
+
+def rehydrate_extraction_page_locations(
+    document: ParsedDocument,
+    extraction: DocumentFactExtraction,
+) -> DocumentFactExtraction:
+    """Rebind cached logical extraction locations to current parser pagination."""
+
+    physical_locations = _physical_locations_at(document)
+
+    def bind(location: DocumentLocation) -> DocumentLocation:
+        return _bind_physical_page(location, physical_locations)
+
+    return extraction.model_copy(
+        update={
+            "profile": extraction.profile.model_copy(
+                update={
+                    "evidence_locations": [
+                        bind(location) for location in extraction.profile.evidence_locations
+                    ]
+                }
+            ),
+            "facts": [
+                fact.model_copy(
+                    update={"location": bind(fact.location)}
+                )
+                for fact in extraction.facts
+            ],
+            "semantic_concepts": [
+                concept.model_copy(
+                    update={
+                        "evidence_locations": [
+                            bind(location) for location in concept.evidence_locations
+                        ]
+                    }
+                )
+                for concept in extraction.semantic_concepts
+            ],
+            "validation_specs": [
+                spec.model_copy(
+                    update={
+                        "evidence_locations": [
+                            bind(location) for location in spec.evidence_locations
+                        ]
+                    }
+                )
+                for spec in extraction.validation_specs
+            ],
+        }
+    )
+
+
 def _evidence_at(document: ParsedDocument) -> dict[tuple[object, ...], list[str]]:
     evidence: dict[tuple[object, ...], list[str]] = defaultdict(list)
     for block in document.blocks:
         evidence[location_key(block.location)].append(block.raw_text)
         if block.table:
             for row in block.table.rows:
-                row_location = DocumentLocation(
-                    table_index=block.table.table_index,
-                    row=row.row,
+                row_text = "\t".join(cell.raw_text for cell in row.cells)
+                logical_row_location = DocumentLocation(
+                    table_index=block.table.table_index, row=row.row
                 )
-                evidence[location_key(row_location)].append(
-                    "\t".join(cell.raw_text for cell in row.cells)
-                )
+                evidence[location_key(logical_row_location)].append(row_text)
+                physical_row_location = _table_row_location(block, row)
+                if location_key(physical_row_location) != location_key(
+                    logical_row_location
+                ):
+                    evidence[location_key(physical_row_location)].append(row_text)
                 for cell in row.cells:
                     evidence[location_key(cell.location)].append(cell.raw_text)
     return evidence

@@ -40,6 +40,7 @@ from app.draft_review.facts import (
     plan_simplified_document_batches,
     plan_text_candidate_batches,
     plan_text_document_batches,
+    rehydrate_extraction_page_locations,
     rehydrate_fact_evidence,
     rehydrate_numeric_fact_evidence,
     split_numeric_structure_unit,
@@ -622,6 +623,7 @@ def _validated_document_checkpoint(
             _page_neutral_document(document),
             _page_neutral_extraction(extraction),
         )
+        extraction = rehydrate_extraction_page_locations(document, extraction)
     except (EvidenceValidationError, TypeError, ValueError):
         return None
     return extraction
@@ -3005,6 +3007,7 @@ async def extract_documents_with_independent_map_reduce(
             raise WorkflowError("DYNAMIC_CHECK_INCOMPLETE", "Reduce 未收到有效事实")
         merged = merge_chunk_extractions(document, parts)
         merged = merged.model_copy(update={"profile": profiles[document.file_id].profile})
+        merged = rehydrate_extraction_page_locations(document, merged)
         validate_extraction_evidence(document, merged)
         _validate_fact_identity_set(merged.facts)
         await save_document_checkpoint(

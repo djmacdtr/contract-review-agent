@@ -22,6 +22,7 @@ from app.documents.models import (
     TableCell,
     TableRow,
 )
+from app.documents.page_locations import validate_public_page_coverage
 from app.draft_review.extraction import _validated_document_checkpoint
 from app.draft_review.facts import (
     MAX_NUMERIC_CANDIDATES_PER_CHUNK,
@@ -48,6 +49,7 @@ from app.draft_review.facts import (
     normalized_fact_components,
     plan_document_batches,
     qualified_fact_refs,
+    rehydrate_fact_evidence,
     stable_fact_id,
     stable_unit_id,
     validate_extraction_evidence,
@@ -151,6 +153,7 @@ def test_document_checkpoint_validation_ignores_display_page_binding() -> None:
 
     assert validated is not None
     assert validated.facts[0].source_file_id == "fil_a"
+    assert validated.facts[0].location.page == 4
 
 
 def _table_document(file_id: str = "fil_table") -> ParsedDocument:
@@ -189,6 +192,89 @@ def _table_document(file_id: str = "fil_table") -> ParsedDocument:
             )
         ],
     )
+
+
+def test_rehydrate_fact_restores_pdf_table_row_physical_page() -> None:
+    document = _table_document()
+    document.page_count = 1
+    document.parser_name = "textin-document-parser"
+    document.blocks[0].location.page = 1
+    document.blocks[0].table.rows[0].cells[0].location.page = 1
+    fact = FactCandidate(
+        field_key="financing_amount",
+        display_name="融资金额",
+        value_type="MONEY",
+        raw_value="1000万元",
+        source_file_id=document.file_id,
+        evidence_text="融资金额1000万元",
+        location=DocumentLocation(table_index=0, row=0),
+        confidence=0.9,
+    )
+
+    [rehydrated] = rehydrate_fact_evidence(document, [fact])
+
+    assert rehydrated.location.page == 1
+    assert rehydrated.location.table_index == 0
+    assert rehydrated.location.row == 0
+
+
+def test_pdf_table_row_fact_conflict_passes_public_page_gate_after_rehydration() -> None:
+    document = _table_document("fil_pdf")
+    document.page_count = 1
+    document.parser_name = "textin-document-parser"
+    document.blocks[0].location.page = 1
+    document.blocks[0].table.rows[0].cells[0].location.page = 1
+    reference = FactCandidate(
+        field_key="financing_amount",
+        display_name="融资金额",
+        value_type="MONEY",
+        raw_value="1000万元",
+        source_file_id=document.file_id,
+        evidence_text="融资金额1000万元",
+        location=DocumentLocation(table_index=0, row=0),
+        confidence=0.9,
+    )
+    [reference] = rehydrate_fact_evidence(document, [reference])
+    target = reference.model_copy(
+        update={
+            "raw_value": "900万元",
+            "source_file_id": "fil_target",
+            "evidence_text": "融资金额900万元",
+            "location": DocumentLocation(page=2, paragraph_index=3),
+        }
+    )
+    matrix = [
+        {
+            "status": "CONFLICT",
+            "display_name": "融资金额",
+            "target_candidate": target.model_dump(mode="json"),
+            "reference_results": [
+                {
+                    "status": "CONFLICT",
+                    "candidate": reference.model_dump(mode="json"),
+                }
+            ],
+        }
+    ]
+    diffs = fact_conflict_diff_items(matrix, target_file_id="fil_target")
+
+    coverage = validate_public_page_coverage(
+        {
+            "files": [
+                {"file_id": "fil_pdf", "page_count": 1},
+                {"file_id": "fil_target", "page_count": 3},
+            ],
+            "diff_items": [item.model_dump(mode="json") for item in diffs],
+            "risk_items": [],
+        },
+        {},
+    )
+
+    assert coverage == {
+        "required_evidence_count": 2,
+        "covered_evidence_count": 2,
+        "missing_evidence_count": 0,
+    }
 
 
 def test_compact_payload_includes_table_cells_and_recovers_cell_evidence() -> None:
