@@ -3,10 +3,11 @@
 ## 基本信息
 
 - 时间：2026-09-04 12:02:49 +08:00
-- 状态：RELEASE CANDIDATE VERIFIED
+- 状态：OFFLINE RELEASE PACKAGED / PRODUCTION DEPLOYMENT PENDING
 - 分支：`feat/draft-review-multidoc`
 - 原生产版本：`2e96fbd`
 - 修复代码提交：`ccee853215ef67a364736039a851d2b8e39087ba`
+- 远端同步：`origin/feat/draft-review-multidoc` 已包含修复与本封版记录。
 - 新业务镜像：`contract-review-agent:ccee853`
 - 目标平台：openEuler 24.03 LTS SP4 x86_64 / Docker 29.7.2 / Compose 5.5.0
 
