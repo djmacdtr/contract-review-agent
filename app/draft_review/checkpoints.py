@@ -9,14 +9,69 @@ protocol later by using the existing task-event persistence boundary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 CheckpointStatus = Literal["SUCCEEDED", "FAILED"]
+MAPPING_CHECKPOINT_VERSION = "fact-mapping-v1"
+MAPPING_PROMPT_VERSION = "fact-mapping-prompt-v1"
+MAPPING_SCHEMA_VERSION = "FactMappingResponse-v1"
+
+
+def _mapping_digest_value(value: Any) -> Any:
+    """Remove task-local identities and physical pages from a cache key."""
+
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {
+                "file_id",
+                "reference_file_id",
+                "source_file_id",
+                "page",
+                "physical_pages",
+            }:
+                continue
+            normalized[key] = _mapping_digest_value(item)
+        return normalized
+    if isinstance(value, list):
+        return [_mapping_digest_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_mapping_digest_value(item) for item in value]
+    return value
+
+
+def mapping_checkpoint_identity(
+    *,
+    target_sha256: str,
+    reference_sha256: str,
+    model_name: str,
+    payload: dict[str, Any],
+    rules_version: str,
+) -> tuple[str, str]:
+    """Return a stable batch/digest pair for a complete Mapping payload."""
+
+    identity = {
+        "version": MAPPING_CHECKPOINT_VERSION,
+        "prompt_version": MAPPING_PROMPT_VERSION,
+        "schema_version": MAPPING_SCHEMA_VERSION,
+        "rules_version": rules_version,
+        "model": model_name,
+        "target_sha256": target_sha256,
+        "reference_sha256": reference_sha256,
+        "payload": _mapping_digest_value(payload),
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"mapping_{digest[:32]}", digest
 
 
 @dataclass(frozen=True)

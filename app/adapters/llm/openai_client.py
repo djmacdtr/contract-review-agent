@@ -33,9 +33,11 @@ from app.adapters.llm.schemas import (
     SemanticFactRef,
     SemanticPlanResponse,
     SemanticValidationSpec,
+    SingleRiskAdviceResponse,
     TextFactExtraction,
 )
 from app.core.config import Settings
+from app.core.reliability import RecoveryBudget, is_retryable_model_output_error
 from app.documents.models import DocumentLocation
 from app.draft_review.facts import (
     TEXT_FACT_VALUE_TYPES,
@@ -53,7 +55,7 @@ Sleeper = Callable[[float], Awaitable[None]]
 ResponseFormat = Literal["prompt_only", "json_object", "json_schema"]
 
 _HTTP_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
-_HTTP_MAX_RETRIES = 4
+_HTTP_MAX_RETRIES = 2
 _HTTP_TIMEOUT_MAX_ATTEMPTS = 2
 _HTTP_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
@@ -61,6 +63,7 @@ _PROFILE_MAX_OUTPUT_TOKENS = 2048
 _TEXT_MAX_OUTPUT_TOKENS = 8192
 _MAPPING_MAX_OUTPUT_TOKENS = 12288
 _ADVICE_MAX_OUTPUT_TOKENS = 8192
+_ADVICE_ITEM_REPAIR_MAX_OUTPUT_TOKENS = 1024
 
 
 def _numeric_max_output_tokens(payload: dict[str, Any]) -> int:
@@ -194,6 +197,7 @@ class LlmClientError(Exception):
         usage: dict[str, int] | None = None,
         max_tokens: int | None = None,
         http_status: int | None = None,
+        mapping_recovery_attempted: bool = False,
     ) -> None:
         super().__init__(safe_message)
         self.code = code
@@ -212,6 +216,7 @@ class LlmClientError(Exception):
         self.usage = usage
         self.max_tokens = max_tokens
         self.http_status = http_status
+        self.mapping_recovery_attempted = mapping_recovery_attempted
 
 
 def completion_body(
@@ -1027,6 +1032,13 @@ def _validate_advice(value: Any) -> dict[str, Any]:
         raise LlmClientError("LLM_SCHEMA_INVALID", "模型建议结果不符合结构约束") from exc
 
 
+def _validate_advice_item(value: Any) -> dict[str, Any]:
+    try:
+        return SingleRiskAdviceResponse.model_validate(value).model_dump(mode="json")
+    except ValidationError as exc:
+        raise LlmClientError("LLM_SCHEMA_INVALID", "单项模型建议结果不符合结构约束") from exc
+
+
 def _validate_mapping(value: Any) -> dict[str, Any]:
     try:
         return FactMappingResponse.model_validate(value).model_dump(mode="json")
@@ -1174,6 +1186,12 @@ class OpenAIContractLlmClient:
         self.numeric_model_override = numeric_model_override
         self.advice_response_format_override = advice_response_format_override
         self._request_semaphore = asyncio.Semaphore(max(1, settings.LLM_MAX_CONCURRENCY))
+        self.recovery_budget: RecoveryBudget | None = None
+
+    def set_recovery_budget(self, budget: RecoveryBudget | None) -> None:
+        """Attach the current task budget without changing the public client API."""
+
+        self.recovery_budget = budget
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -1223,7 +1241,11 @@ class OpenAIContractLlmClient:
         )
 
     async def extract_numeric_candidates(
-        self, payload: dict[str, Any], *, allow_structure_correction: bool = True
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_structure_correction: bool = True,
+        recovery: bool = False,
     ) -> LlmResult:
         candidates = payload.get("numeric_candidates")
         if not isinstance(candidates, list) or not candidates:
@@ -1251,7 +1273,11 @@ class OpenAIContractLlmClient:
                 response_schema=_numeric_candidate_response_schema(payload),
                 max_structure_retries=1 if allow_structure_correction else 0,
                 invalid_json_structure_correction=False,
-                max_output_tokens=_numeric_max_output_tokens(payload),
+                max_output_tokens=(
+                    min(8192, _numeric_max_output_tokens(payload) + 2048)
+                    if recovery
+                    else _numeric_max_output_tokens(payload)
+                ),
                 disable_thinking=True,
             )
         except LlmClientError as first_error:
@@ -1282,7 +1308,11 @@ class OpenAIContractLlmClient:
             )
 
     async def extract_text_facts(
-        self, payload: dict[str, Any], *, allow_structure_correction: bool = True
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_structure_correction: bool = True,
+        disable_thinking: bool = False,
     ) -> LlmResult:
         return await self._structured_completion(
             model=self.text_model_override or self.settings.LLM_EXTRACTION_MODEL,
@@ -1296,6 +1326,7 @@ class OpenAIContractLlmClient:
             allow_evidence_correction=allow_structure_correction,
             invalid_json_structure_correction=False,
             max_output_tokens=_TEXT_MAX_OUTPUT_TOKENS,
+            disable_thinking=disable_thinking,
         )
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult:
@@ -1335,6 +1366,9 @@ class OpenAIContractLlmClient:
         )
 
     async def map_facts(self, payload: dict[str, Any]) -> LlmResult:
+        return await self._map_facts_with_recovery(payload)
+
+    async def _map_facts_once(self, payload: dict[str, Any]) -> LlmResult:
         system = (
             "你是跨文件合同事实映射器。目标事实目录由程序分配 target_fact_id。"
             "仅当辅助资料事实与目标事实的业务含义、条件、时间范围、单位和口径相同或可能相同时"
@@ -1350,6 +1384,36 @@ class OpenAIContractLlmClient:
             max_output_tokens=_MAPPING_MAX_OUTPUT_TOKENS,
             disable_thinking=True,
         )
+
+    async def _map_facts_with_recovery(self, payload: dict[str, Any]) -> LlmResult:
+        """Retry one complete, identical Mapping request after model-output failure."""
+
+        try:
+            return await self._map_facts_once(payload)
+        except LlmClientError as first_error:
+            attempts = max(0, int(getattr(self.settings, "LLM_MAPPING_RECOVERY_ATTEMPTS", 1)))
+            if (
+                attempts < 1
+                or not is_retryable_model_output_error(first_error)
+                or first_error.mapping_recovery_attempted
+            ):
+                raise
+            budget = self.recovery_budget
+            if budget is not None and not budget.allow(first_error.code):
+                raise
+            try:
+                result = await self._map_facts_once(payload)
+            except LlmClientError as second_error:
+                second_error.mapping_recovery_attempted = True
+                raise
+            return replace(
+                result,
+                request_attempts=result.request_attempts + first_error.request_attempts,
+                response_metadata={
+                    **(result.response_metadata or {}),
+                    "mapping_recovery_attempts": 1,
+                },
+            )
 
     async def review_mappings(self, payload: dict[str, Any]) -> LlmResult:
         return await self._structured_completion(
@@ -1420,6 +1484,27 @@ class OpenAIContractLlmClient:
             schema=AdviceResponse,
             response_format_override=self.advice_response_format_override,
             max_output_tokens=_ADVICE_MAX_OUTPUT_TOKENS,
+            disable_thinking=True,
+        )
+
+    async def generate_advice_item(self, payload: dict[str, Any]) -> LlmResult:
+        return await self._structured_completion(
+            model=self.settings.LLM_ADVICE_MODEL,
+            system=(
+                "你只处理输入中的一个合同风险。只返回 JSON 对象，字段必须严格为 risk_id 和 "
+                "analysis_advice；risk_id 必须原样等于输入风险 ID。analysis_advice 只能是一条具体、"
+                "可执行的中文建议，必须引用输入中的差异文字、文件名或证据位置，不能生成总体建议、"
+                "行动清单、限制项或证据引用列表，不得输出内部 ID、技术术语或输入之外的事实。"
+            ),
+            payload=payload,
+            validator=_validate_advice_item,
+            schema=SingleRiskAdviceResponse,
+            response_format_override="json_object",
+            max_structure_retries=0,
+            max_output_tokens=_ADVICE_ITEM_REPAIR_MAX_OUTPUT_TOKENS,
+            allow_structure_correction=False,
+            allow_evidence_correction=False,
+            invalid_json_structure_correction=False,
             disable_thinking=True,
         )
 
@@ -1683,19 +1768,37 @@ class OpenAIContractLlmClient:
     ) -> tuple[httpx.Response, int]:
         max_retries = getattr(self.settings, "LLM_HTTP_RETRY_ATTEMPTS", _HTTP_MAX_RETRIES)
         max_retries = max(0, min(int(max_retries), _HTTP_MAX_RETRIES))
-        max_attempts = max_retries + 1
-        for attempt in range(1, max_attempts + 1):
+        network_retries = getattr(self.settings, "LLM_NETWORK_RETRY_ATTEMPTS", 2)
+        network_retries = max(0, min(int(network_retries), 2))
+        http_retry_count = 0
+        network_retry_count = 0
+        timeout_retry_count = 0
+        attempt = 0
+        while True:
+            attempt += 1
             try:
+                request_kwargs = dict(kwargs)
+                if self.recovery_budget is not None:
+                    self.recovery_budget.record_http_request()
+                    request_kwargs["timeout"] = self.recovery_budget.safe_timeout(
+                        self.settings.LLM_TIMEOUT_SECONDS
+                    )
                 response = await client.request(
                     method,
                     url,
                     headers=self._headers,
-                    **kwargs,
+                    **request_kwargs,
                 )
             except httpx.TimeoutException as exc:
-                if attempt < _HTTP_TIMEOUT_MAX_ATTEMPTS:
-                    await self.sleeper(0.5 * attempt)
-                    continue
+                if timeout_retry_count < _HTTP_TIMEOUT_MAX_ATTEMPTS - 1:
+                    timeout_retry_count += 1
+                    if self.recovery_budget is None:
+                        await self.sleeper(0.5 * attempt)
+                        continue
+                    if self.recovery_budget.allow("LLM_TIMEOUT") and await (
+                        self.recovery_budget.sleep(0.5 * attempt, self.sleeper)
+                    ):
+                        continue
                 raise LlmClientError(
                     "LLM_TIMEOUT",
                     "模型服务请求超时",
@@ -1703,20 +1806,44 @@ class OpenAIContractLlmClient:
                     request_attempts=attempt,
                 ) from exc
             except httpx.RequestError as exc:
+                if network_retry_count < network_retries:
+                    network_retry_count += 1
+                    delay = _HTTP_RETRY_BACKOFF_SECONDS[
+                        min(network_retry_count - 1, 1)
+                    ] + random.uniform(0.0, 0.25)
+                    if self.recovery_budget is None:
+                        await self.sleeper(delay)
+                    elif self.recovery_budget.allow("LLM_NETWORK_ERROR") and await (
+                        self.recovery_budget.sleep(delay, self.sleeper)
+                    ):
+                        pass
+                    else:
+                        network_retry_count = network_retries
+                    if network_retry_count <= network_retries and (
+                        self.recovery_budget is None or not self.recovery_budget.exhausted
+                    ):
+                        continue
                 raise LlmClientError(
                     "LLM_NETWORK_ERROR",
                     "模型服务网络请求失败",
-                    retryable=False,
+                    retryable=True,
                     request_attempts=attempt,
                 ) from exc
             if response.status_code < 400:
                 return response, attempt
             code, message, retryable = self._http_error(response.status_code)
-            if response.status_code in _HTTP_RETRYABLE_STATUSES and attempt < max_attempts:
-                backoff_index = min(attempt - 1, len(_HTTP_RETRY_BACKOFF_SECONDS) - 1)
+            if response.status_code in _HTTP_RETRYABLE_STATUSES and http_retry_count < max_retries:
+                http_retry_count += 1
+                backoff_index = min(http_retry_count - 1, len(_HTTP_RETRY_BACKOFF_SECONDS) - 1)
                 backoff = _HTTP_RETRY_BACKOFF_SECONDS[backoff_index]
-                await self.sleeper(backoff + random.uniform(0.0, 0.25))
-                continue
+                delay = backoff + random.uniform(0.0, 0.25)
+                if self.recovery_budget is None:
+                    await self.sleeper(delay)
+                    continue
+                if self.recovery_budget.allow(code) and await self.recovery_budget.sleep(
+                    delay, self.sleeper
+                ):
+                    continue
             raise LlmClientError(
                 code,
                 message,
@@ -1724,7 +1851,6 @@ class OpenAIContractLlmClient:
                 request_attempts=attempt,
                 http_status=response.status_code,
             )
-        raise AssertionError("unreachable")
 
     @staticmethod
     def _http_error(status_code: int) -> tuple[str, str, bool]:

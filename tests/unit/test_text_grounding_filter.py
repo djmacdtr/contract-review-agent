@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from app.adapters.llm.base import LlmResult
 from app.core.config import Settings
+from app.core.errors import WorkflowError
 from app.documents.models import (
     DocumentBlock,
     DocumentLocation,
@@ -23,8 +27,12 @@ from app.draft_review.facts import (
 from scripts.text_grounding_diagnostic import (
     _decorate_initial_plan,
     _make_child_plan,
+    build_local_diagnostic_file,
     reconstruct_text_batch,
     safe_task_details,
+    select_source_task_file,
+    select_unique_task_role_file,
+    source_file_sha_failure,
 )
 
 
@@ -300,6 +308,93 @@ def test_text_diagnostic_details_exclude_body_and_credentials() -> None:
         "unit_count": 1,
         "batch_id": "batch_safe",
         "failure_code": "FACT_VALUE_NOT_GROUNDED",
+    }
+
+
+@pytest.mark.parametrize("role", ["TARGET", "REFERENCE"])
+def test_text_diagnostic_selects_exact_file_id_without_role_filter(role: str) -> None:
+    target = SimpleNamespace(id="fil_target", role="TARGET")
+    reference = SimpleNamespace(id="fil_reference", role="REFERENCE")
+    task = SimpleNamespace(files=[target, reference])
+
+    selected = select_source_task_file(
+        task,
+        {"batch_id": "batch_exact", "file_id": f"fil_{role.casefold()}"},
+        "batch_exact",
+    )
+
+    assert selected.role == role
+
+
+def test_text_diagnostic_falls_back_to_unique_role_only_without_file_id() -> None:
+    reference = SimpleNamespace(id="fil_reference", role="REFERENCE")
+    task = SimpleNamespace(files=[reference, SimpleNamespace(id="fil_target", role="TARGET")])
+
+    selected = select_source_task_file(
+        task,
+        {"batch_id": "batch_exact"},
+        "batch_exact",
+    )
+
+    assert selected.id == "fil_reference"
+
+
+def test_text_diagnostic_selects_unique_template_for_target_rebuild() -> None:
+    template = SimpleNamespace(id="fil_template", role="TEMPLATE")
+    task = SimpleNamespace(files=[template])
+
+    assert select_unique_task_role_file(task, "TEMPLATE") is template
+
+
+def test_text_diagnostic_rejects_missing_file_id() -> None:
+    task = SimpleNamespace(files=[SimpleNamespace(id="fil_reference", role="REFERENCE")])
+
+    with pytest.raises(WorkflowError) as caught:
+        select_source_task_file(
+            task,
+            {"batch_id": "batch_exact", "file_id": "fil_missing"},
+            "batch_exact",
+        )
+
+    assert caught.value.code == "TEXT_SOURCE_FILE_NOT_FOUND"
+
+
+def test_text_diagnostic_rejects_batch_mismatch() -> None:
+    task = SimpleNamespace(files=[SimpleNamespace(id="fil_target", role="TARGET")])
+
+    with pytest.raises(WorkflowError) as caught:
+        select_source_task_file(
+            task,
+            {"batch_id": "batch_other", "file_id": "fil_target"},
+            "batch_exact",
+        )
+
+    assert caught.value.code == "TEXT_DIAGNOSTIC_BATCH_MISMATCH"
+
+
+def test_text_diagnostic_reports_sha_mismatch_without_llm_call(tmp_path: Path) -> None:
+    path = tmp_path / "target.docx"
+    path.write_bytes(b"fixture")
+    source_file = SimpleNamespace(id="fil_target", role="TARGET", sha256="a" * 64)
+
+    local_file = build_local_diagnostic_file(path, source_file, "b" * 64)
+    failure = source_file_sha_failure(
+        source_task_id="tsk_source",
+        source_file=source_file,
+        local_sha=local_file.sha256,
+        batch_id="batch_exact",
+    )
+
+    assert local_file.role == "TARGET"
+    assert failure == {
+        "status": "SAFE_STOP",
+        "source_task_id": "tsk_source",
+        "file_id": "fil_target",
+        "sha256": "b" * 64,
+        "batch_id": "batch_exact",
+        "llm_calls": 0,
+        "failure_stage": "TEXT_SOURCE_FILE_VALIDATION",
+        "failure_code": "TEXT_SOURCE_SHA_MISMATCH",
     }
 
 

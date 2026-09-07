@@ -1,18 +1,45 @@
 import asyncio
 import socket
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 
 import structlog
+from sqlalchemy.exc import DBAPIError, DisconnectionError, InterfaceError, OperationalError
 
 from app.core.config import Settings
-from app.core.enums import TaskStage
+from app.core.enums import TaskStage, TaskStatus
 from app.core.errors import WorkflowError
+from app.core.reliability import LLM_TRANSPORT_ERROR_CODES
 from app.db.repositories.task_repository import TaskRepository
 from app.db.session import SessionFactory
 from app.workflows.router import WorkflowRouter
 from app.workflows.types import WorkflowOutput
 
 logger = structlog.get_logger(__name__)
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    if isinstance(exc, (OperationalError, InterfaceError, DisconnectionError)):
+        return True
+    return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
+
+
+def _is_transient_workflow_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    if not isinstance(exc, WorkflowError):
+        return False
+    details = exc.details if isinstance(exc.details, dict) else {}
+    code = details.get("failure_code") or details.get("underlying_failure_code") or exc.code
+    if code in LLM_TRANSPORT_ERROR_CODES:
+        return True
+    return code in {
+        "DOWNLOAD_TIMEOUT",
+        "OCR_TIMEOUT",
+        "OCR_SERVICE_UNAVAILABLE",
+        "OCR_UPSTREAM_ERROR",
+        "OCR_NETWORK_ERROR",
+    }
 
 
 class WorkerRunner:
@@ -31,11 +58,33 @@ class WorkerRunner:
         self.worker_id = f"{settings.WORKER_ID}:{socket.gethostname()}:{id(self):x}"
         self._stopping = asyncio.Event()
 
+    async def _db_write(
+        self,
+        operation: Callable[[object], Awaitable[object]],
+    ) -> object:
+        max_retries = max(
+            0, min(int(getattr(self.settings, "DB_WRITE_RETRY_ATTEMPTS", 1)), 1)
+        )
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.session_factory() as session, session.begin():
+                    return await operation(session)
+            except BaseException as exc:
+                if (
+                    attempt >= max_retries
+                    or not _is_transient_db_error(exc)
+                ):
+                    raise
+                await asyncio.sleep(min(0.25 * (attempt + 1), 1.0))
+        raise RuntimeError("database write retry exhausted")
+
     async def recover_stale(self) -> tuple[list[str], list[str]]:
-        async with self.session_factory() as session, session.begin():
-            result = await self.repository.recover_stale(
+        async def operation(session):
+            return await self.repository.recover_stale(
                 session, self.settings.effective_worker_stale_after_seconds
             )
+
+        result = await self._db_write(operation)
         if any(result):
             logger.warning(
                 "stale_tasks_recovered", requeued_count=len(result[0]), failed_count=len(result[1])
@@ -43,12 +92,14 @@ class WorkerRunner:
         return result
 
     async def claim(self):
-        async with self.session_factory() as session, session.begin():
+        async def operation(session):
             return await self.repository.claim_next(session, self.worker_id)
 
+        return await self._db_write(operation)
+
     async def _progress(self, task_id: str, stage: TaskStage, progress: int, message: str) -> None:
-        async with self.session_factory() as session, session.begin():
-            owned = await self.repository.update_progress(
+        async def operation(session):
+            return await self.repository.update_progress(
                 session,
                 task_id=task_id,
                 worker_id=self.worker_id,
@@ -56,6 +107,7 @@ class WorkerRunner:
                 progress=progress,
                 message=message,
             )
+        owned = await self._db_write(operation)
         if not owned:
             raise RuntimeError("task ownership lost")
 
@@ -63,8 +115,10 @@ class WorkerRunner:
         try:
             while not self._stopping.is_set():
                 await asyncio.sleep(self.settings.WORKER_HEARTBEAT_INTERVAL_SECONDS)
-                async with self.session_factory() as session, session.begin():
-                    owned = await self.repository.heartbeat(session, task_id, self.worker_id)
+                async def operation(session):
+                    return await self.repository.heartbeat(session, task_id, self.worker_id)
+
+                owned = await self._db_write(operation)
                 if not owned:
                     return
         except asyncio.CancelledError:
@@ -87,15 +141,35 @@ class WorkerRunner:
             workflow_options = dict(task.options or {})
             if task.source_task_id:
                 workflow_options["source_task_id"] = task.source_task_id
-            output = await self.workflow.run(
-                task_id=task.id,
-                task_type=task.task_type,
-                files=files,
-                options=workflow_options,
-                progress_callback=lambda stage, progress, message: self._progress(
-                    task.id, stage, progress, message
-                ),
-            )
+            resume_attempts = 0
+            while True:
+                try:
+                    output = await self.workflow.run(
+                        task_id=task.id,
+                        task_type=task.task_type,
+                        files=files,
+                        options=workflow_options,
+                        progress_callback=lambda stage, progress, message: self._progress(
+                            task.id, stage, progress, message
+                        ),
+                    )
+                    break
+                except BaseException as exc:
+                    max_resume = max(
+                        0,
+                        min(
+                            int(getattr(self.settings, "TASK_TRANSIENT_RESUME_ATTEMPTS", 1)),
+                            1,
+                        ),
+                    )
+                    if resume_attempts >= max_resume or not _is_transient_workflow_error(exc):
+                        raise
+                    resume_attempts += 1
+                    logger.warning(
+                        "task_transient_resume",
+                        task_id=task.id,
+                        resume_attempt=resume_attempts,
+                    )
             if isinstance(output, WorkflowOutput):
                 result = output.result
                 file_metadata = output.file_metadata
@@ -103,8 +177,8 @@ class WorkerRunner:
                 result = output
                 file_metadata = []
             metadata = result["metadata"]
-            async with self.session_factory() as session, session.begin():
-                completed = await self.repository.complete(
+            async def complete_operation(session):
+                return await self.repository.complete(
                     session,
                     task_id=task.id,
                     worker_id=self.worker_id,
@@ -117,13 +191,24 @@ class WorkerRunner:
                     model_name=metadata.get("primary_model"),
                     file_metadata=file_metadata,
                 )
+            completed = await self._db_write(complete_operation)
             if not completed:
+                async def read_task(session):
+                    return await self.repository.get(session, task.id)
+
+                persisted = await self._db_write(read_task)
+                if getattr(persisted, "status", None) == TaskStatus.SUCCEEDED:
+                    logger.info("task_completion_already_persisted", task_id=task.id)
+                    return True
                 logger.warning("task_completion_skipped_ownership_lost", task_id=task.id)
                 return False
             logger.info("task_succeeded", task_id=task.id, task_type=task.task_type.value)
             return True
         except WorkflowError as exc:
             details = exc.details or {}
+            failure_code = exc.code
+            failure_message = exc.safe_message
+            failure_details = exc.details
             logger.error(
                 "task_failed",
                 task_id=task.id,
@@ -159,15 +244,16 @@ class WorkerRunner:
                 covered_evidence_count=details.get("covered_evidence_count"),
                 missing_evidence_count=details.get("missing_evidence_count"),
             )
-            async with self.session_factory() as session, session.begin():
-                await self.repository.fail(
+            async def fail_operation(session):
+                return await self.repository.fail(
                     session,
                     task_id=task.id,
                     worker_id=self.worker_id,
-                    code=exc.code,
-                    message=exc.safe_message,
-                    details=exc.details,
+                    code=failure_code,
+                    message=failure_message,
+                    details=failure_details,
                 )
+            await self._db_write(fail_operation)
             return False
         except Exception as exc:
             logger.error(
@@ -176,8 +262,8 @@ class WorkerRunner:
                 task_type=task.task_type.value,
                 error_type=type(exc).__name__,
             )
-            async with self.session_factory() as session, session.begin():
-                await self.repository.fail(
+            async def fail_operation(session):
+                return await self.repository.fail(
                     session,
                     task_id=task.id,
                     worker_id=self.worker_id,
@@ -185,6 +271,7 @@ class WorkerRunner:
                     message="任务处理发生未分类错误",
                     details=None,
                 )
+            await self._db_write(fail_operation)
             return False
         finally:
             heartbeat.cancel()

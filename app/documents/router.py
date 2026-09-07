@@ -32,6 +32,7 @@ class DocumentParsingRouter:
         self.page_location_cache = page_location_cache
         self.docx_page_location_enabled = docx_page_location_enabled
         self.page_location_sidecars: dict[str, DocxPageLocationSidecar] = {}
+        self._pending_page_documents: dict[str, ParsedDocument] = {}
 
     def _require_external(self) -> ExternalDocumentParser:
         if self.external is None:
@@ -44,11 +45,29 @@ class DocumentParsingRouter:
         *,
         mode: Literal["auto", "scan"],
         include_stamp_images: bool = False,
+        bypass_cache: bool = False,
+        timeout_seconds: float | None = None,
     ) -> ParsedDocument:
         external = self._require_external()
-        stamp_parser = getattr(external, "parse_with_stamp_images", None)
+        stamp_parser = getattr(
+            external,
+            "parse_with_stamp_images_uncached" if bypass_cache else "parse_with_stamp_images",
+            None,
+        )
         if include_stamp_images and stamp_parser is not None:
-            return await stamp_parser(file, mode=mode)
+            if timeout_seconds is None:
+                return await stamp_parser(file, mode=mode)
+            return await stamp_parser(
+                file, mode=mode, timeout_seconds=timeout_seconds
+            )
+        if bypass_cache:
+            uncached_parser = getattr(external, "parse_uncached", None)
+            if uncached_parser is not None:
+                if timeout_seconds is None:
+                    return await uncached_parser(file, mode=mode)
+                return await uncached_parser(
+                    file, mode=mode, timeout_seconds=timeout_seconds
+                )
         return await external.parse(file, mode=mode)
 
     @staticmethod
@@ -94,22 +113,9 @@ class DocumentParsingRouter:
                 self.page_location_sidecars[file.file_id] = cached_sidecar
                 return local_document
         try:
-            external_document = await self._parse_external(file, mode="auto")
-            sidecar = await asyncio.to_thread(
-                build_docx_page_location_sidecar,
-                local_document,
-                external_document,
+            await self._rebuild_docx_page_location(
+                file, local_document=local_document, refresh_ocr=False
             )
-            await asyncio.to_thread(bind_docx_page_locations, local_document, sidecar)
-            self.page_location_sidecars[file.file_id] = sidecar
-            if self.page_location_cache is not None:
-                try:
-                    await self.page_location_cache.save(
-                        file_sha256=file.sha256, sidecar=sidecar
-                    )
-                except Exception:
-                    # A cache write cannot invalidate a valid external parse.
-                    pass
         except WorkflowError as exc:
             if exc.code == "DOCX_PAGE_LOCATION_INCOMPLETE":
                 raise
@@ -140,8 +146,136 @@ class DocumentParsingRouter:
             ) from exc
         return local_document
 
+    async def _rebuild_docx_page_location(
+        self,
+        file: LocalFile,
+        *,
+        local_document: ParsedDocument,
+        refresh_ocr: bool,
+        persist: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> ParsedDocument:
+        """Build a sidecar on a fresh local parse and commit caches last."""
+
+        external_document = await self._parse_external(
+            file,
+            mode="auto",
+            bypass_cache=refresh_ocr,
+            timeout_seconds=timeout_seconds,
+        )
+        sidecar = await asyncio.to_thread(
+            build_docx_page_location_sidecar,
+            local_document,
+            external_document,
+        )
+        await asyncio.to_thread(bind_docx_page_locations, local_document, sidecar)
+
+        # A refreshed OCR result is not persisted until its page sidecar has
+        # passed the complete mapping build.  A failed refresh therefore
+        # cannot overwrite the previous OCR cache.
+        if persist and refresh_ocr:
+            saver = getattr(self.external, "save_document_to_cache", None)
+            if saver is not None:
+                await saver(
+                    file,
+                    mode="auto",
+                    include_stamp_images=False,
+                    document=external_document,
+                )
+        if persist and self.page_location_cache is not None:
+            try:
+                await self.page_location_cache.save(
+                    file_sha256=file.sha256, sidecar=sidecar
+                )
+            except Exception:
+                # A cache write cannot invalidate a valid external parse.
+                pass
+        self.page_location_sidecars[file.file_id] = sidecar
+        if not persist:
+            self._pending_page_documents[file.file_id] = external_document
+        return local_document
+
+    async def commit_docx_page_location(self, file: LocalFile) -> None:
+        """Atomically publish a validated sidecar and its pending OCR result."""
+
+        sidecar = self.page_location_sidecars.get(file.file_id)
+        if sidecar is None:
+            return
+        external_document = self._pending_page_documents.get(file.file_id)
+        if external_document is not None:
+            saver = getattr(self.external, "save_document_to_cache", None)
+            if saver is not None:
+                await saver(
+                    file,
+                    mode="auto",
+                    include_stamp_images=False,
+                    document=external_document,
+                )
+        if self.page_location_cache is not None:
+            try:
+                await self.page_location_cache.save(
+                    file_sha256=file.sha256, sidecar=sidecar
+                )
+            except Exception:
+                pass
+        self._pending_page_documents.pop(file.file_id, None)
+
+    async def rebuild_docx_page_location(
+        self,
+        file: LocalFile,
+        *,
+        refresh_ocr: bool = False,
+        persist: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> ParsedDocument:
+        """Rebuild one DOCX sidecar, optionally bypassing the OCR cache."""
+
+        if file.detected_mime_type != DOCX_MIME:
+            raise WorkflowError(
+                "DOCX_PAGE_LOCATION_INCOMPLETE",
+                "DOCX 真实页码解析或映射未能可靠完成",
+                details={
+                    "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
+                    "failure_code": "PUBLIC_LOCATION_UNMAPPED",
+                    "file_id": file.file_id,
+                },
+            )
+        self.page_location_sidecars.pop(file.file_id, None)
+        local_document = await self.local.parse(file)
+        try:
+            return await self._rebuild_docx_page_location(
+                file,
+                local_document=local_document,
+                refresh_ocr=refresh_ocr,
+                persist=persist,
+                timeout_seconds=timeout_seconds,
+            )
+        except WorkflowError as exc:
+            if exc.code == "DOCX_PAGE_LOCATION_INCOMPLETE":
+                raise
+            raise WorkflowError(
+                "DOCX_PAGE_LOCATION_INCOMPLETE",
+                "DOCX 真实页码解析或映射未能可靠完成",
+                details=self._failure_details(
+                    exc,
+                    local_document=local_document,
+                    failure_stage="EXTERNAL_PARSE",
+                ),
+            ) from exc
+        except Exception as exc:
+            raise WorkflowError(
+                "DOCX_PAGE_LOCATION_INCOMPLETE",
+                "DOCX 真实页码解析或映射未能可靠完成",
+                details={
+                    "failure_stage": "EXTERNAL_PARSE",
+                    "failure_code": type(exc).__name__,
+                    "file_id": file.file_id,
+                },
+            ) from exc
+
     async def parse_draft_review(self, files: list[LocalFile]) -> list[ParsedDocument]:
         self.page_location_sidecars = {}
+        self._pending_page_documents = {}
         # The formal OCR gateway reliably accepts one document request at a
         # time but may reset concurrent uploads before returning an HTTP
         # status. Keep multi-document parsing ordered and bounded here.
@@ -164,6 +298,7 @@ class DocumentParsingRouter:
 
     async def parse_final_compare(self, files: list[LocalFile]) -> list[ParsedDocument]:
         self.page_location_sidecars = {}
+        self._pending_page_documents = {}
         if len(files) != 2:
             raise WorkflowError("COMPARISON_FAILED", "放款比对必须包含两个文件")
         mimes = [file.detected_mime_type for file in files]

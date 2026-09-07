@@ -19,12 +19,15 @@ class LlmResult:
 class ContractLlmClient(Protocol):
     async def extract_document_profile(self, payload: dict[str, Any]) -> LlmResult: ...
     async def extract_fact_batch(self, payload: dict[str, Any]) -> LlmResult: ...
-    async def extract_numeric_candidates(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def extract_numeric_candidates(
+        self, payload: dict[str, Any], *, recovery: bool = False
+    ) -> LlmResult: ...
     async def extract_text_facts(
         self,
         payload: dict[str, Any],
         *,
         allow_structure_correction: bool = True,
+        disable_thinking: bool = False,
     ) -> LlmResult: ...
 
     async def extract_facts(self, payload: dict[str, Any]) -> LlmResult: ...
@@ -40,6 +43,7 @@ class ContractLlmClient(Protocol):
     ) -> LlmResult: ...
     async def generate_delivery_advice(self, payload: dict[str, Any]) -> LlmResult: ...
     async def generate_advice(self, payload: dict[str, Any]) -> LlmResult: ...
+    async def generate_advice_item(self, payload: dict[str, Any]) -> LlmResult: ...
 
     async def probe_models(self) -> list[str]: ...
 
@@ -84,7 +88,9 @@ class MockContractLlmClient:
             mock=True,
         )
 
-    async def extract_numeric_candidates(self, payload: dict[str, Any]) -> LlmResult:
+    async def extract_numeric_candidates(
+        self, payload: dict[str, Any], *, recovery: bool = False
+    ) -> LlmResult:
         return LlmResult(
             value={
                 "items": [
@@ -112,6 +118,7 @@ class MockContractLlmClient:
         payload: dict[str, Any],
         *,
         allow_structure_correction: bool = True,
+        disable_thinking: bool = False,
     ) -> LlmResult:
         return LlmResult(
             value={"items": [], "has_more": False},
@@ -272,6 +279,18 @@ class MockContractLlmClient:
                 "manual_review_focus": ["模拟风险与差异项"],
                 "limitations": ["本结果未下载或解析任何合同，也未调用真实大模型"],
                 "risk_advices": risk_advices,
+            },
+            configured_model=self.model,
+            actual_model=None,
+            mock=True,
+        )
+
+    async def generate_advice_item(self, payload: dict[str, Any]) -> LlmResult:
+        risk = payload.get("risk") or {}
+        return LlmResult(
+            value={
+                "risk_id": str(risk.get("risk_id", "")),
+                "analysis_advice": f"请核对“{risk.get('title', '该差异')}”的来源文件和对应位置。",
             },
             configured_model=self.model,
             actual_model=None,

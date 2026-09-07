@@ -14,6 +14,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.errors import WorkflowError
+from app.core.reliability import RecoveryBudget
 from app.services.temp_files import TaskWorkspace
 
 Resolver = Callable[[str, int], Awaitable[list[str]]]
@@ -143,62 +144,105 @@ class SafeFileDownloadService:
         client: httpx.AsyncClient,
         item: dict,
         workspace: TaskWorkspace,
+        recovery_budget: RecoveryBudget | None = None,
     ) -> LocalFile:
         suffix, expected_mime = self._file_type(item["file_name"])
-        current_url = item["url"]
         max_bytes = int(self.settings.MAX_FILE_SIZE_MB * 1024 * 1024)
-        redirects = 0
-        while True:
-            await self._validate_url(current_url)
+        max_retries = max(0, min(int(getattr(self.settings, "DOWNLOAD_RETRY_ATTEMPTS", 2)), 2))
+        for attempt in range(max_retries + 1):
+            current_url = item["url"]
+            redirects = 0
             try:
-                async with client.stream("GET", current_url) as response:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        if redirects >= self.settings.DOWNLOAD_MAX_REDIRECTS:
-                            raise WorkflowError("DOWNLOAD_FAILED", "文件下载重定向次数过多")
-                        location = response.headers.get("location")
-                        if not location:
-                            raise WorkflowError("DOWNLOAD_FAILED", "文件下载重定向缺少目标地址")
-                        current_url = urljoin(current_url, location)
-                        redirects += 1
-                        continue
-                    if response.status_code >= 400:
-                        raise WorkflowError(
-                            "DOWNLOAD_FAILED",
-                            "文件服务返回下载失败",
-                            retryable=response.status_code >= 500,
+                while True:
+                    await self._validate_url(current_url)
+                    async with client.stream("GET", current_url) as response:
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            if redirects >= self.settings.DOWNLOAD_MAX_REDIRECTS:
+                                raise WorkflowError("DOWNLOAD_FAILED", "文件下载重定向次数过多")
+                            location = response.headers.get("location")
+                            if not location:
+                                raise WorkflowError("DOWNLOAD_FAILED", "文件下载重定向缺少目标地址")
+                            current_url = urljoin(current_url, location)
+                            redirects += 1
+                            continue
+                        if response.status_code >= 400:
+                            raise WorkflowError(
+                                "DOWNLOAD_FAILED",
+                                "文件服务返回下载失败",
+                                retryable=response.status_code >= 500,
+                            )
+                        declared_length = response.headers.get("content-length")
+                        if declared_length and int(declared_length) > max_bytes:
+                            raise WorkflowError("FILE_TOO_LARGE", "文件超过允许大小")
+                        # A retry always receives a new path, so a partial
+                        # response can never be mistaken for a valid download.
+                        target = workspace.allocate(
+                            f"{item['file_id']}-attempt-{attempt}", suffix
                         )
-                    declared_length = response.headers.get("content-length")
-                    if declared_length and int(declared_length) > max_bytes:
-                        raise WorkflowError("FILE_TOO_LARGE", "文件超过允许大小")
-                    target = workspace.allocate(item["file_id"], suffix)
-                    digest = hashlib.sha256()
-                    size = 0
-                    with target.open("wb") as stream:
-                        async for chunk in response.aiter_bytes():
-                            size += len(chunk)
-                            if size > max_bytes:
-                                raise WorkflowError("FILE_TOO_LARGE", "文件超过允许大小")
-                            digest.update(chunk)
-                            stream.write(chunk)
-                    self._validate_signature(target, expected_mime)
-                    return LocalFile(
-                        file_id=item["file_id"],
-                        role=item["role"],
-                        file_name=item["file_name"],
-                        safe_url=item["safe_url"],
-                        path=target,
-                        file_size=size,
-                        sha256=digest.hexdigest(),
-                        detected_mime_type=expected_mime,
-                    )
-            except WorkflowError:
-                raise
+                        digest = hashlib.sha256()
+                        size = 0
+                        with target.open("wb") as stream:
+                            async for chunk in response.aiter_bytes():
+                                size += len(chunk)
+                                if size > max_bytes:
+                                    raise WorkflowError("FILE_TOO_LARGE", "文件超过允许大小")
+                                digest.update(chunk)
+                                stream.write(chunk)
+                        self._validate_signature(target, expected_mime)
+                        return LocalFile(
+                            file_id=item["file_id"],
+                            role=item["role"],
+                            file_name=item["file_name"],
+                            safe_url=item["safe_url"],
+                            path=target,
+                            file_size=size,
+                            sha256=digest.hexdigest(),
+                            detected_mime_type=expected_mime,
+                        )
+            except WorkflowError as exc:
+                if not exc.retryable or attempt >= max_retries:
+                    raise
+                code = exc.code
+                if recovery_budget is not None and not recovery_budget.allow_stage(
+                    "DOWNLOAD", code
+                ):
+                    raise
+                if recovery_budget is None:
+                    await asyncio.sleep(min(0.25 * (attempt + 1), 1.0))
+                elif not await recovery_budget.sleep(0.25 * (attempt + 1), asyncio.sleep):
+                    raise
             except httpx.TimeoutException as exc:
-                raise WorkflowError("DOWNLOAD_TIMEOUT", "文件下载超时", retryable=True) from exc
+                error = WorkflowError("DOWNLOAD_TIMEOUT", "文件下载超时", retryable=True)
+                if attempt >= max_retries:
+                    raise error from exc
+                if recovery_budget is not None and not recovery_budget.allow_stage(
+                    "DOWNLOAD", error.code
+                ):
+                    raise error from exc
+                if recovery_budget is None:
+                    await asyncio.sleep(min(0.25 * (attempt + 1), 1.0))
+                elif not await recovery_budget.sleep(0.25 * (attempt + 1), asyncio.sleep):
+                    raise error from exc
             except (httpx.HTTPError, OSError, ValueError) as exc:
-                raise WorkflowError("DOWNLOAD_FAILED", "文件下载失败", retryable=True) from exc
+                error = WorkflowError("DOWNLOAD_FAILED", "文件下载失败", retryable=True)
+                if attempt >= max_retries:
+                    raise error from exc
+                if recovery_budget is not None and not recovery_budget.allow_stage(
+                    "DOWNLOAD", error.code
+                ):
+                    raise error from exc
+                if recovery_budget is None:
+                    await asyncio.sleep(min(0.25 * (attempt + 1), 1.0))
+                elif not await recovery_budget.sleep(0.25 * (attempt + 1), asyncio.sleep):
+                    raise error from exc
+        raise WorkflowError("DOWNLOAD_FAILED", "文件下载失败", retryable=True)
 
-    async def prepare(self, files: list[dict], workspace: TaskWorkspace) -> list[LocalFile]:
+    async def prepare(
+        self,
+        files: list[dict],
+        workspace: TaskWorkspace,
+        recovery_budget: RecoveryBudget | None = None,
+    ) -> list[LocalFile]:
         timeout = httpx.Timeout(self.settings.DOWNLOAD_TIMEOUT_SECONDS)
         try:
             async with asyncio.timeout(self.settings.DOWNLOAD_TIMEOUT_SECONDS):
@@ -210,7 +254,9 @@ class SafeFileDownloadService:
                 ) as client:
                     prepared = []
                     for item in files:
-                        prepared.append(await self._download_one(client, item, workspace))
+                        prepared.append(
+                            await self._download_one(client, item, workspace, recovery_budget)
+                        )
                     return prepared
         except TimeoutError as exc:
             raise WorkflowError("DOWNLOAD_TIMEOUT", "文件下载总时长超时", retryable=True) from exc

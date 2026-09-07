@@ -5,6 +5,7 @@ import pytest
 
 from app.core.config import Settings
 from app.core.errors import WorkflowError
+from app.core.reliability import RecoveryBudget
 from app.services.downloader import SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 
@@ -209,3 +210,71 @@ async def test_downloader_rejects_content_signature_mismatch(tmp_path: Path) -> 
                 workspace,
             )
     assert caught.value.code == "FILE_CONTENT_INVALID"
+
+
+async def test_downloader_retries_transient_5xx_with_fresh_attempt_path(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, content=DOCX_BYTES, request=request)
+
+    service = SafeFileDownloadService(
+        settings(tmp_path, DOWNLOAD_RETRY_ATTEMPTS=2),
+        transport=httpx.MockTransport(handler),
+        resolver=private_resolver,
+    )
+    budget = RecoveryBudget(600)
+    async with TaskWorkspace(tmp_path, "tsk_retry") as workspace:
+        files = await service.prepare(
+            [
+                {
+                    "file_id": "fil_retry",
+                    "file_name": "a.docx",
+                    "url": "http://fixture-server/a.docx",
+                    "safe_url": "http://fixture-server/a.docx",
+                    "role": "TARGET",
+                }
+            ],
+            workspace,
+            budget,
+        )
+        assert files[0].path.name == "fil_retry-attempt-2.docx"
+    assert calls == 3
+    assert budget.as_dict()["recovery_stage_counts"] == {"DOWNLOAD": 2}
+
+
+async def test_downloader_does_not_retry_nontransient_http_status(tmp_path: Path) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404, request=request)
+
+    service = SafeFileDownloadService(
+        settings(tmp_path),
+        transport=httpx.MockTransport(handler),
+        resolver=private_resolver,
+    )
+    async with TaskWorkspace(tmp_path, "tsk_404") as workspace:
+        with pytest.raises(WorkflowError) as caught:
+            await service.prepare(
+                [
+                    {
+                        "file_id": "fil_404",
+                        "file_name": "a.docx",
+                        "url": "http://fixture-server/a.docx",
+                        "safe_url": "http://fixture-server/a.docx",
+                        "role": "TARGET",
+                    }
+                ],
+                workspace,
+            )
+    assert caught.value.code == "DOWNLOAD_FAILED"
+    assert calls == 1

@@ -486,7 +486,7 @@ def advice_payload(result: dict[str, Any], risk_ids: set[str] | None = None) -> 
             evidence.get("file_id") or (evidence.get("location") or {}).get("file_id"),
             str(evidence.get("location") or {}),
         )
-        for risk in result.get("risk_items", [])
+        for risk in selected_risk_items
         for evidence in risk.get("source_evidence", [])
         if isinstance(evidence, dict)
     }

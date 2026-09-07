@@ -153,25 +153,61 @@ class CachedExternalDocumentParser:
         *,
         mode: ParseMode,
         include_stamp_images: bool,
+        bypass_cache: bool = False,
+        persist_cache: bool = True,
+        timeout_seconds: float | None = None,
     ) -> ParsedDocument:
         cache_key = self._cache_key(
             mode=mode, include_stamp_images=include_stamp_images
         )
-        try:
-            cached = await self.cache.load(
-                file_sha256=file.sha256, cache_key=cache_key
-            )
-            if cached is not None:
-                document = ParsedDocument.model_validate(cached.get("document"))
-                return self._rebind(document, file)
-        except Exception as exc:
-            logger.warning("ocr_cache_read_failed", error_type=type(exc).__name__)
+        if not bypass_cache:
+            try:
+                cached = await self.cache.load(
+                    file_sha256=file.sha256, cache_key=cache_key
+                )
+                if cached is not None:
+                    document = ParsedDocument.model_validate(cached.get("document"))
+                    return self._rebind(document, file)
+            except Exception as exc:
+                logger.warning("ocr_cache_read_failed", error_type=type(exc).__name__)
 
         stamp_parser = getattr(self.inner, "parse_with_stamp_images", None)
         if include_stamp_images and stamp_parser is not None:
-            document = await stamp_parser(file, mode=mode)
+            if timeout_seconds is None:
+                document = await stamp_parser(file, mode=mode)
+            else:
+                document = await stamp_parser(
+                    file, mode=mode, timeout_seconds=timeout_seconds
+                )
         else:
-            document = await self.inner.parse(file, mode=mode)
+            if timeout_seconds is None:
+                document = await self.inner.parse(file, mode=mode)
+            else:
+                document = await self.inner.parse(
+                    file, mode=mode, timeout_seconds=timeout_seconds
+                )
+        if persist_cache:
+            await self.save_document_to_cache(
+                file,
+                mode=mode,
+                include_stamp_images=include_stamp_images,
+                document=document,
+            )
+        return document
+
+    async def save_document_to_cache(
+        self,
+        file: LocalFile,
+        *,
+        mode: ParseMode,
+        include_stamp_images: bool,
+        document: ParsedDocument,
+    ) -> None:
+        """Persist a validated OCR document after a sidecar has also passed."""
+
+        cache_key = self._cache_key(
+            mode=mode, include_stamp_images=include_stamp_images
+        )
         try:
             await self.cache.save(
                 file_sha256=file.sha256,
@@ -180,12 +216,43 @@ class CachedExternalDocumentParser:
             )
         except Exception as exc:
             logger.warning("ocr_cache_write_failed", error_type=type(exc).__name__)
-        return document
 
     async def parse(self, file: LocalFile, *, mode: ParseMode) -> ParsedDocument:
         return await self._parse(file, mode=mode, include_stamp_images=False)
+
+    async def parse_uncached(
+        self,
+        file: LocalFile,
+        *,
+        mode: ParseMode,
+        timeout_seconds: float | None = None,
+    ) -> ParsedDocument:
+        return await self._parse(
+            file,
+            mode=mode,
+            include_stamp_images=False,
+            bypass_cache=True,
+            persist_cache=False,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def parse_with_stamp_images(
         self, file: LocalFile, *, mode: ParseMode
     ) -> ParsedDocument:
         return await self._parse(file, mode=mode, include_stamp_images=True)
+
+    async def parse_with_stamp_images_uncached(
+        self,
+        file: LocalFile,
+        *,
+        mode: ParseMode,
+        timeout_seconds: float | None = None,
+    ) -> ParsedDocument:
+        return await self._parse(
+            file,
+            mode=mode,
+            include_stamp_images=True,
+            bypass_cache=True,
+            persist_cache=False,
+            timeout_seconds=timeout_seconds,
+        )

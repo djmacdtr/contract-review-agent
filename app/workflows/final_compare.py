@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -23,10 +24,11 @@ from app.comparison.models import ComparisonResult
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
+from app.core.reliability import RecoveryBudget
 from app.db.session import SessionFactory
 from app.documents.models import ParsedDocument, ProcessingWarning
+from app.documents.page_location_cache import SqlAlchemyPageLocationSidecarCache
 from app.documents.page_locations import (
-    apply_docx_page_location_sidecars,
     validate_public_page_coverage,
 )
 from app.documents.parsers import ParserRegistry
@@ -42,9 +44,13 @@ from app.results.risk_model import (
     build_statistics,
 )
 from app.schemas.results import RESULT_SCHEMA_VERSION
-from app.services.downloader import DOCX_MIME, LocalFile, SafeFileDownloadService
+from app.services.downloader import LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
+from app.workflows.page_recovery import (
+    enrich_result_with_page_recovery,
+    recover_missing_page_sidecars,
+)
 from app.workflows.types import WorkflowOutput
 
 FINAL_COMPARE_WORKFLOW_VERSION = "0.7.0"
@@ -88,6 +94,11 @@ class FinalCompareWorkflowExecutor:
             )
             if settings.OCR_ENABLED or settings.DOCX_PAGE_LOCATION_ENABLED
             else None,
+            page_location_cache=(
+                SqlAlchemyPageLocationSidecarCache(SessionFactory)
+                if settings.DOCX_PAGE_LOCATION_ENABLED
+                else None
+            ),
             docx_page_location_enabled=settings.DOCX_PAGE_LOCATION_ENABLED,
         )
         if llm is not None:
@@ -100,8 +111,18 @@ class FinalCompareWorkflowExecutor:
         else:
             self.llm = None
 
-    def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
+    def _build_graph(
+        self,
+        workspace: TaskWorkspace,
+        callback: ProgressCallback,
+        recovery_budget: RecoveryBudget | None = None,
+    ):
         graph = StateGraph(FinalCompareState)
+        recovery_budget = recovery_budget or RecoveryBudget(
+            self.settings.WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS
+        )
+        if self.llm is not None and hasattr(self.llm, "set_recovery_budget"):
+            self.llm.set_recovery_budget(recovery_budget)
 
         async def download_files(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.DOWNLOADING, 10, "正在受控下载两个文件")
@@ -112,28 +133,18 @@ class FinalCompareWorkflowExecutor:
             parsed = await self.parsers.parse_final_compare(state["local_files"])
             sidecars = getattr(self.parsers, "page_location_sidecars", {})
             if self.settings.DOCX_PAGE_LOCATION_ENABLED:
-                missing = [
-                    file.file_id
-                    for file in state["local_files"]
-                    if file.detected_mime_type == DOCX_MIME and file.file_id not in sidecars
-                ]
-                if missing:
-                    raise WorkflowError(
-                        "DOCX_PAGE_LOCATION_INCOMPLETE",
-                        "DOCX 真实页码解析或映射未能可靠完成",
-                        details={
-                            "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
-                            "failure_code": "SIDECAR_MISSING",
-                            "page_count": None,
-                            "external_detail_page_count": 0,
-                            "external_detail_count": 0,
-                            "local_structure_count": 0,
-                            "external_structure_count": 0,
-                            "candidate_mapping_count": 0,
-                            "unmapped_location_count": len(missing),
-                            "missing_file_count": len(missing),
-                        },
-                    )
+                recovered = await recover_missing_page_sidecars(
+                    documents=parsed,
+                    local_files=state["local_files"],
+                    router=self.parsers,
+                    sidecars=sidecars,
+                    budget=recovery_budget,
+                    ocr_refresh_attempts=self.settings.PAGE_LOCATION_OCR_REFRESH_ATTEMPTS,
+                    ocr_timeout_seconds=self.settings.OCR_TIMEOUT_SECONDS,
+                    progress_callback=callback,
+                    progress_stage=TaskStage.PARSING,
+                )
+                parsed, sidecars = recovered.documents, recovered.sidecars
             return {
                 "parsed_documents": parsed,
                 "page_location_sidecars": sidecars,
@@ -217,6 +228,7 @@ class FinalCompareWorkflowExecutor:
                     result,
                     self.llm,
                     require_dynamic_anchor=True,
+                    recovery_budget=recovery_budget,
                 )
             except Exception:
                 # Advice is supplemental and must never invalidate deterministic results.
@@ -233,18 +245,39 @@ class FinalCompareWorkflowExecutor:
         async def persist_result(state: FinalCompareState) -> dict[str, Any]:
             await callback(TaskStage.PERSISTING_RESULT, 97, "正在保存确定性比对结果")
             result = state["result"]
-            apply_docx_page_location_sidecars(result, state.get("page_location_sidecars", {}))
-            if (
-                self.settings.DOCX_PAGE_LOCATION_ENABLED
-                and result.get("metadata", {}).get("comparison_mode")
-                == "FINAL_LOGICAL_V2"
-            ):
-                page_coverage = validate_public_page_coverage(
-                    result, state.get("page_location_sidecars", {})
+            if self.settings.DOCX_PAGE_LOCATION_ENABLED:
+                comparison_is_public = (
+                    result.get("metadata", {}).get("comparison_mode")
+                    == "FINAL_LOGICAL_V2"
                 )
-                result.setdefault("metadata", {})[
-                    "page_location_coverage"
-                ] = page_coverage
+                recovered = await enrich_result_with_page_recovery(
+                    result,
+                    documents=state.get("parsed_documents", []),
+                    local_files=state.get("local_files", []),
+                    router=self.parsers,
+                    sidecars=state.get("page_location_sidecars", {}),
+                    budget=recovery_budget,
+                    ocr_refresh_attempts=self.settings.PAGE_LOCATION_OCR_REFRESH_ATTEMPTS,
+                    ocr_timeout_seconds=self.settings.OCR_TIMEOUT_SECONDS,
+                    validate_coverage=comparison_is_public,
+                    progress_callback=callback,
+                    progress_stage=TaskStage.PERSISTING_RESULT,
+                )
+                result = recovered.result
+                if comparison_is_public:
+                    page_coverage = await asyncio.to_thread(
+                        validate_public_page_coverage, result, recovered.sidecars
+                    )
+                    result.setdefault("metadata", {})[
+                        "page_location_coverage"
+                    ] = page_coverage
+                result.setdefault("metadata", {})["reliability"] = recovery_budget.as_dict()
+                return {
+                    "result": result,
+                    "parsed_documents": recovered.documents,
+                    "page_location_sidecars": recovered.sidecars,
+                }
+            result.setdefault("metadata", {})["reliability"] = recovery_budget.as_dict()
             return {"result": result}
 
         graph.add_node("download_files", download_files)
@@ -416,7 +449,10 @@ class FinalCompareWorkflowExecutor:
         if task_type != TaskType.FINAL_COMPARE:
             raise WorkflowError("COMPARISON_FAILED", "真实比对工作流仅支持 FINAL_COMPARE")
         async with TaskWorkspace(self.settings.TEMP_ROOT, task_id) as workspace:
-            graph = self._build_graph(workspace, progress_callback)
+            recovery_budget = RecoveryBudget(
+                self.settings.WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS
+            )
+            graph = self._build_graph(workspace, progress_callback, recovery_budget)
             state = await graph.ainvoke(
                 FinalCompareState(task_id=task_id, files=files, options=options)
             )

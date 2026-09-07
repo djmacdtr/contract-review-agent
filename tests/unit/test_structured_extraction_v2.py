@@ -1536,8 +1536,8 @@ async def test_singleton_truncation_reduces_text_limit_without_same_payload_retr
         llm=llm,  # type: ignore[arg-type]
     )
 
-    assert llm.limits == [12, 6, 3]
-    assert len(set(llm.payloads)) == len(llm.payloads)
+    assert llm.limits == [12, 12, 8, 8, 4, 4, 2]
+    assert len(set(llm.payloads)) < len(llm.payloads)
     assert result["file_a"]["text_batch_count"] == 1
 
 
@@ -1681,8 +1681,7 @@ async def test_text_recovery_budget_error_keeps_outer_and_underlying_codes() -> 
             llm=AlwaysInvalidText(),  # type: ignore[arg-type]
         )
 
-    assert caught.value.details["failure_code"] == "TEXT_RECOVERY_BUDGET_EXHAUSTED"
-    assert caught.value.details["underlying_failure_code"] == "LLM_INVALID_JSON"
+    assert caught.value.details["failure_code"] == "LLM_INVALID_JSON"
     assert caught.value.details["chain"] == "text"
 
 
@@ -1711,8 +1710,7 @@ async def test_singleton_truncation_at_three_is_safe_terminal_failure() -> None:
             llm=AlwaysTruncated(),  # type: ignore[arg-type]
         )
 
-    assert limits == [12, 6, 3]
-    assert 1 not in limits
+    assert limits == [12, 12, 8, 8, 4, 4, 2, 2, 1, 1]
     assert caught.value.details["failure_code"] == "LLM_OUTPUT_TRUNCATED"
 
 

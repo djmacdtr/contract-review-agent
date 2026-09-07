@@ -843,11 +843,11 @@ async def test_plan_semantics_uses_bounded_internal_schema() -> None:
         (401, "LLM_AUTH_FAILED", 1),
         (403, "LLM_AUTH_FAILED", 1),
         (404, "LLM_ENDPOINT_NOT_FOUND", 1),
-        (429, "LLM_RATE_LIMITED", 5),
-        (500, "LLM_UPSTREAM_ERROR", 5),
-        (502, "LLM_UPSTREAM_ERROR", 5),
-        (503, "LLM_UPSTREAM_ERROR", 5),
-        (504, "LLM_UPSTREAM_ERROR", 5),
+            (429, "LLM_RATE_LIMITED", 3),
+            (500, "LLM_UPSTREAM_ERROR", 3),
+            (502, "LLM_UPSTREAM_ERROR", 3),
+            (503, "LLM_UPSTREAM_ERROR", 3),
+            (504, "LLM_UPSTREAM_ERROR", 3),
     ],
 )
 async def test_safe_http_error_mapping(status: int, code: str, calls: int) -> None:
@@ -1353,6 +1353,56 @@ async def test_mapping_operations_use_expanded_budget_only_for_mapping() -> None
     assert openai_client_module._ADVICE_MAX_OUTPUT_TOKENS == 8192
 
 
+@pytest.mark.asyncio
+async def test_single_risk_advice_repair_uses_compact_json_object_request() -> None:
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "model": "GLM-5.3-Flash",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "risk_id": "risk_1",
+                                    "analysis_advice": "请核对金额差异的审批依据。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        },
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIContractLlmClient(
+        settings(LLM_RESPONSE_FORMAT="json_schema"),
+        transport=httpx.MockTransport(handler),
+        sleeper=no_sleep,
+    )
+
+    result = await client.generate_advice_item(
+        {
+            "risk": {"risk_id": "risk_1", "title": "金额发生变化"},
+            "diff_items": [{"diff_id": "diff_1", "target": {"text": "金额为100万元"}}],
+            "related_facts": [],
+            "files": [{"file_id": "fil_target", "file_name": "当前合同.docx"}],
+        }
+    )
+
+    assert result.value["risk_id"] == "risk_1"
+    assert len(requests) == 1
+    assert requests[0]["max_tokens"] == 1024
+    assert requests[0]["response_format"]["type"] == "json_object"
+    assert requests[0]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 def test_numeric_response_summary_contains_only_safe_index_counts() -> None:
     payload = {"numeric_candidates": [{"candidate_index": 1}]}
 
@@ -1790,8 +1840,8 @@ async def test_upstream_502_uses_bounded_http_retries() -> None:
         await client.extract_fact_batch({"file_id": "fil_synthetic", "units": []})
 
     assert caught.value.code == "LLM_UPSTREAM_ERROR"
-    assert caught.value.request_attempts == 5
-    assert calls == 5
+    assert caught.value.request_attempts == 3
+    assert calls == 3
 
 
 async def test_all_client_requests_share_global_concurrency_gate() -> None:

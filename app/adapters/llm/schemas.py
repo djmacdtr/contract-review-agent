@@ -493,6 +493,13 @@ class RiskAdvice(StrictLlmSchema):
     analysis_advice: str = Field(min_length=1, max_length=240)
 
 
+class SingleRiskAdviceResponse(StrictLlmSchema):
+    """Internal bounded response used only for one-risk Advice recovery."""
+
+    risk_id: str = Field(min_length=1, max_length=160)
+    analysis_advice: str = Field(min_length=1, max_length=240)
+
+
 class AdviceResponse(StrictLlmSchema):
     overall_advice: str = Field(min_length=1, max_length=4000)
     priority_actions: list[str] = Field(default_factory=list, max_length=20)

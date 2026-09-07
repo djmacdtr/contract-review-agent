@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.adapters.llm.base import LlmResult
+from app.core.reliability import RecoveryBudget
 from app.results.advice_batches import generate_advice_in_batches
 
 
@@ -100,6 +101,51 @@ class AdviceFixture:
         )
 
 
+class CodedFailure(RuntimeError):
+    def __init__(self, code: str = "LLM_SCHEMA_INVALID") -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class ItemRepairFixture:
+    def __init__(self, *, item_mode: str = "success", delay: float = 0.0) -> None:
+        self.item_mode = item_mode
+        self.delay = delay
+        self.batch_calls: list[list[str]] = []
+        self.item_calls: list[str] = []
+        self.active = 0
+        self.max_active = 0
+
+    async def generate_advice(self, payload: dict) -> LlmResult:
+        self.batch_calls.append([item["risk_id"] for item in payload["risk_items"]])
+        raise CodedFailure()
+
+    async def generate_advice_item(self, payload: dict) -> LlmResult:
+        import asyncio
+
+        risk = payload["risk"]
+        risk_id = str(risk["risk_id"])
+        self.item_calls.append(risk_id)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        self.active -= 1
+        if self.item_mode == "wrong_id":
+            risk_id = "risk_wrong"
+        if self.item_mode == "not_specific":
+            advice = "请核对相关内容。"
+        else:
+            diff = payload["diff_items"][0]
+            advice = f"请核对{diff['target']['text']}的业务依据。"
+        return LlmResult(
+            value={"risk_id": risk_id, "analysis_advice": advice},
+            configured_model="fixture-advice",
+            actual_model="fixture-advice-item-v1",
+            mock=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_advice_batches_split_189_risks_into_eight_item_batches() -> None:
     result = advice_result(189)
@@ -155,3 +201,73 @@ async def test_zero_risk_advice_does_not_call_model() -> None:
     assert stats.logical_call_count == 0
     assert stats.accepted_count == 0
     assert stats.fallback_count == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_uses_single_risk_protocol_without_fallback() -> None:
+    result = advice_result(1)
+    llm = ItemRepairFixture()
+
+    stats = await generate_advice_in_batches(result, llm)
+
+    assert len(llm.batch_calls) == 2
+    assert llm.item_calls == ["risk_000000"]
+    assert stats.advice_item_repair_attempted == 1
+    assert stats.advice_item_repair_succeeded == 1
+    assert stats.fallback_count == 0
+    assert result["metadata"]["model_runs"][-1]["status"] == "RECOVERED"
+
+
+@pytest.mark.asyncio
+async def test_single_risk_wrong_id_is_rejected_and_diagnosed() -> None:
+    result = advice_result(1)
+    llm = ItemRepairFixture(item_mode="wrong_id")
+
+    stats = await generate_advice_in_batches(result, llm)
+
+    assert stats.fallback_count == 1
+    assert stats.fallback_risk_ids == ["risk_000000"]
+    assert stats.quality_rejections["RISK_ID_INVALID"] >= 1
+    assert stats.fallback_failure_codes["risk_000000"] == "RISK_ID_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_single_risk_not_specific_falls_back_after_quality_gate() -> None:
+    result = advice_result(1)
+    llm = ItemRepairFixture(item_mode="not_specific")
+
+    stats = await generate_advice_in_batches(result, llm)
+
+    assert stats.fallback_count == 1
+    assert stats.quality_rejections["NOT_SPECIFIC"] >= 1
+    assert stats.fallback_failure_codes["risk_000000"] == "NOT_SPECIFIC"
+
+
+@pytest.mark.asyncio
+async def test_recovery_budget_stops_single_risk_repairs() -> None:
+    result = advice_result(1)
+    llm = ItemRepairFixture()
+
+    stats = await generate_advice_in_batches(
+        result,
+        llm,
+        recovery_budget=RecoveryBudget(0),
+    )
+
+    assert llm.item_calls == []
+    assert stats.advice_item_repair_attempted == 0
+    assert stats.fallback_failure_codes["risk_000000"] == "RECOVERY_BUDGET_EXHAUSTED"
+
+
+@pytest.mark.asyncio
+async def test_single_risk_repairs_are_limited_to_sixteen_and_two_concurrent() -> None:
+    result = advice_result(17)
+    llm = ItemRepairFixture(delay=0.001)
+
+    stats = await generate_advice_in_batches(result, llm)
+
+    assert stats.advice_item_repair_attempted == 16
+    assert stats.advice_item_repair_succeeded == 16
+    assert stats.fallback_count == 1
+    assert len(llm.item_calls) == 16
+    assert llm.max_active <= 2

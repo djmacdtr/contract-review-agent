@@ -36,15 +36,30 @@ from app.draft_review.extraction import (
 )
 from app.draft_review.facts import (
     TEXT_EXTRACTION_VERSION,
+    build_template_text_candidates,
     build_text_fact_payload,
     filter_text_fact_evidence,
+    plan_text_candidate_batches,
     plan_text_document_batches,
     split_table_text_unit,
 )
+from app.draft_review.template_checks import analyze_template
 from app.services.downloader import DOCX_MIME, LocalFile
 
 DEFAULT_SOURCE_TASK_ID = "tsk_01M15X5XTYWVJ6MMBY7B47VKNS"
 DEFAULT_BATCH_ID = "batch_161ca9fd8a106e60d1fcc815"
+SAFE_FAILURE_KEYS = {
+    "failure_stage",
+    "chain",
+    "file_id",
+    "role",
+    "file_role",
+    "batch_depth",
+    "unit_count",
+    "batch_id",
+    "failure_code",
+    "underlying_failure_code",
+}
 
 
 def host_database_url(database_url: str) -> str:
@@ -59,17 +74,67 @@ def host_database_url(database_url: str) -> str:
 def safe_task_details(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    keys = {
-        "failure_stage",
-        "chain",
-        "file_id",
-        "batch_depth",
-        "unit_count",
-        "batch_id",
-        "failure_code",
-        "underlying_failure_code",
+    return {key: value[key] for key in SAFE_FAILURE_KEYS if key in value}
+
+
+def select_source_task_file(task: Any, failure: dict[str, Any], batch_id: str):
+    """Select the failed extraction file without guessing its role."""
+
+    if failure.get("batch_id") != batch_id:
+        raise WorkflowError("TEXT_DIAGNOSTIC_BATCH_MISMATCH", "失败批次与诊断批次不一致")
+
+    file_id = str(failure.get("file_id") or "").strip()
+    if file_id:
+        candidates = [item for item in task.files if str(item.id) == file_id]
+        if not candidates:
+            raise WorkflowError("TEXT_SOURCE_FILE_NOT_FOUND", "失败元数据中的文件不存在")
+    else:
+        role = str(
+            failure.get("role") or failure.get("file_role") or "REFERENCE"
+        ).strip()
+        candidates = [item for item in task.files if str(item.role) == role]
+
+    if len(candidates) != 1:
+        raise WorkflowError("TEXT_SOURCE_FILE_NOT_UNIQUE", "来源文本文件不唯一")
+    return candidates[0]
+
+
+def build_local_diagnostic_file(path: Path, source_file: Any, local_sha: str) -> LocalFile:
+    """Build a local file using the task file's actual role."""
+
+    raw_size = path.stat().st_size
+    return LocalFile(
+        file_id=source_file.id,
+        role=str(source_file.role),
+        file_name=path.name,
+        safe_url="local-diagnostic://redacted",
+        path=path,
+        file_size=raw_size,
+        sha256=local_sha,
+        detected_mime_type=DOCX_MIME,
+    )
+
+
+def source_file_sha_failure(
+    *,
+    source_task_id: str,
+    source_file: Any,
+    local_sha: str,
+    batch_id: str,
+) -> dict[str, Any] | None:
+    expected_sha = str(getattr(source_file, "sha256", "") or "")
+    if not expected_sha or expected_sha == local_sha:
+        return None
+    return {
+        "status": "SAFE_STOP",
+        "source_task_id": source_task_id,
+        "file_id": source_file.id,
+        "sha256": local_sha,
+        "batch_id": batch_id,
+        "llm_calls": 0,
+        "failure_stage": "TEXT_SOURCE_FILE_VALIDATION",
+        "failure_code": "TEXT_SOURCE_SHA_MISMATCH",
     }
-    return {key: value[key] for key in keys if key in value}
 
 
 def safe_response_metadata(value: Any) -> dict[str, Any]:
@@ -173,18 +238,33 @@ def reconstruct_text_batch(
     document,
     batch_id: str,
     settings: Settings,
+    *,
+    text_candidates: list[Any] | None = None,
 ) -> dict[str, Any] | None:
     """Rebuild one batch using the production text planner and recovery IDs."""
 
-    initial = plan_text_document_batches(
-        document,
-        max_payload_chars=settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
-        max_text_units=min(settings.LLM_EXTRACTION_MAX_TEXT_UNITS, 16),
-        max_text_facts=min(settings.LLM_EXTRACTION_MAX_TEXT_FACTS, 12),
-        estimated_output_token_limit=min(
+    planner_kwargs = {
+        "max_payload_chars": settings.LLM_EXTRACTION_PAYLOAD_MAX_CHARS,
+        "max_text_facts": min(settings.LLM_EXTRACTION_MAX_TEXT_FACTS, 12),
+        "estimated_output_token_limit": min(
             settings.LLM_EXTRACTION_SIMPLIFIED_ESTIMATED_OUTPUT_TOKENS, 2000
         ),
-    )
+    }
+    if str(document.role) == "TARGET":
+        if text_candidates is None:
+            return None
+        initial = plan_text_candidate_batches(
+            document,
+            text_candidates,
+            max_candidates=min(settings.LLM_EXTRACTION_MAX_TEXT_UNITS, 16),
+            **planner_kwargs,
+        )
+    else:
+        initial = plan_text_document_batches(
+            document,
+            max_text_units=min(settings.LLM_EXTRACTION_MAX_TEXT_UNITS, 16),
+            **planner_kwargs,
+        )
     initial = [
         _decorate_initial_plan(plan, planned_batch_count=len(initial))
         for plan in initial
@@ -235,17 +315,15 @@ async def _source_task_file(session_factory, source_task_id: str, batch_id: str)
     if task is None:
         raise WorkflowError("TEXT_SOURCE_TASK_NOT_FOUND", "来源任务不存在")
     failure = safe_task_details(task.error_details)
-    if failure.get("batch_id") != batch_id:
-        raise WorkflowError("TEXT_DIAGNOSTIC_BATCH_MISMATCH", "失败批次与诊断批次不一致")
-    file_id = str(failure.get("file_id", ""))
-    candidates = [
-        item
-        for item in task.files
-        if str(item.role) == "REFERENCE" and (not file_id or item.id == file_id)
-    ]
+    source_file = select_source_task_file(task, failure, batch_id)
+    return task, source_file, failure
+
+
+def select_unique_task_role_file(task: Any, role: str):
+    candidates = [item for item in task.files if str(item.role) == role]
     if len(candidates) != 1:
-        raise WorkflowError("TEXT_SOURCE_FILE_NOT_UNIQUE", "来源文本文件不唯一")
-    return task, candidates[0], failure
+        raise WorkflowError("TEXT_TEMPLATE_FILE_NOT_UNIQUE", "模板文件不唯一")
+    return candidates[0]
 
 
 async def diagnose(
@@ -255,6 +333,7 @@ async def diagnose(
     batch_id: str,
     response_format: str,
     model_override: str | None,
+    template_path: Path | None = None,
 ) -> dict[str, Any]:
     raw = path.read_bytes()
     settings = Settings()
@@ -269,33 +348,50 @@ async def diagnose(
     engine = create_async_engine(host_database_url(settings.DATABASE_URL), pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        _task, source_file, failure = await _source_task_file(
+        task, source_file, failure = await _source_task_file(
             session_factory, source_task_id, batch_id
         )
         local_sha = hashlib.sha256(raw).hexdigest()
-        local_file = LocalFile(
-            file_id=source_file.id,
-            role="REFERENCE",
-            file_name=path.name,
-            safe_url="local-diagnostic://redacted",
-            path=path,
-            file_size=len(raw),
-            sha256=local_sha,
-            detected_mime_type=DOCX_MIME,
-        )
+        local_file = build_local_diagnostic_file(path, source_file, local_sha)
         document = await DocxParser().parse(local_file)
-        if source_file.sha256 and source_file.sha256 != local_sha:
-            return {
-                "status": "SAFE_STOP",
-                "source_task_id": source_task_id,
-                "file_id": source_file.id,
-                "sha256": local_sha,
-                "batch_id": batch_id,
-                "llm_calls": 0,
-                "failure_stage": "TEXT_SOURCE_FILE_VALIDATION",
-                "failure_code": "TEXT_SOURCE_SHA_MISMATCH",
-            }
-        plan = reconstruct_text_batch(document, batch_id, settings)
+        sha_failure = source_file_sha_failure(
+            source_task_id=source_task_id,
+            source_file=source_file,
+            local_sha=local_sha,
+            batch_id=batch_id,
+        )
+        if sha_failure is not None:
+            return sha_failure
+        text_candidates = None
+        if str(source_file.role) == "TARGET":
+            if template_path is None or not template_path.is_file():
+                raise WorkflowError("TEXT_TEMPLATE_FILE_NOT_FOUND", "TARGET 诊断需要模板文件")
+            template_source = select_unique_task_role_file(task, "TEMPLATE")
+            template_raw = template_path.read_bytes()
+            template_file = build_local_diagnostic_file(
+                template_path,
+                template_source,
+                hashlib.sha256(template_raw).hexdigest(),
+            )
+            template = await DocxParser().parse(template_file)
+            template_review = analyze_template(
+                template,
+                document,
+                ignore_formatting=True,
+                ignore_headers_footers=True,
+                check_blank_fields=True,
+                ocr_low_confidence_threshold=settings.OCR_LOW_CONFIDENCE_THRESHOLD,
+                page_missing_min_equivalent=settings.PAGE_MISSING_MIN_EQUIVALENT,
+                page_missing_min_anchor_similarity=settings.PAGE_MISSING_MIN_ANCHOR_SIMILARITY,
+                page_missing_min_structure_units=settings.PAGE_MISSING_MIN_STRUCTURE_UNITS,
+            )
+            text_candidates = build_template_text_candidates(template_review, document)
+        plan = reconstruct_text_batch(
+            document,
+            batch_id,
+            settings,
+            text_candidates=text_candidates,
+        )
         if plan is None:
             return {
                 "status": "SAFE_STOP",
@@ -409,6 +505,7 @@ def main() -> int:
         default="json_object",
     )
     parser.add_argument("--model", dest="model_override")
+    parser.add_argument("--template", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     path = args.path.resolve()
@@ -421,6 +518,7 @@ def main() -> int:
             batch_id=args.batch_id,
             response_format=args.response_format,
             model_override=args.model_override,
+            template_path=args.template.resolve() if args.template else None,
         )
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2)

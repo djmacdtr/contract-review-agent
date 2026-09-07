@@ -97,6 +97,58 @@ def test_advice_payload_includes_every_formal_risk() -> None:
     ]
 
 
+def test_advice_payload_isolated_to_selected_risk_facts_and_diffs() -> None:
+    result = result_fixture()
+    result["risk_items"].append(
+        {
+            "risk_id": "risk_000002",
+            "risk_type": "ADDITION_OR_CHANGE",
+            "title": "付款方式发生变化",
+            "related_diff_ids": ["diff_000002"],
+            "source_evidence": [
+                {"file_id": "fil_target", "location": {"page": 8, "paragraph_index": 2}}
+            ],
+        }
+    )
+    result["diff_items"].append(
+        {
+            "diff_id": "diff_000002",
+            "baseline": {"file_id": "fil_base", "text": "银行转账", "location": {"page": 8}},
+            "target": {"file_id": "fil_target", "text": "现金支付", "location": {"page": 8}},
+            "segments": [],
+        }
+    )
+    result["fact_matrix"] = [
+        {
+            "status": "CONFLICT",
+            "target_candidate": {
+                "source_file_id": "fil_target",
+                "raw_value": "36个月",
+                "location": {"page": 3, "paragraph_index": 11},
+            },
+            "reference_results": [],
+        },
+        {
+            "status": "CONFLICT",
+            "target_candidate": {
+                "source_file_id": "fil_target",
+                "raw_value": "现金支付",
+                "location": {"page": 8, "paragraph_index": 2},
+            },
+            "reference_results": [],
+        },
+    ]
+    result["risk_items"][0]["source_evidence"] = [
+        {"file_id": "fil_target", "location": {"page": 3, "paragraph_index": 11}}
+    ]
+
+    payload = advice_payload(result, risk_ids={"risk_000001"})
+
+    assert [item["risk_id"] for item in payload["risk_items"]] == ["risk_000001"]
+    assert [item["diff_id"] for item in payload["diff_items"]] == ["diff_000001"]
+    assert [fact["target"]["raw_value"] for fact in payload["related_facts"]] == ["36个月"]
+
+
 def test_model_advice_merges_only_current_unique_risk_ids() -> None:
     result = result_fixture()
     merge_model_advice(

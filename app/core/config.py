@@ -20,7 +20,10 @@ class Settings(BaseSettings):
     WORKER_STALE_AFTER_SECONDS: float = 120.0
     WORKER_MAX_CONCURRENT_TASKS: int = 1
     TASK_MAX_ATTEMPTS: int = 2
+    TASK_TRANSIENT_RESUME_ATTEMPTS: int = Field(default=1, ge=0, le=1)
+    DB_WRITE_RETRY_ATTEMPTS: int = Field(default=1, ge=0, le=1)
     MOCK_STAGE_DELAY_SECONDS: float = 0.15
+    WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS: float = Field(default=600, ge=0, le=3600)
 
     TEMP_ROOT: str = "/tmp/contract-review"
     MAX_FILE_SIZE_MB: float = Field(default=200, gt=0)
@@ -30,6 +33,7 @@ class Settings(BaseSettings):
     MAX_REFERENCE_FILES: int = Field(default=20, ge=1, le=100)
     DOWNLOAD_TIMEOUT_SECONDS: float = 120.0
     DOWNLOAD_MAX_REDIRECTS: int = 3
+    DOWNLOAD_RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=2)
     PDF_MIN_TEXT_CHARS_PER_PAGE: int = Field(default=20, ge=1)
     ALLOW_HTTP_DOWNLOADS: bool = False
     DOWNLOAD_HOST_ALLOWLIST: str = ""
@@ -48,6 +52,7 @@ class Settings(BaseSettings):
     OCR_STAMP_MAX_TOTAL_BYTES: int = Field(default=8_388_608, ge=1024, le=52_428_800)
 
     DOCX_PAGE_LOCATION_ENABLED: bool = False
+    PAGE_LOCATION_OCR_REFRESH_ATTEMPTS: int = Field(default=1, ge=0, le=1)
 
     PAGE_MISSING_MIN_EQUIVALENT: float = Field(default=0.8, gt=0)
     PAGE_MISSING_MIN_ANCHOR_SIMILARITY: float = Field(default=0.85, ge=0, le=1)
@@ -63,7 +68,11 @@ class Settings(BaseSettings):
     LLM_EMBEDDING_MODEL: str = "embedding"
     LLM_RERANK_MODEL: str = "rerank"
     LLM_TIMEOUT_SECONDS: float = 180.0
-    LLM_HTTP_RETRY_ATTEMPTS: int = Field(default=4, ge=0, le=4)
+    LLM_HTTP_RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=2)
+    LLM_NETWORK_RETRY_ATTEMPTS: int = Field(default=2, ge=0, le=2)
+    LLM_MAPPING_RECOVERY_ATTEMPTS: int = Field(default=1, ge=0, le=1)
+    LLM_EXTRACTION_LEAF_RETRY_ATTEMPTS: int = Field(default=1, ge=0, le=1)
+    LLM_TEXT_RECOVERY_MAX_DEPTH: int = Field(default=4, ge=0, le=4)
     LLM_MAX_CONCURRENCY: int = Field(default=3, ge=1, le=4)
     LLM_MAX_OUTPUT_TOKENS: int = 8192
     LLM_RESPONSE_FORMAT: Literal["prompt_only", "json_object", "json_schema"] = "prompt_only"

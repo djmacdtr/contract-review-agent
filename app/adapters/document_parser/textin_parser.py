@@ -19,13 +19,20 @@ class TextInDocumentParser:
         *,
         mode: ParseMode,
         include_stamp_images: bool = False,
+        timeout_seconds: float | None = None,
     ) -> ParsedDocument:
         if include_stamp_images:
-            response = await self.client.parse(
-                file, mode=mode, include_stamp_images=True
-            )
+            if timeout_seconds is None:
+                response = await self.client.parse(file, mode=mode, include_stamp_images=True)
+            else:
+                response = await self.client.parse(
+                    file, mode=mode, include_stamp_images=True, timeout_seconds=timeout_seconds
+                )
         else:
-            response = await self.client.parse(file, mode=mode)
+            if timeout_seconds is None:
+                response = await self.client.parse(file, mode=mode)
+            else:
+                response = await self.client.parse(file, mode=mode, timeout_seconds=timeout_seconds)
         document = map_textin_document(
             response,
             file,
@@ -47,10 +54,14 @@ class TextInDocumentParser:
         )
         return document
 
-    async def parse(self, file: LocalFile, *, mode: ParseMode) -> ParsedDocument:
-        return await self._parse(file, mode=mode)
+    async def parse(
+        self, file: LocalFile, *, mode: ParseMode, timeout_seconds: float | None = None
+    ) -> ParsedDocument:
+        return await self._parse(file, mode=mode, timeout_seconds=timeout_seconds)
 
     async def parse_with_stamp_images(
-        self, file: LocalFile, *, mode: ParseMode
+        self, file: LocalFile, *, mode: ParseMode, timeout_seconds: float | None = None
     ) -> ParsedDocument:
-        return await self._parse(file, mode=mode, include_stamp_images=True)
+        return await self._parse(
+            file, mode=mode, include_stamp_images=True, timeout_seconds=timeout_seconds
+        )

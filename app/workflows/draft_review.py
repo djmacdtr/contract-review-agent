@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from copy import deepcopy
 from typing import Any, TypedDict
 
 import structlog
@@ -22,7 +21,6 @@ from app.adapters.llm.openai_client import (
     _safe_validation_summary,
 )
 from app.adapters.llm.schemas import (
-    AdviceResponse,
     CrossValidationResponse,
     DocumentFactExtraction,
     FactCandidate,
@@ -37,16 +35,20 @@ from app.adapters.llm.schemas import (
 from app.core.config import Settings
 from app.core.enums import TaskStage, TaskType
 from app.core.errors import WorkflowError
+from app.core.reliability import RecoveryBudget, is_retryable_model_output_error
 from app.db.session import SessionFactory
 from app.documents.models import DocumentBlock, ParsedDocument, ProcessingWarning
 from app.documents.page_location_cache import SqlAlchemyPageLocationSidecarCache
 from app.documents.page_locations import (
-    apply_docx_page_location_sidecars,
     validate_public_page_coverage,
 )
 from app.documents.parsers import ParserRegistry
 from app.documents.router import DocumentParsingRouter
-from app.draft_review.checkpoints import ExtractionCheckpoint
+from app.draft_review.checkpoints import (
+    MAPPING_CHECKPOINT_VERSION,
+    ExtractionCheckpoint,
+    mapping_checkpoint_identity,
+)
 from app.draft_review.delivery_cross_check import (
     MAX_CROSS_BATCH_SIZE,
     build_cross_validation_payload,
@@ -93,18 +95,20 @@ from app.draft_review.mapping import (
 from app.draft_review.numeric_rules import evaluate_validation_spec, referenced_fact_refs
 from app.draft_review.template_checks import TemplateReviewResult, analyze_template
 from app.results.advice import (
-    ADVICE_QUALITY_CODES,
-    advice_payload,
-    empty_advice_quality_counts,
     ensure_fallback_risk_advices,
-    validate_advice_item,
 )
+from app.results.advice_batches import generate_advice_in_batches
 from app.results.passed_checks import build_comparison_passed_checks
 from app.results.risk_model import build_risk_items, build_statistics
 from app.schemas.results import RESULT_SCHEMA_VERSION
 from app.services.downloader import DOCX_MIME, LocalFile, SafeFileDownloadService
 from app.services.temp_files import TaskWorkspace
 from app.workflows.mock_graphs import ProgressCallback
+from app.workflows.page_recovery import (
+    enrich_result_with_page_recovery,
+    page_free_result_copy,
+    recover_missing_page_sidecars,
+)
 from app.workflows.types import WorkflowOutput
 
 DRAFT_REVIEW_WORKFLOW_VERSION = "0.7.0"
@@ -502,6 +506,41 @@ def _mapping_failure_details(
     return details
 
 
+def _mapping_logical_location_key(location: Any) -> tuple[Any, ...]:
+    if not isinstance(location, dict):
+        return (None, None, None, None)
+    return tuple(location.get(key) for key in ("paragraph_index", "table_index", "row", "column"))
+
+
+def _rebind_mapping_checkpoint_value(
+    value: dict[str, Any],
+    *,
+    reference_file_id: str,
+    reference_facts: list[FactCandidate],
+) -> FactMappingResponse:
+    """Rebind a page-free/source-task Mapping response to current identities."""
+
+    mapping = FactMappingResponse.model_validate(value)
+    fact_by_key = {
+        (fact.field_key, _mapping_logical_location_key(fact.location.model_dump(mode="json"))): fact
+        for fact in reference_facts
+    }
+    rebound = mapping.model_copy(deep=True, update={"reference_file_id": reference_file_id})
+    for proposal in rebound.mappings:
+        fact = fact_by_key.get(
+            (
+                proposal.reference_field_key,
+                _mapping_logical_location_key(
+                    proposal.reference_location.model_dump(mode="json")
+                ),
+            )
+        )
+        if fact is not None:
+            proposal.source_file_id = reference_file_id
+            proposal.reference_location = fact.location
+    return rebound
+
+
 class DraftReviewState(TypedDict, total=False):
     task_id: str
     files: list[dict[str, Any]]
@@ -572,6 +611,7 @@ class DraftReviewWorkflowExecutor:
         task_id: str,
         result: dict[str, Any],
         documents: list[ParsedDocument],
+        docx_file_ids: set[str] | None = None,
     ) -> None:
         """Persist a page-free result artifact before physical page enrichment.
 
@@ -582,6 +622,11 @@ class DraftReviewWorkflowExecutor:
 
         if self.checkpoint_store is None:
             return
+        docx_file_ids = docx_file_ids or {
+            document.file_id
+            for document in documents
+            if document.file_name.lower().endswith(".docx")
+        }
         sha_by_file_id = {document.file_id: document.sha256 for document in documents}
         for file in result.get("files", []):
             if not isinstance(file, dict):
@@ -590,7 +635,7 @@ class DraftReviewWorkflowExecutor:
             file_sha256 = sha_by_file_id.get(file_id)
             if not isinstance(file_id, str) or not isinstance(file_sha256, str):
                 continue
-            snapshot = deepcopy(result)
+            snapshot = page_free_result_copy(result, docx_file_ids=docx_file_ids)
             identity_payload = {
                 "version": PRE_PAGE_RESULT_SNAPSHOT_VERSION,
                 "file_sha256": file_sha256,
@@ -620,41 +665,44 @@ class DraftReviewWorkflowExecutor:
                 )
             )
 
-    def _build_graph(self, workspace: TaskWorkspace, callback: ProgressCallback):
+    def _build_graph(
+        self,
+        workspace: TaskWorkspace,
+        callback: ProgressCallback,
+        recovery_budget: RecoveryBudget | None = None,
+    ):
         graph = StateGraph(DraftReviewState)
+        recovery_budget = recovery_budget or RecoveryBudget(
+            self.settings.WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS
+        )
+        if self.llm is not None and hasattr(self.llm, "set_recovery_budget"):
+            self.llm.set_recovery_budget(recovery_budget)
 
         async def download_files(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.DOWNLOADING, 10, "正在受控下载起草检查文件")
-            return {"local_files": await self.downloader.prepare(state["files"], workspace)}
+            return {
+                "local_files": await self.downloader.prepare(
+                    state["files"], workspace, recovery_budget
+                )
+            }
 
         async def parse_documents(state: DraftReviewState) -> dict[str, Any]:
             await callback(TaskStage.PARSING, 35, "正在逐份解析目标、模板和辅助资料")
             parsed = await self.parsers.parse_draft_review(state["local_files"])
             sidecars = getattr(self.parsers, "page_location_sidecars", {})
             if self.settings.DOCX_PAGE_LOCATION_ENABLED:
-                missing = [
-                    file.file_id
-                    for file in state["local_files"]
-                    if file.detected_mime_type == DOCX_MIME
-                    and file.file_id not in sidecars
-                ]
-                if missing:
-                    raise WorkflowError(
-                        "DOCX_PAGE_LOCATION_INCOMPLETE",
-                        "DOCX 真实页码解析或映射未能可靠完成",
-                        details={
-                            "failure_stage": "PUBLIC_EVIDENCE_MAPPING",
-                            "failure_code": "SIDECAR_MISSING",
-                            "page_count": None,
-                            "external_detail_page_count": 0,
-                            "external_detail_count": 0,
-                            "local_structure_count": 0,
-                            "external_structure_count": 0,
-                            "candidate_mapping_count": 0,
-                            "unmapped_location_count": len(missing),
-                            "missing_file_count": len(missing),
-                        },
-                    )
+                recovered = await recover_missing_page_sidecars(
+                    documents=parsed,
+                    local_files=state["local_files"],
+                    router=self.parsers,
+                    sidecars=sidecars,
+                    budget=recovery_budget,
+                    ocr_refresh_attempts=self.settings.PAGE_LOCATION_OCR_REFRESH_ATTEMPTS,
+                    ocr_timeout_seconds=self.settings.OCR_TIMEOUT_SECONDS,
+                    progress_callback=callback,
+                    progress_stage=TaskStage.PARSING,
+                )
+                parsed, sidecars = recovered.documents, recovered.sidecars
             return {
                 "parsed_documents": parsed,
                 "page_location_sidecars": sidecars,
@@ -761,7 +809,23 @@ class DraftReviewWorkflowExecutor:
                     break
                 payload = build_cross_validation_payload(batch)
                 try:
-                    generated = await self.llm.cross_validate_candidates(payload)
+                    cross_recovery_attempted = False
+                    while True:
+                        try:
+                            generated = await self.llm.cross_validate_candidates(payload)
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            if (
+                                cross_recovery_attempted
+                                or not is_retryable_model_output_error(exc)
+                                or not recovery_budget.allow_stage(
+                                    "CROSS_VALIDATE", getattr(exc, "code", type(exc).__name__)
+                                )
+                            ):
+                                raise
+                            cross_recovery_attempted = True
                     response = CrossValidationResponse.model_validate(generated.value)
                     expected = {group["candidate_id"] for group in batch}
                     actual = [item.candidate_id for item in response.items]
@@ -865,6 +929,7 @@ class DraftReviewWorkflowExecutor:
                             task_id=state.get("task_id"),
                             source_task_id=checkpoint_source_task_id,
                             source_file_ids_by_file_id=source_file_ids_by_file_id,
+                            recovery_budget=recovery_budget,
                             text_candidates_by_document={
                                 document.file_id: build_template_text_candidates(
                                     state["template_review"], document
@@ -1607,6 +1672,56 @@ class DraftReviewWorkflowExecutor:
                         for fact in accepted_reference_facts
                     ],
                 }
+                mapping_model_name = self.settings.LLM_EXTRACTION_MODEL
+                mapping_checkpoint_batch, mapping_payload_digest = mapping_checkpoint_identity(
+                    target_sha256=target_document.sha256,
+                    reference_sha256=document.sha256,
+                    model_name=mapping_model_name,
+                    payload=payload,
+                    rules_version=DRAFT_REVIEW_RULES_VERSION,
+                )
+
+                async def call_mapping_with_recovery(
+                    mapping_payload: dict[str, Any],
+                ) -> LlmResult:
+                    last_error: BaseException | None = None
+                    max_recovery = max(
+                        0,
+                        min(
+                            int(getattr(self.settings, "LLM_MAPPING_RECOVERY_ATTEMPTS", 1)),
+                            1,
+                        ),
+                    )
+                    for attempt in range(max_recovery + 1):
+                        if attempt:
+                            if getattr(last_error, "mapping_recovery_attempted", False):
+                                raise last_error
+                            failure_code = getattr(last_error, "code", None) or type(
+                                last_error
+                            ).__name__
+                            if not recovery_budget.allow(failure_code):
+                                raise last_error
+                            await callback(
+                                TaskStage.CROSS_VALIDATE,
+                                80,
+                                f"正在自动恢复（{attempt}/{max_recovery}）",
+                            )
+                        try:
+                            return await self.llm.map_facts(mapping_payload)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            last_error = exc
+                            recovery_budget.record_failure(
+                                getattr(exc, "code", None) or type(exc).__name__
+                            )
+                            if (
+                                not is_retryable_model_output_error(exc)
+                                or attempt >= max_recovery
+                            ):
+                                raise
+                    raise AssertionError("unreachable")
+
                 try:
                     if not catalog or not accepted_reference_facts:
                         empty_mapping = FactMappingResponse(
@@ -1631,8 +1746,41 @@ class DraftReviewWorkflowExecutor:
                                 "status": "SKIPPED_NO_QUALIFIED_FACTS",
                             }
                         continue
-                    mapping_result = await self.llm.map_facts(payload)
-                    mapping = FactMappingResponse.model_validate(mapping_result.value)
+                    mapping_result: LlmResult | None = None
+                    mapping: FactMappingResponse | None = None
+                    checkpoint = None
+                    source_task_id = state.get("options", {}).get("source_task_id")
+                    if self.checkpoint_store is not None:
+                        try:
+                            checkpoint = await self.checkpoint_store.load(
+                                mapping_checkpoint_batch,
+                                task_id=state["task_id"],
+                                source_task_id=source_task_id,
+                                file_sha256=document.sha256,
+                                extraction_version=MAPPING_CHECKPOINT_VERSION,
+                                payload_digest=mapping_payload_digest,
+                            )
+                        except Exception:
+                            checkpoint = None
+                    if checkpoint is not None and checkpoint.value is not None:
+                        mapping = _rebind_mapping_checkpoint_value(
+                            checkpoint.value,
+                            reference_file_id=document.file_id,
+                            reference_facts=accepted_reference_facts,
+                        )
+                        mapping_result = LlmResult(
+                            value=mapping.model_dump(mode="json"),
+                            configured_model=checkpoint.model_name or mapping_model_name,
+                            actual_model=None,
+                            mock=False,
+                            response_metadata={"checkpoint_reused": True},
+                        )
+                        recovery_budget.stats.checkpoint_reused = True
+                    else:
+                        mapping_result = await call_mapping_with_recovery(payload)
+                        mapping = FactMappingResponse.model_validate(mapping_result.value)
+                    if mapping is None:
+                        raise ValueError("mapping response missing")
                     if mapping.reference_file_id != document.file_id:
                         raise EvidenceValidationError(
                             "mapping reference file does not match",
@@ -1686,7 +1834,22 @@ class DraftReviewWorkflowExecutor:
                         "duration_ms": mapping_result.duration_ms,
                         "request_attempts": mapping_result.request_attempts,
                         "structure_retries": mapping_result.structure_retries,
+                        "checkpoint_reused": checkpoint is not None,
                     }
+                    if checkpoint is None and self.checkpoint_store is not None:
+                        await self.checkpoint_store.save(
+                            ExtractionCheckpoint(
+                                task_id=state["task_id"],
+                                file_sha256=document.sha256,
+                                batch_id=mapping_checkpoint_batch,
+                                extraction_version=MAPPING_CHECKPOINT_VERSION,
+                                payload_digest=mapping_payload_digest,
+                                value=mapping.model_dump(mode="json"),
+                                status="SUCCEEDED",
+                                model_name=mapping_result.actual_model
+                                or mapping_result.configured_model,
+                            )
+                        )
                     if not mapping_review_enabled:
                         continue
                     catalog_by_id = {
@@ -2128,202 +2291,58 @@ class DraftReviewWorkflowExecutor:
                 ]
                 return {"result": result}
             await callback(TaskStage.GENERATING_ADVICE, 92, "正在根据已有证据生成建议")
-            accepted: dict[str, str] = {}
-            accepted_texts: set[str] = set()
-            advice_quality_counts = empty_advice_quality_counts()
-            advice_specificity_invalid_count = 0
-            multi_sentence_normalized_count = 0
-            unresolved: dict[str, dict[str, Any]] = {}
-            top_level: dict[str, Any] | None = None
-            aggregate_lists: dict[str, list[Any]] = {
-                "priority_actions": [],
-                "manual_review_focus": [],
-                "limitations": [],
-                "evidence_refs": [],
-            }
-            advice_semaphore = asyncio.Semaphore(
-                max(1, self.settings.LLM_EXTRACTION_TASK_CONCURRENCY)
+            await generate_advice_in_batches(
+                result,
+                self.llm,
+                require_dynamic_anchor=True,
+                recovery_budget=recovery_budget,
             )
-
-            async def process_batch(
-                batch: list[dict[str, Any]],
-                *,
-                batch_id: str,
-                missing_retry: bool = False,
-            ) -> None:
-                nonlocal advice_specificity_invalid_count, multi_sentence_normalized_count
-                nonlocal top_level
-                batch_result = {
-                    **result,
-                    "risk_items": batch,
-                    "diff_items": [
-                        diff
-                        for diff in result.get("diff_items", [])
-                        if any(
-                            diff.get("diff_id") in risk.get("related_diff_ids", [])
-                            for risk in batch
-                        )
-                    ],
-                }
-                try:
-                    async with advice_semaphore:
-                        generated = await advice_method(advice_payload(batch_result))
-                    advice = AdviceResponse.model_validate(generated.value)
-                    result["metadata"].setdefault("model_runs", []).append(
-                        {
-                            "purpose": "RISK_ADVICE",
-                            "configured_model": generated.configured_model,
-                            "actual_model": generated.actual_model,
-                            "duration_ms": generated.duration_ms,
-                            "request_attempts": generated.request_attempts,
-                            "structure_retries": generated.structure_retries,
-                            "batch_count": 1,
-                            "batch_id": batch_id,
-                            "risk_count": len(batch),
-                            "status": "SUCCEEDED",
-                        }
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except (LlmClientError, ValidationError, ValueError, TimeoutError) as exc:
-                    if len(batch) > 1:
-                        middle = len(batch) // 2
-                        await process_batch(batch[:middle], batch_id=f"{batch_id}.0")
-                        await process_batch(batch[middle:], batch_id=f"{batch_id}.1")
-                        return
-                    unresolved[batch[0]["risk_id"]] = {
-                        "batch_id": batch_id,
-                        "failure_code": (
-                            getattr(exc, "failure_code", None)
-                            or getattr(exc, "code", None)
-                            or type(exc).__name__
-                        ),
-                    }
-                    return
-
-                advice_value = advice.model_dump(mode="json")
-                if top_level is None:
-                    top_level = {"overall_advice": advice_value["overall_advice"]}
-                for key in aggregate_lists:
-                    for item in advice_value.get(key, []):
-                        if item not in aggregate_lists[key]:
-                            aggregate_lists[key].append(item)
-
-                expected_ids = {risk["risk_id"] for risk in batch}
-                seen_response_ids: set[str] = set()
-                for item in advice.risk_advices:
-                    if item.risk_id not in expected_ids or item.risk_id in seen_response_ids:
-                        continue
-                    outcome = validate_advice_item(
-                        result,
-                        item,
-                        seen_risk_ids=seen_response_ids,
-                        seen_advice_texts=accepted_texts,
-                        require_dynamic_anchor=True,
-                    )
-                    seen_response_ids.add(item.risk_id)
-                    if outcome.reason_code in ADVICE_QUALITY_CODES:
-                        advice_quality_counts[outcome.reason_code] += 1
-                    if outcome.reason_code == "NOT_SPECIFIC":
-                        advice_specificity_invalid_count += 1
-                    if outcome.normalized_multi_sentence:
-                        multi_sentence_normalized_count += 1
-                    if not outcome.accepted:
-                        continue
-                    accepted[item.risk_id] = outcome.normalized_advice
-                    accepted_texts.add(outcome.normalized_advice)
-                    unresolved.pop(item.risk_id, None)
-
-                missing = [risk for risk in batch if risk["risk_id"] not in accepted]
-                if missing and not missing_retry:
-                    await process_batch(
-                        missing,
-                        batch_id=f"{batch_id}.missing",
-                        missing_retry=True,
-                    )
-                else:
-                    for risk in missing:
-                        unresolved.setdefault(
-                            risk["risk_id"],
-                            {
-                                "batch_id": batch_id,
-                                "failure_code": "ADVICE_ITEM_MISSING_OR_INVALID",
-                            },
-                        )
-
-            initial_batches = [
-                (risks[start : start + 8], f"advice-{batch_index:04d}")
-                for batch_index, start in enumerate(range(0, len(risks), 8), start=1)
-            ]
-            for start in range(0, len(initial_batches), 3):
-                await asyncio.gather(
-                    *(
-                        process_batch(batch, batch_id=batch_id)
-                        for batch, batch_id in initial_batches[start : start + 3]
-                    )
-                )
-
-            for risk in risks:
-                if risk["risk_id"] in accepted:
-                    risk["analysis_advice"] = accepted[risk["risk_id"]]
-            ensure_fallback_risk_advices(result)
-            fallback_count = len(risks) - len(accepted)
-            model_rate = len(accepted) / len(risks)
-            fallback_rate = fallback_count / len(risks)
-            result["metadata"]["advice_coverage"] = {
-                "risk_count": len(risks),
-                "model_count": len(accepted),
-                "fallback_count": fallback_count,
-                "model_rate": round(model_rate, 6),
-                "fallback_rate": round(fallback_rate, 6),
-            }
-            result["metadata"]["advice_validation"] = {
-                "accepted_count": len(accepted),
-                **advice_quality_counts,
-                "not_specific_count": advice_specificity_invalid_count,
-                "multi_sentence_normalized_count": multi_sentence_normalized_count,
-            }
-            if fallback_count:
-                result.setdefault("warnings", []).append(
-                    {
-                        "code": "LLM_ADVICE_UNAVAILABLE",
-                        "message": "少量模型建议未完成，已对未覆盖风险使用确定性建议。",
-                        "requires_manual_review": False,
-                    }
-                )
-            result["advice"] = {
-                **(top_level or {"overall_advice": "请按证据位置逐项复核风险。"}),
-                **aggregate_lists,
-                "risk_advices": [
-                    {
-                        "risk_id": risk["risk_id"],
-                        "analysis_advice": risk["analysis_advice"],
-                    }
-                    for risk in risks
-                ],
-            }
             return {"result": result}
 
         async def page_enrich(state: DraftReviewState) -> dict[str, Any]:
             result = state["result"]
             if self.settings.DOCX_PAGE_LOCATION_ENABLED:
+                await callback(
+                    TaskStage.PERSISTING_RESULT,
+                    95,
+                    "正在校验并补全公开证据页码",
+                )
                 await self._save_pre_page_result_snapshot(
                     task_id=state["task_id"],
                     result=result,
                     documents=state.get("parsed_documents", []),
+                    docx_file_ids={
+                        file.file_id
+                        for file in state.get("local_files", [])
+                        if file.detected_mime_type == DOCX_MIME
+                    },
                 )
-                await asyncio.to_thread(
-                    apply_docx_page_location_sidecars,
+                recovered = await enrich_result_with_page_recovery(
                     result,
-                    state.get("page_location_sidecars", {}),
-                    strict=True,
+                    documents=state.get("parsed_documents", []),
+                    local_files=state.get("local_files", []),
+                    router=self.parsers,
+                    sidecars=state.get("page_location_sidecars", {}),
+                    budget=recovery_budget,
+                    ocr_refresh_attempts=self.settings.PAGE_LOCATION_OCR_REFRESH_ATTEMPTS,
+                    ocr_timeout_seconds=self.settings.OCR_TIMEOUT_SECONDS,
+                    progress_callback=callback,
+                    progress_stage=TaskStage.PERSISTING_RESULT,
                 )
+                result = recovered.result
                 page_coverage = await asyncio.to_thread(
                     validate_public_page_coverage,
                     result,
-                    state.get("page_location_sidecars", {}),
+                    recovered.sidecars,
                 )
                 result.setdefault("metadata", {})["page_location_coverage"] = page_coverage
+                result.setdefault("metadata", {})["reliability"] = recovery_budget.as_dict()
+                return {
+                    "result": result,
+                    "parsed_documents": recovered.documents,
+                    "page_location_sidecars": recovered.sidecars,
+                }
+            result.setdefault("metadata", {})["reliability"] = recovery_budget.as_dict()
             return {"result": result}
 
         async def persist_result(state: DraftReviewState) -> dict[str, Any]:
@@ -3640,7 +3659,10 @@ class DraftReviewWorkflowExecutor:
         if roles.count("TARGET") != 1 or roles.count("TEMPLATE") != 1 or "REFERENCE" not in roles:
             raise WorkflowError("PARSE_FAILED", "起草检查文件角色不完整")
         async with TaskWorkspace(self.settings.TEMP_ROOT, task_id) as workspace:
-            graph = self._build_graph(workspace, progress_callback)
+            recovery_budget = RecoveryBudget(
+                self.settings.WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS
+            )
+            graph = self._build_graph(workspace, progress_callback, recovery_budget)
             state = await graph.ainvoke(
                 DraftReviewState(task_id=task_id, files=files, options=options)
             )

@@ -495,6 +495,32 @@ class NotSpecificThenSpecificAdviceLlm(ConsensusFixtureLlm):
         return result
 
 
+class BatchFailureItemRepairAdviceLlm(ConsensusFixtureLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls = 0
+        self.item_repair_calls = 0
+
+    async def generate_advice(self, payload: dict) -> LlmResult:
+        self.batch_calls += 1
+        raise LlmClientError("LLM_SCHEMA_INVALID", "批次 Advice 结构无效")
+
+    async def generate_advice_item(self, payload: dict) -> LlmResult:
+        self.item_repair_calls += 1
+        risk = payload["risk"]
+        diff = payload["diff_items"][0]
+        return LlmResult(
+            value={
+                "risk_id": risk["risk_id"],
+                "analysis_advice": f"请核对{diff['target']['text']}的业务依据。",
+            },
+            configured_model=self.extraction_model,
+            actual_model=self.extraction_model,
+            mock=False,
+            request_attempts=1,
+        )
+
+
 class MappingFailureLlm(ConsensusFixtureLlm):
     def __init__(self, error_factory) -> None:
         super().__init__()
@@ -512,7 +538,12 @@ class IncompleteMappingReviewLlm(ConsensusFixtureLlm):
 
 
 class UnknownTargetMappingLlm(ConsensusFixtureLlm):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mapping_calls = 0
+
     async def map_facts(self, payload: dict) -> LlmResult:
+        self.mapping_calls += 1
         result = await super().map_facts(payload)
         result.value["mappings"][0]["target_fact_id"] = "target_fact_999999"
         return result
@@ -1397,10 +1428,12 @@ async def test_low_confidence_missing_requirement_is_dropped_without_risk(
 async def test_mapping_cannot_reference_an_unknown_target_fact(
     tmp_path: Path,
 ) -> None:
+    llm = UnknownTargetMappingLlm()
     with pytest.raises(WorkflowError, match="跨资料事实映射") as error:
-        await run_consensus_fixture(tmp_path, UnknownTargetMappingLlm())
+        await run_consensus_fixture(tmp_path, llm)
 
     assert error.value.code == "DYNAMIC_CHECK_INCOMPLETE"
+    assert llm.mapping_calls == 1
     assert error.value.details["failure_stage"] == "FACT_MAPPING"
     assert error.value.details["failure_code"] == "FACT_MAPPING_TARGET_NOT_FOUND"
 
@@ -1681,7 +1714,7 @@ async def test_advice_failure_keeps_formal_result_and_fallback_for_each_risk(
         template_body="固定条款甲",
     )
 
-    assert llm.advice_calls == 1
+    assert llm.advice_calls == 2
     assert result["conclusion"] == "RISK_FOUND"
     assert result["risk_items"]
     assert all(item.get("analysis_advice") for item in result["risk_items"])
@@ -1729,6 +1762,32 @@ async def test_non_specific_advice_gets_one_item_compensation(
     assert validation["not_specific_count"] == 1
     assert result["metadata"]["advice_coverage"]["fallback_count"] == 0
     assert "固定条款乙" in result["risk_items"][0]["analysis_advice"]
+
+
+async def test_draft_review_batch_failure_uses_shared_single_risk_repair(
+    tmp_path: Path,
+) -> None:
+    llm = BatchFailureItemRepairAdviceLlm()
+
+    result = await run_consensus_fixture(
+        tmp_path,
+        llm,
+        target_body="固定条款乙",
+        template_body="固定条款甲",
+    )
+
+    assert llm.batch_calls == 2
+    assert llm.item_repair_calls == 1
+    assert result["metadata"]["advice_coverage"]["fallback_count"] == 0
+    assert result["metadata"]["advice_item_repair_attempted"] == 1
+    assert result["metadata"]["advice_item_repair_succeeded"] == 1
+    assert any(
+        run["status"] == "FAILED" for run in result["metadata"]["model_runs"]
+    )
+    assert any(
+        run["status"] == "RECOVERED" for run in result["metadata"]["model_runs"]
+    )
+    assert result["risk_items"][0]["analysis_advice"]
 
 
 async def test_independent_review_receives_source_blocks(tmp_path: Path) -> None:

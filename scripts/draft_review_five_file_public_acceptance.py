@@ -50,6 +50,7 @@ from app.workflows.router import WorkflowRouter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FILE_ROOT = Path(r"D:\work\contract_review")
+WORKTREE_EXCLUDED_PREFIXES = ("backups/", "tmp/", ".real-diagnostic-temp/")
 FILE_SPECS = (
     {
         "path": Path(
@@ -202,21 +203,119 @@ def acquire_lock(path: Path) -> None:
         json.dump({"started_at": time.time(), "purpose": "fresh_five_file_public_task"}, stream)
 
 
-def git_preflight() -> dict[str, Any]:
-    status = subprocess.run(
-        ["git", "status", "--short"],
+def _worktree_pathspecs() -> list[str]:
+    return [
+        ".",
+        ":(exclude)backups/**",
+        ":(exclude)tmp/**",
+        ":(exclude).real-diagnostic-temp/**",
+    ]
+
+
+def _git_output(*arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", *arguments],
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
-        text=True,
     )
-    allowed_prefixes = ("backups/", "tmp/", ".real-diagnostic-temp/")
-    allowed_paths = {"scripts/draft_review_five_file_public_acceptance.py"}
-    unallowed = []
-    for line in status.stdout.splitlines():
-        path = line[3:] if len(line) >= 4 else line
-        if not path.startswith(allowed_prefixes) and path not in allowed_paths:
-            unallowed.append(line)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git command failed: {' '.join(arguments)}: "
+            f"{result.stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    return result.stdout
+
+
+def _git_paths(*arguments: str) -> list[str]:
+    output = _git_output(*arguments)
+    return [
+        line.decode("utf-8", errors="surrogateescape")
+        for line in output.splitlines()
+        if line
+    ]
+
+
+def _is_excluded_worktree_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(
+        normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+        for prefix in WORKTREE_EXCLUDED_PREFIXES
+    )
+
+
+def _tracked_diff_entries() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for line in _git_paths(
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+        *_worktree_pathspecs(),
+    ):
+        status, separator, path = line.partition("\t")
+        if separator and path:
+            entries.append({"status": status, "path": path.replace("\\", "/")})
+    return sorted(entries, key=lambda item: (item["path"], item["status"]))
+
+
+def _untracked_file_entries() -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for raw_path in _git_paths(
+        "ls-files", "--others", "--exclude-standard", "--", *_worktree_pathspecs()
+    ):
+        path = raw_path.replace("\\", "/")
+        if _is_excluded_worktree_path(path):
+            continue
+        absolute_path = REPO_ROOT / Path(path)
+        entries.append({"path": path, "sha256": sha256(absolute_path)})
+    return sorted(entries, key=lambda item: item["path"])
+
+
+def _worktree_fingerprint() -> dict[str, Any]:
+    head = _git_output("rev-parse", "HEAD").decode("ascii").strip()
+    tracked_patch = _git_output(
+        "diff",
+        "--binary",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+        *_worktree_pathspecs(),
+    )
+    tracked_entries = _tracked_diff_entries()
+    untracked_entries = _untracked_file_entries()
+    payload = {
+        "head": head,
+        "tracked_diff_sha256": hashlib.sha256(tracked_patch).hexdigest(),
+        "tracked_diff_files": tracked_entries,
+        "untracked_files": untracked_entries,
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        **payload,
+        "worktree_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def git_preflight(allow_reviewed_worktree_sha256: str | None = None) -> dict[str, Any]:
+    fingerprint = _worktree_fingerprint()
+    dirty_entries = [
+        *(
+            f"{item['status']}\t{item['path']}"
+            for item in fingerprint["tracked_diff_files"]
+        ),
+        *(
+            f"??\t{item['path']}"
+            for item in fingerprint["untracked_files"]
+        ),
+    ]
     commits = {}
     for commit in ("d0cca24", "6d8166d"):
         check = subprocess.run(
@@ -228,14 +327,31 @@ def git_preflight() -> dict[str, Any]:
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, check=False, capture_output=True, text=True
     )
+    supplied = (
+        allow_reviewed_worktree_sha256.strip().casefold()
+        if isinstance(allow_reviewed_worktree_sha256, str)
+        else None
+    )
+    fingerprint_matches = (
+        supplied == fingerprint["worktree_sha256"] if supplied is not None else None
+    )
+    worktree_clean = not dirty_entries
+    worktree_gate_passed = (
+        worktree_clean if supplied is None else fingerprint_matches is True
+    )
     return {
         "head": head.stdout.strip() if head.returncode == 0 else None,
         "required_commits": commits,
-        "unallowed_tracked_changes": unallowed,
-        "allowed_workspace_entries": [
-            line for line in status.stdout.splitlines() if line not in unallowed
-        ],
-        "passed": not unallowed and all(commits.values()),
+        "worktree_sha256": fingerprint["worktree_sha256"],
+        "tracked_diff_sha256": fingerprint["tracked_diff_sha256"],
+        "tracked_diff_files": fingerprint["tracked_diff_files"],
+        "untracked_files": fingerprint["untracked_files"],
+        "excluded_workspace_prefixes": list(WORKTREE_EXCLUDED_PREFIXES),
+        "unallowed_tracked_changes": dirty_entries,
+        "worktree_clean": worktree_clean,
+        "reviewed_worktree_sha256_supplied": supplied is not None,
+        "reviewed_worktree_sha256_matches": fingerprint_matches,
+        "passed": worktree_gate_passed and all(commits.values()),
     }
 
 
@@ -843,7 +959,7 @@ async def create_and_execute(
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     base = Settings()
     settings = runtime_settings(base)
-    git = git_preflight()
+    git = git_preflight(args.allow_reviewed_worktree_sha256)
     inventory, inventory_error = file_inventory()
     report: dict[str, Any] = {
         "script": "draft_review_five_file_public_acceptance",
@@ -922,6 +1038,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--require-worker-stopped", action="store_true")
+    parser.add_argument("--allow-reviewed-worktree-sha256")
     return parser.parse_args()
 
 

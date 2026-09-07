@@ -152,12 +152,14 @@ class TextInDocumentParserClient:
         *,
         mode: ParseMode,
         include_stamp_images: bool = False,
+        timeout_seconds: float | None = None,
     ) -> TextInParseResponse:
         base_url, header, key = self._configuration()
         started = time.monotonic()
+        effective_timeout = timeout_seconds or self.settings.OCR_TIMEOUT_SECONDS
         timeout = httpx.Timeout(
-            self.settings.OCR_TIMEOUT_SECONDS,
-            connect=min(30.0, self.settings.OCR_TIMEOUT_SECONDS),
+            effective_timeout,
+            connect=min(30.0, effective_timeout),
         )
         attempts = self.settings.OCR_HTTP_RETRY_ATTEMPTS + 1
         request_parameters = {**FIXED_PARAMETERS, "parse_mode": mode}

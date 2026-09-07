@@ -15,6 +15,11 @@ from app.adapters.llm.openai_client import LlmClientError
 from app.adapters.llm.schemas import DocumentFactExtraction, FactCandidate
 from app.core.config import Settings
 from app.core.errors import WorkflowError
+from app.core.reliability import (
+    LLM_MODEL_OUTPUT_ERROR_CODES,
+    RecoveryBudget,
+    is_retryable_model_output_error,
+)
 from app.documents.models import DocumentBlock, ParsedDocument
 from app.draft_review.checkpoints import ExtractionCheckpoint, ExtractionCheckpointStore
 from app.draft_review.facts import (
@@ -80,7 +85,7 @@ LLM_TRANSPORT_FAILURE_CODES = frozenset(
 )
 
 TEXT_MIN_RECOVERY_BUDGET = 3
-TEXT_MAX_RECOVERY_DEPTH = 2
+TEXT_MAX_RECOVERY_DEPTH = 4
 
 
 def numeric_recovery_blocks(
@@ -1597,6 +1602,7 @@ async def extract_documents_with_independent_map_reduce(
     source_task_id: str | None = None,
     source_file_ids_by_file_id: dict[str, str] | None = None,
     text_candidates_by_document: dict[str, list[TextExtractionCandidate]] | None = None,
+    recovery_budget: RecoveryBudget | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Run profile, numeric and text extraction as independent Map–Reduce chains.
 
@@ -1608,6 +1614,9 @@ async def extract_documents_with_independent_map_reduce(
     """
 
     documents_by_id = {document.file_id: document for document in documents}
+    recovery_budget = recovery_budget or RecoveryBudget(
+        getattr(settings, "WORKFLOW_RECOVERY_MAX_EXTRA_SECONDS", 600)
+    )
     semaphore = asyncio.Semaphore(settings.LLM_EXTRACTION_TASK_CONCURRENCY)
     profile_semaphore = asyncio.Semaphore(
         getattr(settings, "LLM_PROFILE_CONCURRENCY", 1)
@@ -1616,6 +1625,19 @@ async def extract_documents_with_independent_map_reduce(
     document_logical_calls: Counter[str] = Counter()
     wave_count = 0
     transport_circuit_open = asyncio.Event()
+
+    def reserve_logical_call(document_id: str, stage: str) -> bool:
+        nonlocal logical_calls
+        if (
+            logical_calls >= settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL
+            or document_logical_calls[document_id]
+            >= settings.LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT
+        ):
+            return False
+        logical_calls += 1
+        document_logical_calls[document_id] += 1
+        recovery_budget.record_logical_call(stage)
+        return True
 
     async def materialize_checkpoint(
         checkpoint: ExtractionCheckpoint,
@@ -1812,20 +1834,35 @@ async def extract_documents_with_independent_map_reduce(
                     "batch_id": batch_id,
                     "extraction_version": "profile-v2",
                 }
-        if (
-            logical_calls >= settings.LLM_EXTRACTION_MAX_LOGICAL_CALLS_TOTAL
-            or document_logical_calls[document.file_id]
-            >= settings.LLM_EXTRACTION_ABSOLUTE_MAX_REQUESTS_PER_DOCUMENT
-        ):
+        if not reserve_logical_call(document.file_id, "PROFILE"):
             raise WorkflowError(
                 "DYNAMIC_CHECK_INCOMPLETE",
                 "抽取调用预算已耗尽",
                 details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
             )
-        logical_calls += 1
-        document_logical_calls[document.file_id] += 1
-        async with profile_semaphore:
-            result = await llm.extract_document_profile(payload)
+        profile_recovery_attempts = 0
+        while True:
+            try:
+                async with profile_semaphore:
+                    result = await llm.extract_document_profile(payload)
+                break
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                if (
+                    profile_recovery_attempts
+                    >= getattr(settings, "LLM_EXTRACTION_LEAF_RETRY_ATTEMPTS", 1)
+                    or not is_retryable_model_output_error(exc)
+                    or not recovery_budget.allow_stage("PROFILE", _safe_failure_code(exc))
+                ):
+                    raise
+                profile_recovery_attempts += 1
+                if not reserve_logical_call(document.file_id, "PROFILE"):
+                    raise WorkflowError(
+                        "DYNAMIC_CHECK_INCOMPLETE",
+                        "抽取调用预算已耗尽",
+                        details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
+                    ) from exc
         profile_value = expand_document_overview(payload, result.value)
         if checkpoint_store is not None:
             await checkpoint_store.save(
@@ -1849,6 +1886,7 @@ async def extract_documents_with_independent_map_reduce(
             "duration_ms": result.duration_ms,
             "request_attempts": result.request_attempts,
             "structure_retries": result.structure_retries,
+            "recovery_attempts": profile_recovery_attempts,
             "batch_id": batch_id,
             "extraction_version": "profile-v2",
         }
@@ -2429,35 +2467,98 @@ async def extract_documents_with_independent_map_reduce(
                         "request_attempts": 0,
                         "structure_retries": 0,
                     }
-                logical_calls += 1
-                document_logical_calls[plan["document_id"]] += 1
-                if plan["chain"] == "numeric":
-                    result = await llm.extract_numeric_candidates(payload)
-                    facts, _classified = expand_numeric_candidate_response(payload, result.value)
-                    facts = rehydrate_numeric_fact_evidence(
-                        documents_by_id[plan["document_id"]], facts
-                    )
-                    _validate_fact_identity_set(facts)
-                else:
+                async def call_and_expand(
+                    *, recovery: bool
+                ) -> tuple[LlmResult, list[FactCandidate], dict[str, int], int]:
+                    if not reserve_logical_call(plan["document_id"], plan["chain"].upper()):
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "抽取调用预算已耗尽",
+                            details={"failure_code": "EXTRACTION_CALL_BUDGET_EXHAUSTED"},
+                        )
+                    if plan["chain"] == "numeric":
+                        try:
+                            result = await llm.extract_numeric_candidates(
+                                payload, recovery=recovery
+                            )
+                        except TypeError as exc:
+                            if "recovery" not in str(exc):
+                                raise
+                            result = await llm.extract_numeric_candidates(payload)
+                        facts, _classified = expand_numeric_candidate_response(
+                            payload, result.value
+                        )
+                        facts = rehydrate_numeric_fact_evidence(
+                            documents_by_id[plan["document_id"]], facts
+                        )
+                        _validate_fact_identity_set(facts)
+                        return result, facts, {}, 0
                     try:
                         result = await llm.extract_text_facts(
                             payload,
                             allow_structure_correction=len(plan["blocks"]) == 1,
+                            disable_thinking=recovery,
                         )
                     except TypeError as exc:
-                        if "allow_structure_correction" not in str(exc):
+                        if "disable_thinking" in str(exc):
+                            try:
+                                result = await llm.extract_text_facts(
+                                    payload,
+                                    allow_structure_correction=len(plan["blocks"]) == 1,
+                                )
+                            except TypeError as compatibility_error:
+                                if "allow_structure_correction" not in str(compatibility_error):
+                                    raise
+                                result = await llm.extract_text_facts(payload)
+                        elif "allow_structure_correction" in str(exc):
+                            result = await llm.extract_text_facts(payload)
+                        else:
                             raise
-                        # Compatibility adapters and test doubles written
-                        # before the keyword option remain usable. Production
-                        # clients implement the explicit protocol above.
-                        result = await llm.extract_text_facts(payload)
                     facts, discarded_fact_codes = filter_text_fact_evidence(
                         documents_by_id[plan["document_id"]],
                         payload,
                         result.value,
                     )
                     _validate_fact_identity_set(facts)
-                    discarded_fact_count = sum(discarded_fact_codes.values())
+                    return result, facts, discarded_fact_codes, sum(discarded_fact_codes.values())
+
+                try:
+                    result, facts, discarded_fact_codes, discarded_fact_count = (
+                        await call_and_expand(recovery=False)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as first_error:
+                    failure_code = _safe_failure_code(first_error)
+                    structural_children = len(plan["blocks"]) > 1
+                    if plan["chain"] == "numeric" and not structural_children:
+                        structural_children = bool(
+                            numeric_recovery_blocks(plan["blocks"], failure_code)
+                            or len(numeric_candidate_indexes(payload)) > 1
+                        )
+                    elif plan["chain"] == "text" and not structural_children:
+                        structural_children = bool(
+                            len(split_table_text_unit(plan["blocks"][0])) > 1
+                            or len(_split_text_structure_unit(plan["blocks"][0])) > 1
+                        )
+                    leaf_retry_allowed = (
+                        len(plan["blocks"]) == 1
+                        and not structural_children
+                        and (
+                            plan["chain"] == "text"
+                            or failure_code == "LLM_OUTPUT_TRUNCATED"
+                        )
+                        and failure_code in LLM_MODEL_OUTPUT_ERROR_CODES
+                        and getattr(settings, "LLM_EXTRACTION_LEAF_RETRY_ATTEMPTS", 1) >= 1
+                    )
+                    if not leaf_retry_allowed or not recovery_budget.allow_stage(
+                        f"{plan['chain'].upper()}_LEAF", failure_code
+                    ):
+                        raise
+                    recovery_budget.record_split_depth(int(plan.get("depth", 0)))
+                    result, facts, discarded_fact_codes, discarded_fact_count = (
+                        await call_and_expand(recovery=True)
+                    )
                 if plan["chain"] == "numeric":
                     discarded_fact_codes = {}
                     discarded_fact_count = 0
@@ -2545,16 +2646,12 @@ async def extract_documents_with_independent_map_reduce(
                 "recovery_counts": {},
                 "first_wave_success_rate": 1.0,
             }
-        recovery_budget = {
-            document_id: max(
-                TEXT_MIN_RECOVERY_BUDGET if chain == "text" else 2,
-                (count * 30 + 99) // 100,
-            )
-            for (document_id, plan_chain), count in per_document_chain_count.items()
-            if plan_chain == chain
-        }
         max_recovery_depth = (
-            min(settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH, TEXT_MAX_RECOVERY_DEPTH)
+            min(
+                settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH,
+                getattr(settings, "LLM_TEXT_RECOVERY_MAX_DEPTH", TEXT_MAX_RECOVERY_DEPTH),
+                TEXT_MAX_RECOVERY_DEPTH,
+            )
             if chain == "text"
             else settings.LLM_EXTRACTION_MAX_SPLIT_DEPTH
         )
@@ -2639,7 +2736,7 @@ async def extract_documents_with_independent_map_reduce(
                         .get("max_items", default_text_fact_limit),
                     )
                 )
-                next_limit = {12: 6, 6: 3}.get(current_limit)
+                next_limit = {12: 8, 8: 4, 6: 4, 4: 2, 2: 1}.get(current_limit)
                 if next_limit is not None:
                     return [([blocks[0]], next_limit, None)]
             return []
@@ -2739,6 +2836,20 @@ async def extract_documents_with_independent_map_reduce(
                     and failure_code in TEXT_RECOVERABLE_FAILURE_CODES
                 )
                 if recoverable:
+                    if not recovery_budget.allow_stage(
+                        f"{chain.upper()}_SPLIT", failure_code
+                    ):
+                        terminal_failure = outcome
+                        raise WorkflowError(
+                            "DYNAMIC_CHECK_INCOMPLETE",
+                            "事实抽取统一恢复预算已用尽",
+                            details=_failure_details(
+                                outcome,
+                                failure_code="RECOVERY_BUDGET_EXHAUSTED",
+                                underlying_failure_code=failure_code,
+                            ),
+                        ) from outcome.get("error")
+                    recovery_budget.record_split_depth(int(plan.get("depth", 0)) + 1)
                     document = documents_by_id[plan["document_id"]]
                     new_children = [
                         make_child_plan(
@@ -2768,24 +2879,6 @@ async def extract_documents_with_independent_map_reduce(
                         saturation_split_counts[plan["document_id"]] += 1
                     else:
                         budgeted_recovery_counts[plan["document_id"]] += 1
-                        if (
-                            budgeted_recovery_counts[plan["document_id"]]
-                            > recovery_budget[plan["document_id"]]
-                        ):
-                            terminal_failure = outcome
-                            if chain == "text":
-                                details = _failure_details(
-                                    outcome,
-                                    failure_code="TEXT_RECOVERY_BUDGET_EXHAUSTED",
-                                    underlying_failure_code=failure_code,
-                                )
-                            else:
-                                details = _failure_details(outcome)
-                            raise WorkflowError(
-                                "DYNAMIC_CHECK_INCOMPLETE",
-                                "事实抽取恢复预算已用尽",
-                                details=details,
-                            )
                     superseded.add(plan["batch_id"])
                     continue
                 if failure_code in {
