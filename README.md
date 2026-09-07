@@ -31,6 +31,8 @@
 
 ## Docker 首次启动
 
+生产服务器的增量离线升级统一使用[甲方生产离线升级操作说明](docs/deployment/甲方生产离线升级操作说明.md)，不要直接套用开发环境首次启动命令。
+
 需要 Docker Desktop/Engine 和 Docker Compose，不要求宿主机安装 Python 或 Node.js。
 
 ```powershell
